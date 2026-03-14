@@ -1,0 +1,31 @@
+{
+  "name": "default_triage",
+  "description": "Default fast-triage scoring configuration for the Adaptive Discovery Orchestrator. Uses MolScore's descriptor and filter functions to aggressively discard non-viable molecules.",
+  "scoring_functions": [
+    {
+      "name": "MolecularDescriptors",
+      "run": true,
+      "parameters": {
+        "prefix": "desc",
+        "descriptors": ["MolWt", "MolLogP", "NumHBD", "NumHBA", "TPSA", "QED", "SAScore", "NumRotatableBonds", "NumHeavyAtoms"]
+      }
+    },
+    {
+      "name": "SubstructureFilters",
+      "run": true,
+      "parameters": {
+        "prefix": "filter",
+        "filter_type": "PAINS"
+      }
+    }
+  ],
+  "filter_thresholds": {
+    "desc_MolWt": {"max": 500, "reason": "Lipinski Rule of Five: MW <= 500"},
+    "desc_MolLogP": {"max": 5, "reason": "Lipinski Rule of Five: LogP <= 5"},
+    "desc_NumHBD": {"max": 5, "reason": "Lipinski Rule of Five: HBD <= 5"},
+    "desc_NumHBA": {"max": 10, "reason": "Lipinski Rule of Five: HBA <= 10"},
+    "desc_SAScore": {"max": 5.0, "reason": "Synthetic Accessibility <= 5.0"},
+    "desc_QED": {"min": 0.3, "reason": "QED Drug-likeness >= 0.3"},
+    "filter_PAINS": {"equals": 0, "reason": "No PAINS structural alerts"}
+  }
+}

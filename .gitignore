@@ -1,0 +1,89 @@
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.Python
+
+# =============================================================================
+# Virtual environments
+# =============================================================================
+env/
+venv/
+.venv/
+conda-bld/
+
+# =============================================================================
+# IDE / Editor
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# =============================================================================
+# Pipeline run outputs (regenerated per campaign — do not commit)
+# =============================================================================
+
+# Telemetry database (local, regenerated on each run)
+*.db
+
+# Generated / intermediate molecular data
+autonomous_drug_discovery/data/campaign_*/
+autonomous_drug_discovery/data/candidates/
+autonomous_drug_discovery/data/screened/
+autonomous_drug_discovery/data/results/
+autonomous_drug_discovery/data/processed/*_out/
+autonomous_drug_discovery/data/processed/*_manifest.json
+autonomous_drug_discovery/data/processed/run_metadata.json
+
+# Test run artifacts
+autonomous_drug_discovery/data/test_*/
+
+# Molecular structure files (large, binary, regenerated)
+*.pdbqt
+*.sdf
+*.pqr
+
+# Keep input PDB files tracked (small, needed to reproduce)
+!autonomous_drug_discovery/data/processed/*.pdb
+
+# =============================================================================
+# Large reference data (download separately — see README)
+# =============================================================================
+data/components.cif.gz
+data/aa-variants-v1.cif
+data/sample/
+data/.idea/
+data/._*
+
+# =============================================================================
+# TargetDiff (nested git repo — add as submodule separately)
+# See: https://github.com/guanjq/targetdiff.git
+# =============================================================================
+autonomous_drug_discovery/modules/02_generation/targetdiff/
+
+# =============================================================================
+# Model checkpoints / weights (too large for git)
+# =============================================================================
+*.pt
+*.ckpt
+*.h5
+*.safetensors
+*.bin
+
+# =============================================================================
+# Secrets / credentials
+# =============================================================================
+.env
+*.key
+*.secret
+credentials.json

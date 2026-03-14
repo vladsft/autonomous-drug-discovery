@@ -1,0 +1,23 @@
+# Orchestrator Environment
+# Core environment for the pipeline driver, screening (MolScore), docking triage (TDC),
+# and the Agent Planner (LangChain).
+
+name: orchestrator_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - rdkit
+  - numpy
+  - pandas
+  - scipy
+  - pip
+  - pip:
+    - molscore
+    - PyTDC
+    - langchain
+    - langchain-core
+    - langchain-google-genai
+    - posecheck
+    - pytest

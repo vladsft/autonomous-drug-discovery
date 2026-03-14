@@ -1,0 +1,16 @@
+# Docking Environment
+
+name: docking_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - openbabel
+  - rdkit
+  - pandas
+  - scipy
+  - numpy
+  - vina
+  - meeko
+  - pip

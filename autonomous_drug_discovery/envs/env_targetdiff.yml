@@ -1,0 +1,29 @@
+# TargetDiff Environment
+
+name: targetdiff_env
+channels:
+  - pytorch
+  - nvidia
+  - pyg
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pytorch=1.13.0
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=11.7
+  - pyg
+  - pytorch-cluster
+  - pytorch-scatter
+  - pytorch-sparse
+  - openbabel
+  - rdkit
+  - biopython
+  - pandas
+  - pyyaml
+  - tqdm
+  - pip
+  - pip:
+    - lmdb
+    - easydict
