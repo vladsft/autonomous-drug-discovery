@@ -15,6 +15,7 @@ import subprocess
 import shutil
 import json
 import hashlib
+import re
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,24 @@ def _file_hash(filepath):
         for chunk in iter(lambda: f.read(8192), b""):
             sha256.update(chunk)
     return sha256.hexdigest()
+
+
+def _parse_pocket_scores(info_txt_path):
+    """Parse fpocket _info.txt file and return dict of {pocket_number: druggability_score}."""
+    scores = {}
+    current_pocket = None
+    with open(info_txt_path, "r") as f:
+        for line in f:
+            m = re.match(r"^Pocket\s+(\d+)\s*:", line)
+            if m:
+                current_pocket = int(m.group(1))
+                continue
+            if current_pocket is not None:
+                m = re.match(r"\s+Druggability Score\s*:\s+([\d.]+)", line)
+                if m:
+                    scores[current_pocket] = float(m.group(1))
+                    current_pocket = None
+    return scores
 
 
 def _get_fpocket_version():
@@ -98,7 +117,7 @@ def run_fpocket(pdb_file, output_dir, db_path=None, campaign_id=None):
         # Copy PDB to output directory for fpocket (skip if already there)
         target_pdb_name = pdb_path.name
         target_pdb_path = out_path / target_pdb_name
-        if pdb_path != target_pdb_path:
+        if pdb_path.resolve() != target_pdb_path.resolve():
             shutil.copy2(pdb_path, target_pdb_path)
 
         cmd = [str(FPOCKET_BIN), "-f", str(target_pdb_path)]
@@ -124,13 +143,30 @@ def run_fpocket(pdb_file, output_dir, db_path=None, campaign_id=None):
         }
 
         if pockets_dir.exists():
-            pockets = sorted(
-                list(pockets_dir.glob("pocket*_atm.pdb")),
-                key=lambda p: int(p.stem.replace("pocket", "").replace("_atm", "")),
-            )
+            pockets = list(pockets_dir.glob("pocket*_atm.pdb"))
             manifest["pockets_found"] = len(pockets)
             if pockets:
-                # pocket1 has the highest drug score (fpocket ranks by score)
+                # Parse druggability scores from fpocket info file and select best pocket
+                info_txt = out_folder_path / f"{target_pdb_path.stem}_info.txt"
+                if info_txt.exists():
+                    pocket_scores = _parse_pocket_scores(info_txt)
+                    # Sort by druggability score (descending), fall back to pocket number
+                    pockets.sort(
+                        key=lambda p: pocket_scores.get(
+                            int(p.stem.replace("pocket", "").replace("_atm", "")),
+                            -1,
+                        ),
+                        reverse=True,
+                    )
+                    best_num = int(pockets[0].stem.replace("pocket", "").replace("_atm", ""))
+                    best_score = pocket_scores.get(best_num, "N/A")
+                    print(f"[Ingestion] Best pocket: pocket{best_num} (Druggability Score: {best_score})")
+                else:
+                    # Fallback: sort numerically by pocket number (fpocket default ranking)
+                    pockets.sort(
+                        key=lambda p: int(p.stem.replace("pocket", "").replace("_atm", ""))
+                    )
+                    print("[Ingestion] Warning: _info.txt not found, using fpocket default pocket ordering")
                 manifest["best_pocket"] = str(pockets[0])
 
         manifest_path = out_path / f"{target_pdb_path.stem}_manifest.json"
