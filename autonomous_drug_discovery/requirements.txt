@@ -1,0 +1,28 @@
+# Autonomous Drug Discovery Pipeline — Dependencies
+# Install via conda (recommended) + pip:
+#   conda install -c conda-forge rdkit vina scipy numpy
+#   pip install meeko gemmi
+
+# Core chemistry
+rdkit>=2025.03
+vina>=1.2.5
+meeko>=0.7.0
+gemmi>=0.7.0
+
+# Scientific computing
+numpy>=2.0
+scipy>=1.10
+
+# fpocket must be installed separately (binary):
+#   git clone https://github.com/Discngine/fpocket.git
+#   cd fpocket && make && make install
+#   Expected at: /home/vladsft/fpocket/bin/fpocket
+
+# --- Optional: TargetDiff diffusion generation ---
+# Requires separate conda env (Python 3.8):
+#   conda create -n targetdiff_env python=3.8
+#   conda install pytorch pytorch-cuda=11.6 -c pytorch -c nvidia
+#   conda install pyg -c pyg
+#   conda install rdkit openbabel tensorboard pyyaml easydict python-lmdb -c conda-forge
+#   pip install meeko==0.1.dev3 scipy pdb2pqr vina==1.2.2
+# Pretrained weights must be downloaded separately (see modules/02_generation/targetdiff/README.md)
