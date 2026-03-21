@@ -6,26 +6,40 @@ An end-to-end computational drug discovery system that takes a protein structure
 
 Given a protein target, the pipeline:
 
-1. **Detects binding pockets** on the protein surface using fpocket
+1. **Detects binding pockets** on the protein surface using P2Rank (ML-based, default) or fpocket (fallback)
 2. **Generates candidate molecules** using fragment-based combinatorial chemistry (RDKit), sized to fit the detected pocket
-3. **Screens candidates** against drug-likeness filters (Lipinski Rule of Five, QED, synthetic accessibility, PAINS toxicity alerts)
+3. **Screens candidates** against drug-likeness filters (Lipinski, QED, SA, PAINS) and annotates with ADMET-AI predictions (104 properties: toxicity, absorption, metabolism, etc.)
 4. **Docks survivors** into the binding pocket using AutoDock Vina to estimate binding affinity
 5. **Ranks and reports** the results, with all intermediate data logged to SQLite
 
-The system has been validated against EGFR (PDB: 1M17), where it correctly identifies the erlotinib binding site and produces molecules with physically meaningful docking scores (-3.9 to -9.1 kcal/mol).
+Validated against three cancer targets with crystallographic ground truth:
+
+| Target | Disease | Best Dock Score | Pocket Accuracy |
+|--------|---------|----------------|-----------------|
+| EGFR (1M17) | Lung cancer | -9.32 kcal/mol | 2.7 A from erlotinib, 82% residue overlap |
+| BCR-ABL (2HYY) | Leukemia | -12.56 kcal/mol | 2.7 A from imatinib, 92% residue overlap |
+| BRAF V600E (6P3D) | Melanoma | -10.40 kcal/mol | 3.1 A from ponatinib, 89% residue overlap |
 
 ## Quick start
 
 ### Prerequisites
 
 - [Miniconda](https://docs.conda.io/en/latest/miniconda.html) or Anaconda
-- [fpocket](https://github.com/Discngine/fpocket) binary installed at `/home/<user>/fpocket/bin/fpocket` (or update the path in `modules/01_ingestion/run_pocket.py`)
+- [P2Rank](https://github.com/rdk/p2rank) (default pocket detection) — requires Java 17+
+- [fpocket](https://github.com/Discngine/fpocket) (fallback pocket detection)
 
 ### Install dependencies
 
 ```bash
-conda install -n base -c conda-forge rdkit vina -y
-pip install meeko gemmi
+conda install -n base -c conda-forge rdkit vina openjdk=17 -y
+pip install meeko gemmi admet-ai
+```
+
+Download P2Rank:
+```bash
+cd ~
+wget https://github.com/rdk/p2rank/releases/download/2.5.1/p2rank_2.5.1.tar.gz
+tar -xzf p2rank_2.5.1.tar.gz && rm p2rank_2.5.1.tar.gz
 ```
 
 ### Run the full pipeline
@@ -97,17 +111,15 @@ conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json 
 
 ### Stage 1: Pocket detection (`01_ingestion/run_pocket.py`)
 
-**Tool:** fpocket (Voronoi tessellation + alpha sphere clustering)
+**Tool:** P2Rank (default, ML-based) or fpocket (fallback, geometry-based). Selectable via `--backend p2rank|fpocket`.
 
 **Input:** A `.pdb` file containing a protein structure.
 
 **Output:**
-- `{stem}_manifest.json` — lists all detected pockets, ranked by druggability score. The best pocket (pocket1) is selected automatically.
-- `{stem}_out/pockets/` — individual pocket PDB files (`pocket1_atm.pdb` = protein atoms lining the pocket, `pocket1_vert.pqr` = cavity geometry and scoring metadata).
+- `{stem}_manifest.json` — best pocket location, score, probability, and pre-computed center coordinates.
+- `{stem}_p2rank/` (or `{stem}_out/` for fpocket) — predictions CSV and pocket atom PDB files.
 
-**Key metrics in the `.pqr` headers:** Drug Score (0-1), Pocket Score, Volume, Hydrophobicity, Polarity.
-
-**Validation:** On EGFR (1M17), pocket1 captures 50% of the known erlotinib binding residues and the docking box center falls 6.3 Angstroms from the co-crystallized ligand position.
+**P2Rank advantages over fpocket:** 10-20 percentage point better recall on standard benchmarks. On EGFR (1M17), P2Rank places the pocket 2.7 A from the known drug (vs fpocket's 6.3 A) with 82% residue overlap (vs 53%).
 
 ### Stage 2: Molecule generation (`02_generation/run_generation.py`)
 
@@ -124,13 +136,13 @@ conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json 
 
 ### Stage 3: Screening (`03_screening/run_screening.py`)
 
-**Tool:** RDKit (with optional MolScore backend if installed)
+**Tool:** RDKit filters + ADMET-AI (104-property toxicity/absorption/metabolism prediction)
 
 **Input:** An `.sdf` file of candidate molecules.
 
 **Output:**
 - `screened_molecules.sdf` — only molecules that passed all filters.
-- `screening_report.json` — per-molecule properties, pass/fail status, and attrition summary.
+- `screening_report.json` — per-molecule properties, pass/fail status, ADMET annotations, and attrition summary.
 
 **Filters applied (configurable in `default_scoring_config.json`):**
 
@@ -237,31 +249,34 @@ The fragment library (scaffolds, substituents, linkers) is defined at the top of
 
 ## Current status and roadmap
 
-### Working now
-- Pocket detection (fpocket) — real, validated
-- Molecule generation (RDKit fragment-based) — real, pocket-aware
-- Screening (RDKit) — real, Lipinski + QED + SA + PAINS
-- Docking (AutoDock Vina) — real, production-grade PDBQT preparation
+### Working now (M1 + M2 complete)
+- Pocket detection (P2Rank, default) — ML-based, validated against crystallography
+- Molecule generation (RDKit fragment-based) — pocket-aware sizing
+- Screening (RDKit + ADMET-AI) — Lipinski + QED + SA + PAINS + 104 ADMET properties
+- Docking (AutoDock Vina) — production-grade, uses P2Rank pocket centers
 - Campaign telemetry — full logging of all stages
-- Validated against EGFR (1M17) with erlotinib binding site recovery
+- Validated against 3 cancer targets (EGFR, BCR-ABL, BRAF V600E) with crystallographic ground truth
+- Benchmark comparison script (`benchmark.py`)
 
-### Planned next (see `plan.md` for full roadmap)
-- Multi-target validation benchmark (EGFR, BCR-ABL, BRAF V600E)
-- TargetDiff integration for structure-aware diffusion-based generation
-- ADMET prediction (absorption, metabolism, toxicity)
+### Planned next
+- TargetDiff diffusion generation (environment ready, checkpoint downloaded)
 - GNINA CNN-based rescoring
-- Retrosynthetic accessibility analysis (AiZynthFinder)
+- AiZynthFinder retrosynthetic feasibility
+- Domain expert review (M3)
 - Agent planner with empirical strategy selection
 
 ## Dependencies
 
 | Package | Purpose | Install |
 |---------|---------|---------|
+| P2Rank | ML-based pocket detection (default) | [Download binary](https://github.com/rdk/p2rank/releases) |
+| Java 17+ | Required by P2Rank | `conda install -c conda-forge openjdk=17` |
 | RDKit | Molecular property calculation, fragment generation, PAINS filters | `conda install -c conda-forge rdkit` |
 | AutoDock Vina | Molecular docking (binding affinity scoring) | `conda install -c conda-forge vina` |
 | Meeko | Ligand PDBQT preparation for Vina | `pip install meeko` |
 | gemmi | Receptor PDB parsing and atom typing | `pip install gemmi` |
-| fpocket | Binding pocket detection | [Build from source](https://github.com/Discngine/fpocket) |
+| ADMET-AI | 104-property ADMET prediction | `pip install admet-ai` |
+| fpocket | Pocket detection (fallback) | [Build from source](https://github.com/Discngine/fpocket) |
 
 ## License
 

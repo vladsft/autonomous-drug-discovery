@@ -344,10 +344,50 @@ def run_screening(input_sdf: str, output_dir: str, config_path: str | None = Non
                 writer.write(mols[idx])
         writer.close()
 
+        # ADMET-AI enrichment for survivors
+        admet_results = {}
+        try:
+            from admet_ai import ADMETModel
+            admet_model = ADMETModel()
+            survivor_smiles = [r["smiles"] for r in survivors if r["smiles"]]
+            if survivor_smiles:
+                print(f"[Screening] Running ADMET-AI on {len(survivor_smiles)} survivors...")
+                admet_preds = admet_model.predict(smiles=survivor_smiles)
+                # admet_preds is a dict of {property: value} for single, or list for batch
+                if isinstance(admet_preds, dict) and len(survivor_smiles) == 1:
+                    admet_results[survivor_smiles[0]] = {
+                        k: round(v, 4) if isinstance(v, float) else v
+                        for k, v in admet_preds.items()
+                    }
+                elif isinstance(admet_preds, list):
+                    for smi, pred in zip(survivor_smiles, admet_preds):
+                        admet_results[smi] = {
+                            k: round(v, 4) if isinstance(v, float) else v
+                            for k, v in pred.items()
+                        }
+                # Select key ADMET properties for the report
+                admet_key_props = [
+                    "hERG", "AMES", "DILI", "CYP2D6_Veith", "CYP3A4_Veith",
+                    "Caco2_Wang", "HIA_Hou", "BBB_Martins", "Clearance_Hepatocyte_AZ",
+                    "Bioavailability_Ma", "LD50_Zhu",
+                ]
+                for r in survivors:
+                    smi = r["smiles"]
+                    if smi in admet_results:
+                        for prop in admet_key_props:
+                            if prop in admet_results[smi]:
+                                r["properties"][f"admet_{prop}"] = admet_results[smi][prop]
+                print(f"[Screening] ADMET-AI: {len(admet_results)} molecules annotated")
+        except ImportError:
+            print("[Screening] ADMET-AI not installed, skipping ADMET predictions")
+        except Exception as e:
+            print(f"[Screening] ADMET-AI warning: {e} (continuing without ADMET)")
+
         # Build report
         report = {
             "timestamp": timestamp,
             "backend": BACKEND,
+            "admet_ai": len(admet_results) > 0,
             "config": config.get("name", "custom"),
             "input_file": str(input_path),
             "output_file": str(output_sdf),

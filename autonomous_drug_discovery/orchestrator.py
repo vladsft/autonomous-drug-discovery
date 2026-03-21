@@ -39,10 +39,10 @@ def get_python_cmd(env_name):
     return ["conda", "run", "-n", env_name, "python"]
 
 
-def run_ingestion(pdb_path, db_path, campaign_id, clean_pdb=False):
-    """Run the ingestion module (fpocket wrapper)."""
+def run_ingestion(pdb_path, db_path, campaign_id, clean_pdb=False, pocket_backend="p2rank"):
+    """Run the ingestion module (P2Rank or fpocket)."""
     print(f"\n{'='*60}")
-    print(f"[Orchestrator] Stage 1: INGESTION — {pdb_path}")
+    print(f"[Orchestrator] Stage 1: INGESTION — {pdb_path} (backend={pocket_backend})")
     print(f"{'='*60}")
 
     script_path = MODULES_DIR / "01_ingestion" / "run_pocket.py"
@@ -56,6 +56,7 @@ def run_ingestion(pdb_path, db_path, campaign_id, clean_pdb=False):
         "--output_dir", str(DATA_DIR / "processed"),
         "--db_path", db_path,
         "--campaign_id", campaign_id,
+        "--backend", pocket_backend,
     ]
     if clean_pdb:
         cmd.append("--clean")

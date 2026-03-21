@@ -1,7 +1,10 @@
 """
-Module 01: Ingestion — fpocket Wrapper.
+Module 01: Ingestion — Pocket Detection (P2Rank / fpocket).
 
-Wraps the fpocket binary to identify binding pockets on a protein PDB.
+Two backends:
+  - p2rank (default): ML-based pocket prediction, 10-20% better recall than fpocket.
+  - fpocket: Geometry-based detection, fallback if Java/P2Rank unavailable.
+
 Produces a manifest.json (pocket data) and run_metadata.json (telemetry).
 
 Input contract:  .pdb file path
@@ -11,6 +14,7 @@ Output contract: {stem}_manifest.json + run_metadata.json
 import os
 import sys
 import argparse
+import csv
 import subprocess
 import shutil
 import json
@@ -24,6 +28,7 @@ from pathlib import Path
 MODULE_DIR = Path(__file__).parent.resolve()
 PROJECT_ROOT = MODULE_DIR.parent.parent
 FPOCKET_BIN = Path("/home/vladsft/fpocket/bin/fpocket")
+P2RANK_BIN = Path("/home/vladsft/p2rank_2.5.1/prank")
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from telemetry import TelemetryDB
@@ -54,6 +59,161 @@ def _parse_pocket_scores(info_txt_path):
                     scores[current_pocket] = float(m.group(1))
                     current_pocket = None
     return scores
+
+
+def _parse_p2rank_predictions(predictions_csv):
+    """Parse P2Rank predictions CSV. Returns list of dicts sorted by rank."""
+    pockets = []
+    with open(predictions_csv) as f:
+        # P2Rank CSV has spaces in headers — strip them
+        header = f.readline()
+        fieldnames = [h.strip() for h in header.split(",")]
+        reader = csv.DictReader(f, fieldnames=fieldnames, skipinitialspace=True)
+        for row in reader:
+            pockets.append({
+                "name": row["name"].strip(),
+                "rank": int(row["rank"].strip()),
+                "score": float(row["score"].strip()),
+                "probability": float(row["probability"].strip()),
+                "center_x": float(row["center_x"].strip()),
+                "center_y": float(row["center_y"].strip()),
+                "center_z": float(row["center_z"].strip()),
+                "residue_ids": row["residue_ids"].strip(),
+                "surf_atoms": int(row["surf_atoms"].strip()),
+            })
+    pockets.sort(key=lambda p: p["rank"])
+    return pockets
+
+
+def run_p2rank(pdb_file, output_dir, db_path=None, campaign_id=None):
+    """Run P2Rank on a PDB file with full telemetry capture."""
+    pdb_path = Path(pdb_file).resolve()
+    out_path = Path(output_dir).resolve()
+    out_path.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    db = None
+    run_id = None
+    parameters = {"backend": "p2rank", "p2rank_binary": str(P2RANK_BIN)}
+
+    if db_path and campaign_id:
+        db = TelemetryDB(db_path)
+        run_id = db.start_run(
+            campaign_id=campaign_id,
+            module_name="01_ingestion",
+            input_path=str(pdb_path),
+            parameters=parameters,
+        )
+
+    try:
+        if not pdb_path.exists():
+            raise FileNotFoundError(f"Input PDB file {pdb_path} does not exist.")
+        if not P2RANK_BIN.exists():
+            raise FileNotFoundError(f"P2Rank binary not found at {P2RANK_BIN}")
+
+        input_hash = _file_hash(pdb_path)
+        p2rank_out = out_path / f"{pdb_path.stem}_p2rank"
+
+        print(f"[Ingestion] Running P2Rank on {pdb_path.name}...")
+
+        cmd = [
+            str(P2RANK_BIN), "predict",
+            "-f", str(pdb_path),
+            "-o", str(p2rank_out),
+            "-visualizations", "0",
+        ]
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Parse predictions
+        predictions_csv = p2rank_out / f"{pdb_path.name}_predictions.csv"
+        if not predictions_csv.exists():
+            raise RuntimeError(f"P2Rank predictions not found at {predictions_csv}")
+
+        pockets = _parse_p2rank_predictions(predictions_csv)
+        print(f"[Ingestion] P2Rank found {len(pockets)} pockets")
+
+        # Build manifest — write best pocket residues as a PDB for downstream compatibility
+        best_pocket = pockets[0] if pockets else None
+        best_pocket_pdb = None
+
+        if best_pocket:
+            print(f"[Ingestion] Best pocket: {best_pocket['name']} "
+                  f"(score: {best_pocket['score']:.2f}, probability: {best_pocket['probability']:.3f})")
+
+            # Extract pocket atoms from PDB for docking box centroid
+            residue_ids = best_pocket["residue_ids"].split()
+            pocket_residues = set()
+            for rid in residue_ids:
+                parts = rid.split("_")
+                if len(parts) == 2:
+                    pocket_residues.add((parts[0], int(parts[1])))
+
+            # Write pocket PDB (atoms belonging to pocket residues)
+            best_pocket_pdb_path = p2rank_out / f"{pdb_path.stem}_pocket1_atm.pdb"
+            with open(pdb_path) as fin, open(best_pocket_pdb_path, "w") as fout:
+                for line in fin:
+                    if line.startswith(("ATOM", "HETATM")):
+                        chain = line[21]
+                        try:
+                            resnum = int(line[22:26].strip())
+                        except ValueError:
+                            continue
+                        if (chain, resnum) in pocket_residues:
+                            fout.write(line)
+            best_pocket_pdb = str(best_pocket_pdb_path)
+
+        manifest = {
+            "input_pdb": str(pdb_path),
+            "pocket_backend": "p2rank",
+            "p2rank_out_dir": str(p2rank_out),
+            "pockets_found": len(pockets),
+            "best_pocket": best_pocket_pdb,
+            "best_pocket_score": best_pocket["score"] if best_pocket else None,
+            "best_pocket_probability": best_pocket["probability"] if best_pocket else None,
+            "best_pocket_center": [
+                best_pocket["center_x"], best_pocket["center_y"], best_pocket["center_z"]
+            ] if best_pocket else None,
+        }
+
+        manifest_path = out_path / f"{pdb_path.stem}_manifest.json"
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=4)
+
+        metadata = {
+            "module": "01_ingestion",
+            "timestamp": timestamp,
+            "backend": "p2rank",
+            "input_pdb": str(pdb_path),
+            "input_hash_sha256": input_hash,
+            "pockets_found": len(pockets),
+            "best_pocket": best_pocket_pdb,
+            "manifest_path": str(manifest_path),
+            "status": "success",
+        }
+        with open(out_path / "run_metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        if db and run_id:
+            db.complete_run(run_id, "success", str(manifest_path))
+
+        print(f"[Ingestion] Manifest written to {manifest_path}")
+
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        print(f"[Ingestion] FAILED: {e}")
+        if db and run_id:
+            db.complete_run(run_id, "failed", error_trace=error_msg)
+        fail_metadata = {
+            "module": "01_ingestion", "timestamp": timestamp,
+            "input_pdb": str(pdb_path), "status": "failed",
+            "error": str(e), "traceback": error_msg,
+        }
+        with open(out_path / "run_metadata.json", "w") as f:
+            json.dump(fail_metadata, f, indent=2)
+        sys.exit(1)
+    finally:
+        if db:
+            db.close()
 
 
 def _get_fpocket_version():
@@ -224,15 +384,20 @@ def run_fpocket(pdb_file, output_dir, db_path=None, campaign_id=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Module 01: Ingestion (fpocket)")
+    parser = argparse.ArgumentParser(description="Module 01: Ingestion (P2Rank / fpocket)")
     parser.add_argument("--pdb", required=True, help="Input PDB file")
     parser.add_argument("--output_dir", required=True, help="Output directory")
     parser.add_argument("--db_path", default=None, help="Path to telemetry database")
     parser.add_argument("--campaign_id", default=None, help="Campaign ID for telemetry")
+    parser.add_argument("--backend", choices=["p2rank", "fpocket"], default="p2rank",
+                        help="Pocket detection backend (default: p2rank)")
     parser.add_argument("--clean", action="store_true", help="Clean PDB before processing")
     args = parser.parse_args()
 
-    run_fpocket(args.pdb, args.output_dir, args.db_path, args.campaign_id)
+    if args.backend == "p2rank":
+        run_p2rank(args.pdb, args.output_dir, args.db_path, args.campaign_id)
+    else:
+        run_fpocket(args.pdb, args.output_dir, args.db_path, args.campaign_id)
 
 
 if __name__ == "__main__":

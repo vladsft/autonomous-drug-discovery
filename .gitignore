@@ -42,6 +42,7 @@ autonomous_drug_discovery/data/candidates/
 autonomous_drug_discovery/data/screened/
 autonomous_drug_discovery/data/results/
 autonomous_drug_discovery/data/processed/*_out/
+autonomous_drug_discovery/data/processed/*_p2rank/
 autonomous_drug_discovery/data/processed/*_manifest.json
 autonomous_drug_discovery/data/processed/run_metadata.json
 
@@ -100,6 +101,7 @@ credentials.json
 .pytest_cache/
 
 # =============================================================================
-# Agent handoff (session-specific, not part of source)
+# Session-specific / external documents
 # =============================================================================
 AGENT_HANDOFF.md
+compass_artifact_*.md

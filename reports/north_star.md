@@ -8,7 +8,7 @@ It is not a replacement for medicinal chemistry expertise. It is infrastructure 
 
 ## The Problem
 
-Early-stage drug discovery involves a repetitive workflow: identify a target protein, find plausible binding sites, generate or screen candidate molecules, filter for drug-likeness and toxicity, score for binding affinity, and decide what to test next. Today, most academic and small-biotech teams do this by manually chaining together a patchwork of open-source tools — fpocket, AutoDock Vina, RDKit, various generative models — with custom scripts, inconsistent file formats, and no systematic record of what was tried, what failed, and why.
+Early-stage drug discovery involves a repetitive workflow: identify a target protein, find plausible binding sites, generate or screen candidate molecules, filter for drug-likeness and toxicity, score for binding affinity, and decide what to test next. Today, most academic and small-biotech teams do this by manually chaining together a patchwork of open-source tools — P2Rank, AutoDock Vina, RDKit, various generative models — with custom scripts, inconsistent file formats, and no systematic record of what was tried, what failed, and why.
 
 This means three things go wrong consistently:
 
@@ -16,100 +16,165 @@ This means three things go wrong consistently:
 2. **Silent attrition.** Molecules fail downstream — in synthesis, in assay, in ADMET profiling — for reasons that were detectable computationally but weren't checked because the pipeline didn't enforce it.
 3. **Expert bottleneck.** Computational chemists spend a disproportionate amount of time on pipeline plumbing (format conversion, job management, results aggregation) rather than on the scientific reasoning that actually moves the project forward.
 
-## What We Are Building
+No single open-source pipeline integrates the full workflow from target input through pocket detection, generative design, docking validation, ADMET filtering, and retrosynthetic feasibility assessment. This integration gap is our primary opportunity.
+
+## The Market
+
+The AI drug discovery market sits at approximately **$2.5–5B in 2025**, projected to reach **$8–16B by 2030** at 20–30% CAGR. Oncology dominates at 73% of all AI drug discovery studies. Over 200 AI-influenced drugs are in clinical development, with no FDA approval yet — the first is anticipated in 2026–2027.
+
+The competitive landscape is dominated by well-funded platforms:
+
+- **Schrödinger** ($180–200M annual revenue, ~1,750 customers, $50K–500K+/year licenses) — most commercially mature, zasocitinib in Phase 3
+- **Recursion-Exscientia** ($688M merger) — largest public AI drug discovery company
+- **Isomorphic Labs** ($600M Series A, $3B in pharma partnerships) — Alphabet/DeepMind
+- **Insilico Medicine** — fully AI-native drug (rentosertib) completed Phase IIa, target to candidate in 18 months at ~$150K cost
+
+A critical financial reality: the **50:1 ratio** between announced "biobucks" and actual upfront payments reveals deep industry caution. Big pharma is hedging — paying options, not commitments.
+
+**We are not competing with these companies.** We are building an open, modular, transparent alternative for academic labs and small biotechs who cannot afford Schrödinger licenses but still need to move from target to candidate efficiently. This academic/research segment is growing at the fastest CAGR in the market and is currently underserved by integrated tooling.
+
+## What We Build
 
 A modular, orchestrated pipeline with five stages:
 
-### Stage 1 — Target Ingestion and Context
+### Stage 1 — Pocket Detection
 
 Input: a PDB structure file for a protein of interest.
 
-The system prepares the structure for downstream analysis and gathers available context: known ligands from public databases (ChEMBL, PDB ligand records), relevant literature on the target's biology, existing drug programmes against the same target or family. The output is a structured target profile that informs every subsequent stage.
+The system identifies candidate binding pockets on the protein surface using P2Rank (ML-based, default) or fpocket (geometry-based fallback). Each pocket is ranked by predicted ligandability with pre-computed center coordinates for downstream docking.
 
-This stage is important because generative models and docking tools are only as good as the context they operate within. A molecule designed without awareness of known SAR (structure-activity relationships) for the target is a molecule designed in ignorance.
+P2Rank outperforms fpocket by 10–20 percentage points on standard benchmarks. Our validation confirms this: on EGFR (1M17), P2Rank places the pocket 2.7 A from the known drug binding site with 82% residue overlap, versus fpocket's 6.3 A and 53%.
 
-### Stage 2 — Structural Analysis and Pocket Detection
+### Stage 2 — Molecule Generation
 
-Using fpocket and related tools, the system identifies candidate binding pockets on the protein surface. Each pocket is characterised by volume, druggability score, and geometric properties.
+Given a prioritised binding pocket, the system generates candidate molecules. Two backends:
 
-Where possible, the system cross-references detected pockets against known binding sites in the literature. The goal is not just to find pockets, but to prioritise them — which sites are most likely to be pharmacologically relevant, and which are structural artefacts.
+- **RDKit fragment-based** (current default): Assembles drug-like scaffolds with functional groups and linkers, sized to fit the detected pocket. Fast, no GPU required, produces valid chemistry.
+- **TargetDiff diffusion** (ready, not yet in pipeline): E(3)-equivariant diffusion model that designs molecules conditioned on the 3D pocket shape. Should produce better-fitting candidates but requires hours on CPU (minutes on GPU).
 
-The output is one or more ranked binding sites with associated geometric data, ready to condition the generative stage.
+Critical caveat from the literature: an ICLR 2025 paper demonstrated that SBDD models routinely generate molecules with better Vina docking scores than known ligands — but this improvement is largely an artifact of generating larger molecules, not better binders. We must always evaluate molecular weight alongside docking score.
 
-### Stage 3 — Molecule Generation
+### Stage 3 — Scoring and Filtering
 
-Given a prioritised binding pocket, the system generates candidate molecules designed to complement the pocket geometry. This uses structure-conditioned generative models (currently TargetDiff; the architecture supports swapping in alternatives as the field evolves).
+Every candidate passes through multiple computational checks:
 
-Critical constraint: generated molecules must be filtered immediately for synthetic accessibility. A molecule that cannot be reasonably synthesised in a lab is not a candidate — it is noise. This stage must enforce that boundary aggressively, because generative models have no intrinsic incentive to produce makeable molecules.
+- **Drug-likeness.** Lipinski rules, QED, and related heuristics via RDKit. Effective at eliminating obvious failures.
+- **ADMET estimation.** ADMET-AI provides 104 predictions covering absorption, metabolism, toxicity, CYP450 inhibition, hERG liability, and more. AUROC >0.85 for 20 of 31 classification tasks on the TDC benchmark. Performance degrades on novel scaffolds — which is exactly where AI-generated molecules live.
+- **Synthetic accessibility.** SA scores flag molecules that would be impractical to make. Retrosynthetic feasibility via AiZynthFinder (planned) will provide route-level assessment.
+- **PAINS filters.** Removes molecules with known promiscuous substructures.
 
-The output is a set of structurally novel candidate molecules, each associated with the pocket it was designed for.
+No single filter is reliable alone. The value is in the combination.
 
-### Stage 4 — Scoring and Filtering
+### Stage 4 — Docking
 
-Every candidate passes through a series of computational checks:
+Binding affinity estimation via AutoDock Vina, using the pocket center from Stage 1 to place the docking box. Each molecule is prepared via Meeko, docked with exhaustiveness=8, and scored.
 
-- **Drug-likeness.** Lipinski and related heuristics via RDKit. Not predictive on their own, but effective at eliminating obvious failures.
-- **ADMET estimation.** Absorption, distribution, metabolism, excretion, and toxicity heuristics. These are approximate, not definitive — the system must communicate confidence levels, not binary pass/fail.
-- **Binding affinity scoring.** Docking against the target pocket using established tools. Docking scores are noisy and weakly correlated with true affinity — the system treats them as a ranking signal, not a measurement.
-- **Synthetic accessibility.** SA scores and retrosynthetic feasibility checks where possible.
-
-No single filter is reliable alone. The value is in the combination — molecules that survive all filters are meaningfully more likely to be worth a chemist's attention than unfiltered generative output.
-
-The output is a ranked candidate list with per-molecule scorecards showing every metric computed and the assumptions behind each.
+Honest limitation: the Pearson correlation between docking scores and experimental binding affinity is only **r = 0.4–0.6**. Docking scores are a ranking signal, not a measurement. Virtual screening hit rates from docking run 1–5% traditionally, improving to 10–30% with ML-enhanced approaches. We treat docking as one signal among many, not the final answer.
 
 ### Stage 5 — Reporting and Handoff
 
 The system produces a structured research artefact for human review:
 
-- Ranked candidates with full rationale (why this molecule, for this pocket, with these scores).
-- Explicit assumptions and limitations (where the scoring is weak, where the model is extrapolating, where literature support is thin).
-- Suggested next steps for experimental validation, ordered by information value — what experiment would most efficiently confirm or eliminate the top candidates.
+- Ranked candidates with per-molecule scorecards showing every metric computed.
+- ADMET profiles highlighting toxicity risks and metabolic liabilities.
+- Explicit assumptions and limitations.
+- All results logged to a SQLite telemetry database for full provenance tracking.
 
 This is the deliverable. Not a cure, not a clinical candidate, not a paper. A prioritised, transparent, auditable set of hypotheses that helps a researcher decide what to make and test next.
 
-## The Orchestration Layer
+## Where We Are
 
-The five stages above are not novel individually. What is novel is wiring them into a single reproducible workflow with:
+### Validated Results (M1 + M2 complete)
 
-- **Full provenance tracking.** Every decision, parameter, score, and intermediate output is logged in a structured database. Any result can be traced back to the exact inputs and configuration that produced it.
-- **Campaign-level memory.** When multiple campaigns are run against related targets, the system retains what was tried and what failed. Over time, this builds an institutional memory that no individual researcher carries.
-- **Adaptive strategy (future).** An AI planning layer that adjusts pipeline parameters mid-campaign based on observed attrition rates. If a generative model is producing molecules that consistently fail the ADMET filter, the planner tightens generation constraints or switches models. This is not implemented yet and depends on having sufficient real campaign data to learn from. We do not pretend it works today.
+The pipeline runs end-to-end with real tools on real proteins. Validated against three well-characterised cancer targets where the answers are known:
+
+| Target | Disease | Known Drug | Best Dock Score | Pocket Distance | Residue Overlap |
+|--------|---------|------------|----------------|-----------------|-----------------|
+| EGFR (1M17) | Lung cancer | Erlotinib | -9.32 kcal/mol | 2.7 A | 82% |
+| BCR-ABL (2HYY) | Leukemia | Imatinib | -12.56 kcal/mol | 2.7 A | 92% |
+| BRAF V600E (6P3D) | Melanoma | Ponatinib | -10.40 kcal/mol | 3.1 A | 89% |
+
+The pipeline independently finds molecules scoring in the same range as known approved drugs, without any knowledge of those drugs. Pocket detection places the docking box within 3 A of the crystallographic drug position for all three targets. This is the scientific credibility gate — the system recovers what is already known.
+
+### Current Tool Stack
+
+| Component | Tool | Status |
+|-----------|------|--------|
+| Pocket detection | P2Rank (ML-based) | Integrated, default |
+| Molecule generation | RDKit fragment-based | Integrated |
+| Molecule generation | TargetDiff diffusion | Environment ready, checkpoint downloaded |
+| Screening | RDKit + ADMET-AI (104 properties) | Integrated |
+| Docking | AutoDock Vina + Meeko | Integrated |
+| Telemetry | SQLite | Integrated |
+| Benchmarking | benchmark.py | Integrated |
+
+## Where We Are Going
+
+### M3 — Domain Expert Integration (next)
+
+A computational chemistry or cancer research collaborator reviews pipeline output and feeds back: are the generated molecules sensible, are the rankings meaningful, are the failure modes expected or surprising. This feedback shapes filter thresholds, scoring weights, and generation constraints.
+
+**This is non-negotiable.** Without medicinal chemistry judgment, the pipeline produces numbers without meaning. Imperial's Chemistry department or Cancer Research center should be engaged now.
+
+### M4 — First Novel Campaign
+
+Run the pipeline against a target with genuine unmet need — where the answer is not known — and produce a candidate set that a research group considers worth synthesising. This is the point at which the system produces real scientific value.
+
+Oncology kinase targets are the most computationally tractable starting point: abundant crystal structures, well-defined binding pockets, extensive SAR data. KRAS G12D, novel EGFR resistance mutations, or emerging kinase targets would be strong M4 candidates.
+
+### M5 — Adaptive Planning
+
+With sufficient campaign history, implement an AI planning layer that adjusts pipeline parameters mid-campaign based on observed attrition. This is the long-term differentiator, but it earns its existence only after M3-M4 are solid.
+
+### Technical Roadmap
+
+Near-term (M3 timeline):
+- Integrate TargetDiff diffusion generation into the pipeline
+- Add GNINA CNN-based rescoring alongside Vina
+- Add AiZynthFinder retrosynthetic feasibility
+- Tighten screening thresholds based on expert feedback
+- Per-campaign output directories (prevent file collisions)
+
+Medium-term:
+- AlphaFold/ESMFold integration for targets without crystal structures
+- Multi-pocket docking (top 3 pockets, not just best)
+- Docker containerization for reproducible deployment
+- Publishable methods paper (Journal of Cheminformatics or JCIM)
+
+## Strategic Positioning
+
+**What we are:** An open, modular, well-engineered orchestration layer that makes state-of-the-art computational drug discovery accessible to researchers who lack the software engineering capacity to build pipelines themselves.
+
+**Who we serve:** Academic labs, small biotechs, and chemistry groups at institutions who have domain expertise but not the engineering resources to chain P2Rank, TargetDiff, RDKit, Vina, ADMET-AI, and AiZynthFinder into a reproducible, documented workflow.
+
+**How we differentiate:** Not by algorithmic novelty (the individual tools are freely available), but by integration quality, reproducibility, transparency, and honest communication of limitations. The COVID Moonshot project proved that open-source, community-driven drug discovery can produce real candidates. The hunger for accessible, integrated tools is genuine.
+
+**Business model path:** Freemium open-source — release the pipeline openly to build adoption and credibility, then monetize through cloud-hosted premium features, consulting/customization, or partnership deals based on demonstrated utility.
 
 ## What This Is Not
 
-**It is not a drug.** Nothing this system produces is a therapeutic. It produces hypotheses for experimental validation.
+**It is not a drug.** Nothing this system produces is a therapeutic. It produces hypotheses for experimental validation. The wet lab bottleneck is real: synthesising a single compound costs $500–5,000+ and takes weeks.
 
 **It is not a replacement for domain expertise.** The system's output requires evaluation by someone who understands medicinal chemistry, structural biology, and the specific disease context. The system accelerates their work — it does not replace their judgment.
 
-**It is not validated yet.** The pipeline exists as a working skeleton. The individual tools are established, but the integrated pipeline has not yet been benchmarked against known outcomes. Validation — running well-studied targets where the right answers are known and checking whether the system recovers them — is the immediate next milestone.
+**It is not competing with Schrödinger or Recursion.** A 2–3 person team cannot compete on pipeline depth, proprietary data, or clinical validation. We compete on accessibility, transparency, and community adoption in an underserved market segment.
 
-**It is not the adaptive agent yet.** The learning-across-campaigns vision is the long-term goal, not the current capability. The current system runs a fixed pipeline with configurable parameters. Adaptive planning requires real experimental feedback data that we do not yet have.
+## Honest Risk Assessment
 
-## Milestones
+**The scoring function gap undermines all downstream claims.** If docking scores correlate with experimental binding at only r = 0.4–0.6, then ranking candidates by docking score is ranking by a noisy proxy. Every result we present must acknowledge this limitation.
 
-### M1 — Working Pipeline (Current)
-Pipeline runs end-to-end on a real protein target with real tools (not simulation stubs). RDKit screening functional. Real docking scores. Output reviewed by a domain expert.
+**The commoditization clock is ticking.** AlphaFold 3 was published in May 2024; Chai Discovery open-sourced a comparable model by September 2024. Over 200 foundation models for drug discovery have been published since 2022. Generic generative models are being rapidly commoditized. Our value must come from integration quality, not algorithmic uniqueness.
 
-### M2 — Validation Against Known Targets
-Run the pipeline against 3-5 well-characterised targets (e.g., EGFR, BCR-ABL, BRAF V600E) where known active compounds exist. Measure whether the system recovers known ligands or proposes structurally similar candidates. This is the scientific credibility gate — if the system cannot recover what is already known, it cannot be trusted to propose what is unknown.
+**ADMET prediction degrades on novel chemistry.** ADMET-AI performs well on known scaffolds but poorly on out-of-distribution structures — which is exactly what generative models produce. We must communicate confidence levels, not binary pass/fail.
 
-### M3 — Domain Expert Integration
-A computational chemistry or cancer research collaborator actively reviews pipeline output and feeds back on quality: are the generated molecules sensible, are the rankings meaningful, are the failure modes expected or surprising. This feedback shapes filter thresholds, scoring weights, and generation constraints.
+**Defensibility is limited for pure software.** Durable moats come from proprietary experimental data, integrated wet-dry lab platforms, and clinical pipeline IP — not from software that chains freely available tools. Long-term defensibility requires community adoption and real-world validation data.
 
-### M4 — First Novel Campaign
-Run the pipeline against a target with genuine unmet need — where the answer is not known — and produce a candidate set that a research group considers worth synthesising. This is the point at which the system produces real scientific value.
+**The BenevolentAI cautionary tale.** Founded 2013, raised hundreds of millions, went public at ~$2B valuation, then watched their lead clinical asset fail Phase 2a with no benefit over placebo. The target and mechanism were already well-known — AI's contribution was questionable. Stock collapsed from >$9 to <$2. Lesson: AI is not a substitute for good target selection, and overpromising destroys credibility.
 
-### M5 — Adaptive Planning
-With sufficient campaign history (M4 repeated across multiple targets), implement the adaptive planning layer. The system begins adjusting strategy based on observed attrition patterns. This is the long-term differentiator, but it earns its existence only after M1-M4 are solid.
+## Operating Principles
 
-## Why We Might Succeed
-
-The individual tools are mature and freely available. The integration — turning a manual, ad hoc workflow into a reproducible, logged, orchestrated pipeline — is genuine engineering value that most small research teams cannot build themselves. The team combines software engineering capability with chemistry training, and has access to domain expertise through academic collaborators.
-
-The competitive landscape is dominated by well-funded companies building proprietary end-to-end platforms. We are not competing with them. We are building an open, modular, transparent alternative for academic labs and small biotechs who cannot afford Schrödinger licenses or Recursion partnerships but who still need to move from target to candidate efficiently.
-
-## Why We Might Fail
-
-The generative models may not produce molecules that real chemists take seriously. The scoring layer may not be discriminative enough to meaningfully rank candidates. The adaptive planning vision may require more data than we can realistically accumulate. And the team may not secure the sustained domain expertise needed to validate the pipeline's scientific output.
-
-These are not reasons to stop. They are the specific risks we are working to retire, in order, starting with M1.
+1. **Don't oversell.** Position honestly: we generate ranked hypotheses for experimental validation, not "discover drugs." Intellectual honesty, rare in this space, is itself a differentiator.
+2. **Validate before claiming.** Every capability must be benchmarked against known outcomes before being used on novel targets.
+3. **Show your work.** Full provenance tracking, explicit limitations, auditable decisions. If a result can't be traced back to its inputs, it doesn't count.
+4. **The domain expert is the customer.** Build for the computational chemist who needs to decide what to synthesise next, not for the investor who wants to hear about AI.
+5. **Publish early and openly.** A well-documented, benchmarked, open-source pipeline paper establishes credibility and attracts the community contributions that any future commercial model requires.

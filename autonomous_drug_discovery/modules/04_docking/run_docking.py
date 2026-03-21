@@ -196,9 +196,14 @@ def run_docking_production(manifest, candidates_dir, out_path, parameters, db=No
     print(f"[Docking] Preparing receptor PDBQT for {receptor_pdb.name}...")
     _prepare_receptor_pdbqt(receptor_pdb, receptor_pdbqt)
 
-    # 2. Box center from pocket centroid
+    # 2. Box center: use P2Rank's pre-computed center if available, else compute from pocket PDB
     pocket_pdb = manifest.get("best_pocket")
-    box_center = _compute_pocket_centroid(pocket_pdb) if pocket_pdb else [0, 0, 0]
+    if manifest.get("best_pocket_center"):
+        box_center = manifest["best_pocket_center"]
+    elif pocket_pdb:
+        box_center = _compute_pocket_centroid(pocket_pdb)
+    else:
+        box_center = [0, 0, 0]
     box_size = parameters.get("box_size", [20, 20, 20])
     print(f"[Docking] Box center: {box_center}, size: {box_size}")
 
