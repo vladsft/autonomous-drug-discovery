@@ -58,7 +58,7 @@ Critical caveat from the literature: an ICLR 2025 paper demonstrated that SBDD m
 
 Every candidate passes through multiple computational checks:
 
-- **Drug-likeness.** Lipinski rules, QED, and related heuristics via RDKit. Effective at eliminating obvious failures.
+- **Drug-likeness.** Lipinski rules, QED, and related heuristics via MolScore (preferred) or RDKit fallback. Effective at eliminating obvious failures.
 - **ADMET estimation.** ADMET-AI provides 104 predictions covering absorption, metabolism, toxicity, CYP450 inhibition, hERG liability, and more. AUROC >0.85 for 20 of 31 classification tasks on the TDC benchmark. Performance degrades on novel scaffolds — which is exactly where AI-generated molecules live.
 - **Synthetic accessibility.** SA scores flag molecules that would be impractical to make. Retrosynthetic feasibility via AiZynthFinder (planned) will provide route-level assessment.
 - **PAINS filters.** Removes molecules with known promiscuous substructures.
@@ -88,22 +88,36 @@ This is the deliverable. Not a cure, not a clinical candidate, not a paper. A pr
 
 The pipeline runs end-to-end with real tools on real proteins. Validated against three well-characterised cancer targets where the answers are known:
 
-| Target | Disease | Known Drug | Best Dock Score | Pocket Distance | Residue Overlap |
-|--------|---------|------------|----------------|-----------------|-----------------|
-| EGFR (1M17) | Lung cancer | Erlotinib | -9.32 kcal/mol | 2.7 A | 82% |
-| BCR-ABL (2HYY) | Leukemia | Imatinib | -12.56 kcal/mol | 2.7 A | 92% |
-| BRAF V600E (6P3D) | Melanoma | Ponatinib | -10.40 kcal/mol | 3.1 A | 89% |
+| Target | Disease | Known Drug | Best Dock Score | Avg Dock | Pocket Distance | Residue Overlap |
+|--------|---------|------------|----------------|----------|-----------------|-----------------|
+| EGFR (1M17) | Lung cancer | Erlotinib | -9.32 kcal/mol | -6.58 | 2.7 A | 82% |
+| BCR-ABL (2HYY) | Leukemia | Imatinib | -12.59 kcal/mol | -9.25 | 2.7 A | 92% |
+| BRAF V600E (6P3D) | Melanoma | Ponatinib | -11.20 kcal/mol | -8.39 | 3.1 A | 89% |
 
 The pipeline independently finds molecules scoring in the same range as known approved drugs, without any knowledge of those drugs. Pocket detection places the docking box within 3 A of the crystallographic drug position for all three targets. This is the scientific credibility gate — the system recovers what is already known.
+
+P2Rank outperformed fpocket in a head-to-head comparison on all three targets: EGFR pocket placement improved from 6.1 A to 2.7 A, and residue overlap improved from 53% to 82%. BCR-ABL and BRAF showed comparable geometry (both methods placed pockets well) with P2Rank maintaining a slight edge in residue overlap.
+
+### TargetDiff Proof-of-Concept (M2.5)
+
+The TargetDiff E(3)-equivariant diffusion model was run standalone on the BRAF V600E pocket, generating molecules from random noise conditioned on the 3D pocket shape (1000 denoising steps, CPU inference, ~12 min/molecule):
+
+| Molecule | MW | QED | Dock Score | Ligand Efficiency | Tanimoto to Ponatinib |
+|----------|----|-----|-----------|-------------------|----------------------|
+| `C1=CN=CC=C(c2cccc(Nc3ccncc3)c2)C1` | 261 | 0.899 | -7.59 kcal/mol | 0.38 | 0.186 |
+| `COc1cnc(C(=O)NCc2cccc(C)n2)cn1` | 258 | 0.889 | -7.38 kcal/mol | 0.39 | 0.154 |
+
+Both molecules are drug-like, compact, and structurally novel (low similarity to known drugs). Docking scores are moderate (-7.4 to -7.6), weaker than the best RDKit-generated candidates (-11.2) but within the "worth investigating" range. Ligand efficiency (0.38-0.39) is excellent. TargetDiff is not yet integrated into the orchestrator pipeline.
 
 ### Current Tool Stack
 
 | Component | Tool | Status |
 |-----------|------|--------|
 | Pocket detection | P2Rank (ML-based) | Integrated, default |
+| Pocket detection | fpocket (geometry-based) | Integrated, fallback |
 | Molecule generation | RDKit fragment-based | Integrated |
-| Molecule generation | TargetDiff diffusion | Environment ready, checkpoint downloaded |
-| Screening | RDKit + ADMET-AI (104 properties) | Integrated |
+| Molecule generation | TargetDiff diffusion | Env ready, standalone POC done, not in orchestrator |
+| Screening | MolScore (primary) + RDKit fallback + ADMET-AI (104 properties) | Integrated |
 | Docking | AutoDock Vina + Meeko | Integrated |
 | Telemetry | SQLite | Integrated |
 | Benchmarking | benchmark.py | Integrated |
@@ -129,11 +143,11 @@ With sufficient campaign history, implement an AI planning layer that adjusts pi
 ### Technical Roadmap
 
 Near-term (M3 timeline):
-- Integrate TargetDiff diffusion generation into the pipeline
-- Add GNINA CNN-based rescoring alongside Vina
+- Wire TargetDiff into orchestrator pipeline (standalone POC done, needs config YAML integration)
+- Per-campaign output directories (prevent file collisions between concurrent runs)
+- Add GNINA CNN-based rescoring alongside Vina (needs GPU)
 - Add AiZynthFinder retrosynthetic feasibility
-- Tighten screening thresholds based on expert feedback
-- Per-campaign output directories (prevent file collisions)
+- Tighten screening thresholds based on expert feedback (current survival: 73-98%, target: 40-60%)
 
 Medium-term:
 - AlphaFold/ESMFold integration for targets without crystal structures

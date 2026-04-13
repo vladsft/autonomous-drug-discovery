@@ -353,18 +353,13 @@ def run_screening(input_sdf: str, output_dir: str, config_path: str | None = Non
             if survivor_smiles:
                 print(f"[Screening] Running ADMET-AI on {len(survivor_smiles)} survivors...")
                 admet_preds = admet_model.predict(smiles=survivor_smiles)
-                # admet_preds is a dict of {property: value} for single, or list for batch
-                if isinstance(admet_preds, dict) and len(survivor_smiles) == 1:
-                    admet_results[survivor_smiles[0]] = {
-                        k: round(v, 4) if isinstance(v, float) else v
-                        for k, v in admet_preds.items()
+                # admet_preds is a pandas DataFrame (rows=molecules, cols=properties)
+                for i, smi in enumerate(survivor_smiles):
+                    row = admet_preds.iloc[i]
+                    admet_results[smi] = {
+                        k: round(float(v), 4) if isinstance(v, (float, int)) else v
+                        for k, v in row.items()
                     }
-                elif isinstance(admet_preds, list):
-                    for smi, pred in zip(survivor_smiles, admet_preds):
-                        admet_results[smi] = {
-                            k: round(v, 4) if isinstance(v, float) else v
-                            for k, v in pred.items()
-                        }
                 # Select key ADMET properties for the report
                 admet_key_props = [
                     "hERG", "AMES", "DILI", "CYP2D6_Veith", "CYP3A4_Veith",

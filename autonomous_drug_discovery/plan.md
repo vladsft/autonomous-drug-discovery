@@ -2,13 +2,25 @@
 
 ## Current State
 
-The pipeline exists as a working skeleton that runs end-to-end in simulation mode. The orchestrator CLI accepts a PDB file and moves through pocket detection, molecule generation, screening, and scoring. Campaign telemetry is logged to a local database.
+**M1 (Working Pipeline) and M2 (Validation) are complete.**
 
-What works: fpocket integration for pocket detection. Simulation stubs for generation, screening, and docking. Campaign tracking and CLI interface.
+The pipeline runs end-to-end with real tools on real proteins. All four stages are production-grade:
 
-What does not work yet: RDKit is not installed, so drug-likeness filtering produces no real results. TargetDiff runs in stub mode — no actual diffusion-based generation. Docking falls back to dummy scores. The LLM-based agent planner has no API key configured and defaults to the fixed pipeline.
+- **Pocket detection**: P2Rank (ML-based, default) and fpocket (geometry-based fallback) both integrated. P2Rank is the default.
+- **Molecule generation**: RDKit fragment-based generation integrated. TargetDiff diffusion model has a working standalone proof-of-concept (BRAF V600E) but is not yet wired into the orchestrator pipeline.
+- **Screening**: MolScore (primary backend) or RDKit fallback, with ADMET-AI enrichment (104 properties) on survivors.
+- **Docking**: AutoDock Vina (production), TDC Oracle (triage), and simulation stubs all supported.
+- **Telemetry**: Full SQLite logging across all stages.
 
-The immediate priority is turning the simulation pipeline into a real one, validating it against known science, and only then layering intelligence on top.
+Validated against three cancer targets with crystallographic ground truth:
+
+| Target | Best Dock | Pocket Distance | Residue Overlap |
+|--------|-----------|-----------------|-----------------|
+| EGFR (1M17) | -9.32 kcal/mol | 2.7 A | 82% |
+| BCR-ABL (2HYY) | -12.59 kcal/mol | 2.7 A | 92% |
+| BRAF V600E (6P3D) | -11.20 kcal/mol | 3.1 A | 89% |
+
+The immediate priorities are: M3 domain expert review (non-negotiable), TargetDiff orchestrator integration, and per-campaign output directories to prevent file collisions.
 
 ## Architecture
 
@@ -106,25 +118,25 @@ Both should be available as interchangeable modules behind a common interface. T
 
 ## Immediate Next Steps (In Order)
 
-### Step 1 — Get Real Tools Running
-Install RDKit. Replace screening stubs with actual property calculations. Confirm that the pipeline produces real QED, SA, and Lipinski values for generated molecules. This is the single highest-value task right now.
+### Step 1 — M3: Domain Expert Review (Highest Priority)
+Engage a medicinal chemistry or cancer research collaborator to review pipeline output on the three validated targets. Ask: are the generated molecules sensible, are the rankings meaningful, are the failure modes expected? This feedback shapes filter thresholds, scoring weights, and generation constraints. Without medicinal chemistry judgment, the pipeline produces numbers without meaning.
 
-### Step 2 — Real Docking
-Install and configure AutoDock Vina. Replace dummy docking scores with real ones. Confirm that docking runs complete and produce physically meaningful poses and scores.
+### Step 2 — TargetDiff Orchestrator Integration
+The TargetDiff standalone POC is done (BRAF V600E, 2 molecules, CPU inference ~12 min/molecule). Wire it into the orchestrator as a selectable generation backend via `--mode targetdiff`. Requires passing config YAML to the targetdiff environment.
 
-### Step 3 — Real Generation
-Get TargetDiff or Pocket2Mol running in non-stub mode. Generate actual molecules conditioned on a real pocket. Inspect the output manually — do the molecules look like plausible drug-like compounds, or are they chemical nonsense?
+### Step 3 — Per-Campaign Output Directories
+Currently all campaigns write to shared output directories with hardcoded filenames. Concurrent runs collide. Each campaign should write to a timestamped subdirectory (e.g., `data/campaigns/{campaign_id}/`).
 
-### Step 4 — First Real End-to-End Run
-Pick EGFR (PDB: 1M17 or similar). Run the full pipeline. Examine every intermediate output. Show the final ranked list to a domain expert (your Chemistry teammate or the professor). Ask: is any of this useful?
+### Step 4 — Tighten Screening Thresholds
+Current survival rates are 73-98% (target: 40-60%). This means the generator is over-producing junk or filters are too loose. Tighten based on Step 1 expert input. This is a config-only change (`default_scoring_config.json`).
 
-### Step 5 — Validation Benchmark
-Run the pipeline against 3-5 known targets as described in Layer 3. Document results. This is the deliverable that determines whether the project is scientifically viable.
+### Step 5 — GNINA Rescoring (After Steps 1-4)
+Add GNINA CNN-based rescoring alongside Vina. Needs GPU; download binary from github.com/gnina/gnina/releases. Only worthwhile after screening is properly calibrated.
 
-### Step 6 — Iterate Based on Expert Feedback
-Adjust filter thresholds, generation parameters, and scoring weights based on what the validation benchmark and domain expert feedback reveal. This is where the real learning happens — not in an LLM, but in the team understanding what the tools actually do well and poorly.
+### Step 6 — AiZynthFinder Retrosynthetic Feasibility
+`pip install aizynthfinder` (needs policy models). Apply to top-ranked candidates only — it is slow and heavyweight. Provides route-level synthesis feasibility, far more informative than SA score alone.
 
-### Step 7 — Agent Planner (Only After Steps 1-6)
+### Step 7 — Agent Planner (Only After M3 Feedback)
 By this point you have real telemetry data, validated benchmarks, and expert-informed parameter ranges. Now you can build the agent planner with actual knowledge to encode, not guesses.
 
 ## Principles

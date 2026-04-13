@@ -32,7 +32,7 @@ Validated against three cancer targets with crystallographic ground truth:
 
 ```bash
 conda install -n base -c conda-forge rdkit vina openjdk=17 -y
-pip install meeko gemmi admet-ai
+pip install meeko gemmi admet-ai molscore
 ```
 
 Download P2Rank:
@@ -136,13 +136,16 @@ conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json 
 
 ### Stage 3: Screening (`03_screening/run_screening.py`)
 
-**Tool:** RDKit filters + ADMET-AI (104-property toxicity/absorption/metabolism prediction)
+**Tool:** MolScore (preferred) or RDKit fallback + ADMET-AI (104-property toxicity/absorption/metabolism prediction)
+
+The screening module uses MolScore as the primary backend for descriptor calculation and PAINS filtering. If MolScore is not installed, it falls back to hand-rolled RDKit filters. ADMET-AI enrichment runs on survivors regardless of backend.
 
 **Input:** An `.sdf` file of candidate molecules.
 
 **Output:**
 - `screened_molecules.sdf` — only molecules that passed all filters.
 - `screening_report.json` — per-molecule properties, pass/fail status, ADMET annotations, and attrition summary.
+- `run_metadata.json` — module execution metadata (backend, counts, status).
 
 **Filters applied (configurable in `default_scoring_config.json`):**
 
@@ -156,14 +159,15 @@ conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json 
 | QED | >= 0.3 | Drug-likeness |
 | PAINS | = 0 | No toxic substructure alerts |
 
-**Adding a new filter:** Edit `default_scoring_config.json`. Each entry in `filter_thresholds` maps a property name to `{"max": N}`, `{"min": N}`, or `{"equals": N}`. No code change required.
+**Adding a new filter:** Edit `default_scoring_config.json`. Each entry in `filter_thresholds` maps a property name (prefixed `desc_` for descriptors, `filter_` for substructure filters) to `{"max": N}`, `{"min": N}`, or `{"equals": N}`. No code change required.
 
 ### Stage 4: Docking (`04_docking/run_docking.py`)
 
 **Tool:** AutoDock Vina (Python API) + Meeko (ligand PDBQT preparation)
 
 **Modes:**
-- `simulation` — returns hardcoded dummy scores.
+- `simulation` — returns hardcoded dummy scores for pipeline testing.
+- `triage` — fast SMILES-based docking via the TDC Oracle (Vina under the hood). Lower setup overhead than production; requires `pytdc`. Falls back to simulation if unavailable.
 - `production` — full Vina docking pipeline: converts receptor PDB to PDBQT with proper AutoDock atom typing (C, A, N, NA, OA, SA, HD), prepares each ligand via Meeko, computes Vina grid maps centered on the pocket centroid, docks with exhaustiveness=8 and 9 poses per ligand, reports the best binding affinity.
 
 **Input:** `manifest.json` (for receptor PDB and pocket centroid) + candidates directory containing an `.sdf` file.
@@ -252,7 +256,7 @@ The fragment library (scaffolds, substituents, linkers) is defined at the top of
 ### Working now (M1 + M2 complete)
 - Pocket detection (P2Rank, default) — ML-based, validated against crystallography
 - Molecule generation (RDKit fragment-based) — pocket-aware sizing
-- Screening (RDKit + ADMET-AI) — Lipinski + QED + SA + PAINS + 104 ADMET properties
+- Screening (MolScore + ADMET-AI) — Lipinski + QED + SA + PAINS + 104 ADMET properties
 - Docking (AutoDock Vina) — production-grade, uses P2Rank pocket centers
 - Campaign telemetry — full logging of all stages
 - Validated against 3 cancer targets (EGFR, BCR-ABL, BRAF V600E) with crystallographic ground truth
@@ -272,6 +276,7 @@ The fragment library (scaffolds, substituents, linkers) is defined at the top of
 | P2Rank | ML-based pocket detection (default) | [Download binary](https://github.com/rdk/p2rank/releases) |
 | Java 17+ | Required by P2Rank | `conda install -c conda-forge openjdk=17` |
 | RDKit | Molecular property calculation, fragment generation, PAINS filters | `conda install -c conda-forge rdkit` |
+| MolScore | Primary screening backend — descriptor calculation and PAINS filtering | `pip install molscore` |
 | AutoDock Vina | Molecular docking (binding affinity scoring) | `conda install -c conda-forge vina` |
 | Meeko | Ligand PDBQT preparation for Vina | `pip install meeko` |
 | gemmi | Receptor PDB parsing and atom typing | `pip install gemmi` |
