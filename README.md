@@ -31,8 +31,11 @@ Validated against three cancer targets with crystallographic ground truth:
 ### Install dependencies
 
 ```bash
+# Step 1 — conda packages (compiled extensions)
 conda install -n base -c conda-forge rdkit vina openjdk=17 -y
-pip install meeko gemmi admet-ai molscore
+
+# Step 2 — pip packages
+pip install -r autonomous_drug_discovery/requirements.txt
 ```
 
 Download P2Rank:
@@ -63,6 +66,18 @@ conda run -n base python orchestrator.py screen data/candidates/generated_molecu
 conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json --mode production
 ```
 
+## Documentation
+
+| Doc | Question it answers |
+|-----|---------------------|
+| This README | What is this repo? Quick start, structure, dependencies |
+| [docs/north-star.md](docs/north-star.md) | What are we building and why? Vision, market, strategy, roadmap |
+| [docs/testing-guide.md](docs/testing-guide.md) | How do I know the science works? Plain-language explanations, validation experiments, glossary |
+| [docs/pipeline-guide.md](docs/pipeline-guide.md) | How do I use the pipeline? Commands, modes, parameters, output structure |
+| [docs/installation.md](docs/installation.md) | How do I set this up? Prerequisites, install steps, troubleshooting |
+| [docs/telemetry-guide.md](docs/telemetry-guide.md) | How do I query the data? DB schema, SQL queries, Python API |
+| [docs/targetdiff-setup.md](docs/targetdiff-setup.md) | How do I set up TargetDiff? Separate env, standalone testing, performance |
+
 ## Repository structure
 
 ```
@@ -71,40 +86,29 @@ conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json 
 │   ├── orchestrator.py              # CLI entrypoint — runs stages individually or as full pipeline
 │   ├── agent_planner.py             # LLM-driven adaptive orchestration (optional, requires API key)
 │   ├── telemetry.py                 # SQLite telemetry database (runs + molecule_scores tables)
-│   ├── plan.md                      # Architectural plan and roadmap
 │   │
 │   ├── modules/
 │   │   ├── 01_ingestion/
-│   │   │   └── run_pocket.py        # fpocket wrapper — detects binding pockets on a PDB file
+│   │   │   └── run_pocket.py        # P2Rank / fpocket — detects binding pockets on a PDB file
 │   │   ├── 02_generation/
 │   │   │   └── run_generation.py    # Molecule generator — fragment-based (RDKit) or TargetDiff
 │   │   ├── 03_screening/
-│   │   │   ├── run_screening.py     # Drug-likeness filters — Lipinski, QED, SA, PAINS
+│   │   │   ├── run_screening.py     # Drug-likeness filters — Lipinski, QED, SA, PAINS, ADMET-AI
 │   │   │   └── default_scoring_config.json  # Filter thresholds (editable)
 │   │   └── 04_docking/
-│   │       └── run_docking.py       # AutoDock Vina docking — simulation, or production mode
+│   │       └── run_docking.py       # AutoDock Vina docking — simulation, triage, or production mode
 │   │
 │   ├── data/
-│   │   └── processed/
-│   │       ├── 1M17.pdb             # EGFR kinase (erlotinib co-crystal) — validation target
-│   │       └── 1UYD.pdb             # UDP-GlcNAc epimerase — test target
+│   │   └── processed/               # PDB files and manifests
 │   │
-│   ├── envs/                        # Conda environment specs (for reference)
-│   │   ├── env_orchestrator.yml
-│   │   ├── env_docking.yml
-│   │   └── env_targetdiff.yml
-│   │
+│   ├── envs/                        # Conda environment specs
 │   └── tests/
 │       ├── test_screening.py
 │       └── test_telemetry.py
 │
-├── data/                            # Reference data (CIF dictionaries, utilities)
-│   ├── keepResidues.txt
-│   └── extractModifiedResidueCodes.py
-│
-└── reports/
-    ├── north_star.md
-    └── config.js
+├── docs/                            # Documentation (see table above)
+├── reports/                         # Visualizations (TargetDiff molecule comparisons)
+└── data/                            # Reference data (CIF dictionaries, utilities)
 ```
 
 ## Pipeline stages in detail

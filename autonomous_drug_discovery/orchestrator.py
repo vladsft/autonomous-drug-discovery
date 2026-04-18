@@ -70,7 +70,8 @@ def run_ingestion(pdb_path, db_path, campaign_id, clean_pdb=False, pocket_backen
         return False
 
 
-def run_generation(manifest_path, db_path, campaign_id, mode="simulation"):
+def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
+                   output_dir=None):
     """Run the generation module (TargetDiff wrapper)."""
     print(f"\n{'='*60}")
     print(f"[Orchestrator] Stage 2: GENERATION — mode={mode}")
@@ -81,6 +82,8 @@ def run_generation(manifest_path, db_path, campaign_id, mode="simulation"):
         print(f"Error: Generation module not found at {script_path}")
         return False
 
+    out_dir = output_dir or str(DATA_DIR / "candidates")
+
     # Use targetdiff_env only for targetdiff mode; base env for everything else
     if mode == "targetdiff":
         cmd = get_python_cmd("targetdiff_env")
@@ -90,7 +93,7 @@ def run_generation(manifest_path, db_path, campaign_id, mode="simulation"):
     cmd += [
         str(script_path),
         "--manifest", str(manifest_path),
-        "--output_dir", str(DATA_DIR / "candidates"),
+        "--output_dir", out_dir,
         "--db_path", db_path,
         "--campaign_id", campaign_id,
         "--mode", mode,
@@ -105,7 +108,7 @@ def run_generation(manifest_path, db_path, campaign_id, mode="simulation"):
         return False
 
 
-def run_screening(sdf_path, db_path, campaign_id):
+def run_screening(sdf_path, db_path, campaign_id, output_dir=None):
     """Run the screening module (RDKit fast triage)."""
     print(f"\n{'='*60}")
     print(f"[Orchestrator] Stage 3: SCREENING (Fast Triage)")
@@ -116,10 +119,12 @@ def run_screening(sdf_path, db_path, campaign_id):
         print(f"Error: Screening module not found at {script_path}")
         return False
 
+    out_dir = output_dir or str(DATA_DIR / "screened")
+
     cmd = get_python_cmd("base") + [
         str(script_path),
         "--input_sdf", str(sdf_path),
-        "--output_dir", str(DATA_DIR / "screened"),
+        "--output_dir", out_dir,
         "--db_path", db_path,
         "--campaign_id", campaign_id,
     ]
@@ -133,7 +138,8 @@ def run_screening(sdf_path, db_path, campaign_id):
         return False
 
 
-def run_docking(manifest_path, db_path, campaign_id, mode="simulation"):
+def run_docking(manifest_path, db_path, campaign_id, mode="simulation",
+                candidates_dir=None, output_dir=None):
     """Run the docking module (Vina wrapper)."""
     print(f"\n{'='*60}")
     print(f"[Orchestrator] Stage 4: DOCKING — mode={mode}")
@@ -144,12 +150,15 @@ def run_docking(manifest_path, db_path, campaign_id, mode="simulation"):
         print(f"Error: Docking module not found at {script_path}")
         return False
 
+    cand_dir = candidates_dir or str(DATA_DIR / "screened")
+    out_dir = output_dir or str(DATA_DIR / "results")
+
     cmd = get_python_cmd("base")
     cmd += [
         str(script_path),
         "--manifest", str(manifest_path),
-        "--candidates_dir", str(DATA_DIR / "screened"),
-        "--output_dir", str(DATA_DIR / "results"),
+        "--candidates_dir", cand_dir,
+        "--output_dir", out_dir,
         "--db_path", db_path,
         "--campaign_id", campaign_id,
         "--mode", mode,
@@ -206,7 +215,7 @@ def main():
     # Generate command
     gen_parser = subparsers.add_parser("generate", help="Generate molecules from a manifest")
     gen_parser.add_argument("manifest", help="Path to ingestion manifest.json")
-    gen_parser.add_argument("--mode", choices=["simulation", "production"],
+    gen_parser.add_argument("--mode", choices=["simulation", "rdkit", "targetdiff", "production"],
                             default="simulation", help="Execution mode")
 
     # Screen command
@@ -222,7 +231,7 @@ def main():
     # Full Pipeline command
     pipeline_parser = subparsers.add_parser("run", help="Run full pipeline")
     pipeline_parser.add_argument("pdb_file", help="Path to input PDB file")
-    pipeline_parser.add_argument("--mode", choices=["simulation", "production"],
+    pipeline_parser.add_argument("--mode", choices=["simulation", "production", "targetdiff"],
                                  default="simulation", help="Execution mode")
 
     args = parser.parse_args()
@@ -257,18 +266,29 @@ def main():
         # Map pipeline mode to per-stage modes
         if mode == "simulation":
             gen_mode, dock_mode = "simulation", "simulation"
+        elif mode == "targetdiff":
+            gen_mode, dock_mode = "targetdiff", "production"
         else:
             gen_mode, dock_mode = "rdkit", "production"
 
+        # Per-campaign output directories prevent file collisions between runs
+        campaign_dir = DATA_DIR / campaign_id
+        gen_dir = str(campaign_dir / "candidates")
+        screen_dir = str(campaign_dir / "screened")
+        dock_dir = str(campaign_dir / "results")
+
         print(f"[Orchestrator] Running FULL PIPELINE — gen={gen_mode}, dock={dock_mode}")
+        print(f"[Orchestrator] Campaign directory: {campaign_dir}")
 
         if run_ingestion(pdb_path, db_path, campaign_id):
             manifest_path = DATA_DIR / "processed" / f"{pdb_path.stem}_manifest.json"
-            if run_generation(manifest_path, db_path, campaign_id, gen_mode):
-                sdf_path = DATA_DIR / "candidates" / "generated_molecules.sdf"
-                if run_screening(sdf_path, db_path, campaign_id):
-                    screened_sdf = DATA_DIR / "screened" / "screened_molecules.sdf"
-                    run_docking(manifest_path, db_path, campaign_id, dock_mode)
+            if run_generation(manifest_path, db_path, campaign_id, gen_mode,
+                              output_dir=gen_dir):
+                sdf_path = Path(gen_dir) / "generated_molecules.sdf"
+                if run_screening(sdf_path, db_path, campaign_id,
+                                 output_dir=screen_dir):
+                    run_docking(manifest_path, db_path, campaign_id, dock_mode,
+                                candidates_dir=screen_dir, output_dir=dock_dir)
 
         print_campaign_summary(db_path, campaign_id)
     else:

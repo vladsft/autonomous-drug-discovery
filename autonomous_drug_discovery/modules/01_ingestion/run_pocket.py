@@ -27,8 +27,8 @@ from pathlib import Path
 # Paths
 MODULE_DIR = Path(__file__).parent.resolve()
 PROJECT_ROOT = MODULE_DIR.parent.parent
-FPOCKET_BIN = Path("/home/vladsft/fpocket/bin/fpocket")
-P2RANK_BIN = Path("/home/vladsft/p2rank_2.5.1/prank")
+FPOCKET_BIN = Path(os.environ.get("FPOCKET_BIN", os.path.expanduser("~/fpocket/bin/fpocket")))
+P2RANK_BIN = Path(os.environ.get("P2RANK_BIN", os.path.expanduser("~/p2rank_2.5.1/prank")))
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from telemetry import TelemetryDB

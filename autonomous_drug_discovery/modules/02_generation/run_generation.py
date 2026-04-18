@@ -201,71 +201,111 @@ def _estimate_heavy_atom_range(pocket_pdb_path):
     return lo, hi
 
 
+def _find_attachment_points(mol):
+    """Find atoms that can accept a new single bond (have implicit Hs).
+
+    Returns list of atom indices that have at least one implicit hydrogen,
+    meaning they can form a new bond without violating valence rules.
+    """
+    attachment = []
+    for atom in mol.GetAtoms():
+        if atom.GetNumImplicitHs() > 0:
+            attachment.append(atom.GetIdx())
+    return attachment
+
+
+def _attach_fragment(mol, frag_smi, rng):
+    """Attach a fragment to the molecule at a valid attachment point.
+
+    Uses RDKit's RWMol to combine molecules and form a proper bond between
+    atoms that have available valence (implicit Hs). Returns None if no
+    valid attachment is possible.
+    """
+    frag = Chem.MolFromSmiles(frag_smi)
+    if frag is None:
+        return None
+
+    main_points = _find_attachment_points(mol)
+    frag_points = _find_attachment_points(frag)
+
+    if not main_points or not frag_points:
+        return None
+
+    # Try a few random attachment point pairs
+    attempts = min(5, len(main_points) * len(frag_points))
+    for _ in range(attempts):
+        main_idx = rng.choice(main_points)
+        frag_idx = rng.choice(frag_points)
+
+        combo = AllChem.CombineMols(mol, frag)
+        editable = Chem.RWMol(combo)
+        # Fragment atom indices are offset by the number of atoms in mol
+        editable.AddBond(main_idx, frag_idx + mol.GetNumAtoms(), Chem.BondType.SINGLE)
+        try:
+            new_mol = editable.GetMol()
+            Chem.SanitizeMol(new_mol)
+            return new_mol
+        except Exception:
+            continue
+
+    return None
+
+
 def _assemble_molecule(scaffolds, substituents, linkers, rng):
     """Assemble a random molecule from fragments.
 
     Strategy: pick 1-2 scaffolds, connect with a linker, decorate with
-    1-3 substituents. This mimics medicinal chemistry fragment assembly.
+    1-3 substituents. Uses proper RDKit bond formation to ensure valid
+    valence at all attachment points.
     """
     # Pick primary scaffold
     scaffold_smi = rng.choice(scaffolds)
-
-    # Optionally attach a second scaffold via a linker (30% chance)
-    if rng.random() < 0.3:
-        scaffold2 = rng.choice(scaffolds)
-        linker = rng.choice(linkers)
-        # Use SMILES concatenation — RDKit will try to parse it
-        combined = f"{scaffold_smi}{linker}{scaffold2}"
-    else:
-        combined = scaffold_smi
-
-    mol = Chem.MolFromSmiles(combined)
+    mol = Chem.MolFromSmiles(scaffold_smi)
     if mol is None:
         return None
 
+    # Optionally attach a second scaffold via a linker (30% chance)
+    if rng.random() < 0.3:
+        scaffold2_smi = rng.choice(scaffolds)
+        linker_smi = rng.choice(linkers)
+
+        if linker_smi:
+            # Attach linker to scaffold, then second scaffold to linker
+            linked = _attach_fragment(mol, linker_smi, rng)
+            if linked is not None:
+                mol = linked
+                linked2 = _attach_fragment(mol, scaffold2_smi, rng)
+                if linked2 is not None:
+                    mol = linked2
+        else:
+            # Direct bond between scaffolds
+            linked = _attach_fragment(mol, scaffold2_smi, rng)
+            if linked is not None:
+                mol = linked
+
     # Try BRICS decomposition and reassembly for more diversity
     try:
-        frags = list(BRICS.BRICSDecompose(mol))
+        frags = list(BRICS.BRICSDecompose(Chem.MolToSmiles(mol)))
         if len(frags) >= 2:
-            rebuilt = list(BRICS.BRICSBuild(
-                [Chem.MolFromSmiles(f) for f in frags if Chem.MolFromSmiles(f) is not None]
-            ))
-            if rebuilt:
-                candidate = rng.choice(rebuilt[:10])  # pick from first few
-                candidate = Chem.MolFromSmiles(Chem.MolToSmiles(candidate))
-                if candidate is not None:
-                    mol = candidate
+            frag_mols = [Chem.MolFromSmiles(f) for f in frags]
+            frag_mols = [f for f in frag_mols if f is not None]
+            if len(frag_mols) >= 2:
+                rebuilt = list(BRICS.BRICSBuild(frag_mols))
+                if rebuilt:
+                    candidate = rng.choice(rebuilt[:10])
+                    candidate = Chem.MolFromSmiles(Chem.MolToSmiles(candidate))
+                    if candidate is not None:
+                        mol = candidate
     except Exception:
         pass  # BRICS can fail on some scaffolds, that's fine
 
-    # Add 1-3 substituents by replacing Hs on the scaffold
+    # Add 1-3 substituents at valid attachment points
     n_subs = rng.randint(1, 3)
-    current_smi = Chem.MolToSmiles(mol)
     for _ in range(n_subs):
-        sub = rng.choice(substituents)
-        # Simple attachment: wrap scaffold + substituent
-        trial_smi = f"{current_smi}.{sub}"
-        trial = Chem.MolFromSmiles(trial_smi)
-        if trial is not None:
-            # Try to create a bond between the fragments
-            try:
-                combo = AllChem.CombineMols(mol, Chem.MolFromSmiles(sub))
-                editable = Chem.RWMol(combo)
-                # Find atoms that can accept a bond
-                n_atoms_main = mol.GetNumAtoms()
-                # Pick a random atom from main mol and sub mol
-                main_idx = rng.randint(0, n_atoms_main - 1)
-                sub_idx = rng.randint(n_atoms_main, editable.GetNumAtoms() - 1)
-                editable.AddBond(main_idx, sub_idx, Chem.BondType.SINGLE)
-                new_mol = editable.GetMol()
-                try:
-                    Chem.SanitizeMol(new_mol)
-                    mol = new_mol
-                    current_smi = Chem.MolToSmiles(mol)
-                except Exception:
-                    pass  # invalid bond, skip this substituent
-            except Exception:
-                pass
+        sub_smi = rng.choice(substituents)
+        decorated = _attach_fragment(mol, sub_smi, rng)
+        if decorated is not None:
+            mol = decorated
 
     return mol
 
@@ -378,7 +418,13 @@ def run_generation_rdkit(manifest, out_path, parameters):
 
 
 def run_generation_targetdiff(manifest, out_path, parameters):
-    """TargetDiff mode: execute TargetDiff diffusion model inference."""
+    """TargetDiff mode: execute TargetDiff diffusion model inference.
+
+    TargetDiff's sample_for_pocket.py requires a config YAML (with checkpoint path)
+    as a positional arg, and writes individual SDF files into a sdf/ subdirectory.
+    This wrapper handles config generation and consolidates the output into a single
+    generated_molecules.sdf for downstream pipeline consumption.
+    """
     if not TARGETDIFF_REPO.exists():
         raise FileNotFoundError(
             f"TargetDiff repository not found at {TARGETDIFF_REPO}. "
@@ -395,23 +441,86 @@ def run_generation_targetdiff(manifest, out_path, parameters):
     if not sample_script.exists():
         raise FileNotFoundError(f"TargetDiff sample script not found at {sample_script}")
 
+    # Locate checkpoint — use the pretrained model shipped with the repo
+    checkpoint = TARGETDIFF_REPO / "pretrained_models" / "pretrained_diffusion.pt"
+    if not checkpoint.exists():
+        raise FileNotFoundError(
+            f"TargetDiff checkpoint not found at {checkpoint}. "
+            f"Download it to {checkpoint}."
+        )
+
     out_path.mkdir(parents=True, exist_ok=True)
+
+    # Generate a sampling config YAML for this run
+    num_samples = parameters.get("num_samples", 100)
+    sampling_config = out_path / "sampling_config.yml"
+    import yaml
+    config_data = {
+        "model": {
+            "checkpoint": str(checkpoint),
+        },
+        "sample": {
+            "seed": parameters.get("seed", 2021),
+            "num_samples": num_samples,
+            "num_steps": parameters.get("sampling_steps", 1000),
+            "pos_only": False,
+            "center_pos_mode": "protein",
+            "sample_num_atoms": "prior",
+        },
+    }
+    with open(sampling_config, "w") as f:
+        yaml.dump(config_data, f)
+
+    # TargetDiff writes individual SDFs to {result_path}/sdf/
+    td_result_path = out_path / "targetdiff_raw"
 
     cmd = [
         "conda", "run", "-n", "targetdiff_env", "python",
         str(sample_script),
+        str(sampling_config),
         "--pdb_path", str(pocket_pdb),
-        "--result_path", str(out_path),
-        "--num_samples", str(parameters.get("num_samples", 100)),
+        "--result_path", str(td_result_path),
+        "--device", parameters.get("device", "cpu"),
+        "--batch_size", str(parameters.get("batch_size", 16)),
     ]
+    if num_samples:
+        cmd += ["--num_samples", str(num_samples)]
 
-    subprocess.check_call(cmd)
+    subprocess.check_call(cmd, cwd=str(TARGETDIFF_REPO))
 
+    # Consolidate individual SDF files into a single generated_molecules.sdf
+    sdf_dir = td_result_path / "sdf"
     output_sdf = out_path / "generated_molecules.sdf"
-    if not output_sdf.exists():
-        raise RuntimeError(f"Expected output {output_sdf} was not produced by TargetDiff.")
 
-    print(f"[Generation] Molecules generated at {output_sdf}")
+    if not HAS_RDKIT:
+        raise ImportError("RDKit is required to consolidate TargetDiff output.")
+
+    RDLogger.DisableLog("rdApp.*")
+    individual_sdfs = sorted(sdf_dir.glob("*.sdf")) if sdf_dir.exists() else []
+    if not individual_sdfs:
+        raise RuntimeError(
+            f"TargetDiff produced no SDF files in {sdf_dir}. "
+            f"Check {td_result_path} for errors."
+        )
+
+    writer = Chem.SDWriter(str(output_sdf))
+    mol_count = 0
+    for sdf_file in individual_sdfs:
+        supplier = Chem.SDMolSupplier(str(sdf_file), removeHs=False)
+        for mol in supplier:
+            if mol is not None:
+                mol.SetProp("molecule_id", f"mol_{mol_count:04d}")
+                mol.SetProp("_Name", f"mol_{mol_count:04d}")
+                try:
+                    mol.SetProp("smiles", Chem.MolToSmiles(mol))
+                except Exception:
+                    pass
+                writer.write(mol)
+                mol_count += 1
+    writer.close()
+
+    print(f"[Generation] {mol_count} molecules consolidated from {len(individual_sdfs)} TargetDiff outputs")
+    print(f"[Generation] Output: {output_sdf}")
     return str(output_sdf)
 
 

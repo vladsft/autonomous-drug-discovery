@@ -118,25 +118,15 @@ def _screen_with_molscore(mols, smiles_list, config):
             sa_scorer = _get_sa_scorer()
             props["desc_SAScore"] = round(sa_scorer(mol), 2)
 
-            # PAINS filter via MolScore if available, else skip
-            if HAS_MOLSCORE:
-                try:
-                    from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
-                    params = FilterCatalogParams()
-                    params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
-                    catalog = FilterCatalog(params)
-                    props["filter_PAINS"] = 1 if catalog.HasMatch(mol) else 0
-                except Exception:
-                    props["filter_PAINS"] = 0
-            else:
-                try:
-                    from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
-                    params = FilterCatalogParams()
-                    params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
-                    catalog = FilterCatalog(params)
-                    props["filter_PAINS"] = 1 if catalog.HasMatch(mol) else 0
-                except Exception:
-                    props["filter_PAINS"] = 0
+            # PAINS filter via RDKit FilterCatalog
+            try:
+                from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
+                pains_params = FilterCatalogParams()
+                pains_params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
+                catalog = FilterCatalog(pains_params)
+                props["filter_PAINS"] = 1 if catalog.HasMatch(mol) else 0
+            except Exception:
+                props["filter_PAINS"] = 0
 
         except Exception as e:
             results.append({
@@ -335,12 +325,13 @@ def run_screening(input_sdf: str, output_dir: str, config_path: str | None = Non
             category = reason.split("_")[0] if "_" in reason else reason
             attrition[category] = attrition.get(category, 0) + 1
 
-        # Write filtered SDF
+        # Write filtered SDF — use a lookup from molecule_id to list index
+        mol_id_to_idx = {f"mol_{i:04d}": i for i in range(len(mols))}
         output_sdf = out_path / "screened_molecules.sdf"
         writer = Chem.SDWriter(str(output_sdf))
         for r in survivors:
-            idx = int(r["molecule_id"].split("_")[1])
-            if idx < len(mols) and mols[idx] is not None:
+            idx = mol_id_to_idx.get(r["molecule_id"])
+            if idx is not None and idx < len(mols) and mols[idx] is not None:
                 writer.write(mols[idx])
         writer.close()
 

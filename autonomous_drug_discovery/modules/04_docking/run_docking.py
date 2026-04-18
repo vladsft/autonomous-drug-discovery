@@ -12,6 +12,7 @@ Output contract: docking_results.csv + run_metadata.json
 
 import sys
 import os
+import csv
 import argparse
 import subprocess
 import json
@@ -81,10 +82,11 @@ def run_docking_simulation(manifest, candidates_dir, out_path, parameters, db=No
     ]
 
     results_file = out_path / "docking_results.csv"
-    with open(results_file, "w") as f:
-        f.write("ligand_id,smiles,affinity\n")
+    with open(results_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ligand_id", "smiles", "affinity"])
         for r in simulated:
-            f.write(f"{r['ligand_id']},{r['smiles']},{r['affinity']}\n")
+            writer.writerow([r["ligand_id"], r["smiles"], r["affinity"]])
 
     if db and run_id:
         for r in simulated:
@@ -156,10 +158,11 @@ def run_docking_triage(manifest, candidates_dir, out_path, parameters, db=None, 
 
     # Write results
     results_file = out_path / "docking_results.csv"
-    with open(results_file, "w") as f:
-        f.write("ligand_id,smiles,affinity\n")
+    with open(results_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ligand_id", "smiles", "affinity"])
         for r in scored:
-            f.write(f"{r['ligand_id']},{r['smiles']},{r['affinity']}\n")
+            writer.writerow([r["ligand_id"], r["smiles"], r["affinity"]])
 
     print(f"[Docking] {len(scored)} molecules scored. Best: {scored[0]['affinity']:.2f} kcal/mol" if scored else "[Docking] No molecules scored.")
     print(f"[Docking] Results: {results_file}")
@@ -238,10 +241,11 @@ def run_docking_production(manifest, candidates_dir, out_path, parameters, db=No
     scored.sort(key=lambda r: r["affinity"])
 
     results_file = out_path / "docking_results.csv"
-    with open(results_file, "w") as f:
-        f.write("ligand_id,smiles,affinity\n")
+    with open(results_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ligand_id", "smiles", "affinity"])
         for r in scored:
-            f.write(f"{r['ligand_id']},{r['smiles']},{r['affinity']}\n")
+            writer.writerow([r["ligand_id"], r["smiles"], r["affinity"]])
 
     if scored:
         print(f"[Docking] {len(scored)} molecules scored. Best: {scored[0]['affinity']:.2f} kcal/mol")
@@ -341,7 +345,6 @@ def _prepare_receptor_pdbqt(receptor_pdb, output_pdbqt):
             return el
 
     structure = gemmi.read_structure(str(receptor_pdb))
-    structure.remove_waters()
     structure.remove_ligands_and_waters()
 
     lines = [

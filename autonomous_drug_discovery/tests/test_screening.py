@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 
 try:
     from rdkit import Chem
-    from rdkit.Chem import AllChem
+    from rdkit.Chem import AllChem, Descriptors
     HAS_RDKIT = True
 except ImportError:
     HAS_RDKIT = False
@@ -52,27 +52,7 @@ def _smiles_to_sdf(smiles_list, output_path):
             AllChem.EmbedMolecule(mol, randomSeed=42)
             mol.SetProp("molecule_id", f"mol_{i:04d}")
             writer.write(mol)
-        else:
-            # Write an invalid entry by writing raw text
-            pass
     writer.close()
-
-
-def _smiles_to_sdf_with_invalid(smiles_list, output_path):
-    """Write SMILES to SDF, including an intentionally malformed entry."""
-    with open(output_path, "w") as f:
-        for i, smi in enumerate(smiles_list):
-            mol = Chem.MolFromSmiles(smi)
-            if mol is not None:
-                AllChem.EmbedMolecule(mol, randomSeed=42)
-                f.write(Chem.MolToMolBlock(mol))
-                f.write(f">  <molecule_id>\nmol_{i:04d}\n\n")
-                f.write("$$$$\n")
-
-        # Add an invalid mol block
-        f.write("INVALID_MOL\n")
-        f.write("M  END\n")
-        f.write("$$$$\n")
 
 
 # ---------------------------------------------------------------------------
@@ -100,60 +80,108 @@ def work_dir(tmp_path):
     return tmp_path
 
 
-class TestIndividualFilters:
-    """Test each filter function independently."""
+class TestScreeningBackend:
+    """Test that a screening backend is available and selected."""
 
-    def test_valid_chemistry_pass(self):
+    def test_backend_selected(self):
+        assert screening_module.BACKEND in ("molscore", "rdkit_fallback")
+
+
+class TestMolScoreScreening:
+    """Test the MolScore/RDKit screening functions directly."""
+
+    def test_valid_molecule_gets_properties(self):
+        """A valid drug molecule should have all expected properties computed."""
         mol = Chem.MolFromSmiles(ASPIRIN)
-        passed, reason = screening_module.filter_valid_chemistry(mol)
-        assert passed is True
-        assert reason is None
+        mols = [mol]
+        smiles_list = [ASPIRIN]
+        config = {"filter_thresholds": {}}
 
-    def test_valid_chemistry_fail_none(self):
-        passed, reason = screening_module.filter_valid_chemistry(None)
-        assert passed is False
-        assert reason == "invalid_chemistry"
+        if screening_module.BACKEND == "molscore":
+            results = screening_module._screen_with_molscore(mols, smiles_list, config)
+        else:
+            results = screening_module._screen_with_rdkit_fallback(mols, smiles_list, config)
 
-    def test_lipinski_pass(self):
-        mol = Chem.MolFromSmiles(ASPIRIN)
-        passed, reason = screening_module.filter_lipinski(mol)
-        assert passed is True
+        assert len(results) == 1
+        r = results[0]
+        assert r["passed"] is True
+        props = r["properties"]
+        assert "desc_MolWt" in props
+        assert "desc_MolLogP" in props
+        assert "desc_QED" in props
+        assert props["desc_MolWt"] > 0
+        assert 0 <= props["desc_QED"] <= 1
 
-    def test_lipinski_fail_mw(self):
-        # Create a molecule with MW > 500
+    def test_none_mol_rejected(self):
+        """A None molecule should be rejected as invalid_chemistry."""
+        mols = [None]
+        smiles_list = [None]
+        config = {"filter_thresholds": {}}
+
+        if screening_module.BACKEND == "molscore":
+            results = screening_module._screen_with_molscore(mols, smiles_list, config)
+        else:
+            results = screening_module._screen_with_rdkit_fallback(mols, smiles_list, config)
+
+        assert len(results) == 1
+        assert results[0]["passed"] is False
+        assert results[0]["eliminated_by"] == "invalid_chemistry"
+
+    def test_mw_filter_rejects_large_mol(self):
+        """A molecule exceeding MW 500 should be filtered out."""
         mol = Chem.MolFromSmiles(LARGE_MOL)
-        if mol is not None:
-            from rdkit.Chem import Descriptors
-            mw = Descriptors.MolWt(mol)
-            if mw > 500:
-                passed, reason = screening_module.filter_lipinski(mol)
-                assert passed is False
-                assert reason == "lipinski_violation"
+        if mol is None:
+            pytest.skip("LARGE_MOL SMILES did not parse")
+        mw = Descriptors.MolWt(mol)
+        if mw <= 500:
+            pytest.skip(f"LARGE_MOL MW={mw} does not exceed 500")
 
-    def test_qed_pass(self):
+        mols = [mol]
+        smiles_list = [LARGE_MOL]
+        config = {"filter_thresholds": {"desc_MolWt": {"max": 500}}}
+
+        if screening_module.BACKEND == "molscore":
+            results = screening_module._screen_with_molscore(mols, smiles_list, config)
+        else:
+            results = screening_module._screen_with_rdkit_fallback(mols, smiles_list, config)
+
+        assert results[0]["passed"] is False
+        assert "desc_MolWt" in results[0]["eliminated_by"]
+
+    def test_logp_filter_rejects_lipophilic(self):
+        """Eicosane (very high LogP) should be filtered out."""
+        mol = Chem.MolFromSmiles(LIPOPHILIC)
+        if mol is None:
+            pytest.skip("LIPOPHILIC SMILES did not parse")
+
+        mols = [mol]
+        smiles_list = [LIPOPHILIC]
+        config = {"filter_thresholds": {"desc_MolLogP": {"max": 5}}}
+
+        if screening_module.BACKEND == "molscore":
+            results = screening_module._screen_with_molscore(mols, smiles_list, config)
+        else:
+            results = screening_module._screen_with_rdkit_fallback(mols, smiles_list, config)
+
+        assert results[0]["passed"] is False
+        assert "desc_MolLogP" in results[0]["eliminated_by"]
+
+    def test_aspirin_passes_default_config(self):
+        """Aspirin should pass the default scoring config."""
         mol = Chem.MolFromSmiles(ASPIRIN)
-        passed, reason = screening_module.filter_qed(mol)
-        assert passed is True
+        mols = [mol]
+        smiles_list = [ASPIRIN]
 
-    def test_sa_score_pass(self):
-        mol = Chem.MolFromSmiles(ASPIRIN)
-        passed, reason = screening_module.filter_sa_score(mol)
-        assert passed is True
+        cfg_path = screening_module.DEFAULT_CONFIG
+        with open(cfg_path) as f:
+            config = json.load(f)
 
+        if screening_module.BACKEND == "molscore":
+            results = screening_module._screen_with_molscore(mols, smiles_list, config)
+        else:
+            results = screening_module._screen_with_rdkit_fallback(mols, smiles_list, config)
 
-class TestMoleculeProperties:
-    """Test property computation."""
-
-    def test_compute_properties(self):
-        mol = Chem.MolFromSmiles(ASPIRIN)
-        props = screening_module.compute_molecule_properties(mol)
-        assert "smiles" in props
-        assert "mol_weight" in props
-        assert "logp" in props
-        assert "qed" in props
-        assert "sa_score" in props
-        assert props["mol_weight"] > 0
-        assert 0 <= props["qed"] <= 1
+        assert results[0]["passed"] is True
 
 
 class TestFullScreeningPipeline:
@@ -177,7 +205,7 @@ class TestFullScreeningPipeline:
             report = json.load(f)
         assert report["total_input"] == 3
         assert report["total_passed"] >= 2
-        assert "attrition_by_filter" in report
+        assert "attrition_summary" in report
         assert "survivors" in report
 
     def test_screened_sdf_produced(self, work_dir):
@@ -219,9 +247,7 @@ class TestFullScreeningPipeline:
         with open(report_path) as f:
             report = json.load(f)
         assert report["total_input"] == 2
-        # Sum of attrition + passed should equal total input
-        total_attrition = sum(report["attrition_by_filter"].values())
-        assert total_attrition + report["total_passed"] == report["total_input"]
+        assert report["total_passed"] + report["total_rejected"] == report["total_input"]
 
     def test_telemetry_integration(self, work_dir):
         """Verify telemetry DB is populated when db_path provided."""
@@ -247,14 +273,21 @@ class TestFullScreeningPipeline:
         db.close()
 
     def test_empty_sdf(self, work_dir):
-        """Empty SDF should produce zero output gracefully."""
+        """Empty SDF should either produce zero output or exit gracefully."""
         sdf_path = work_dir / "empty.sdf"
         with open(sdf_path, "w") as f:
             f.write("")  # Empty file
 
         output_dir = work_dir / "output"
-        total_in, total_passed, report_path = screening_module.run_screening(
-            str(sdf_path), str(output_dir)
-        )
-        assert total_in == 0
-        assert total_passed == 0
+        # The screening module calls sys.exit(1) on invalid/empty files
+        # since RDKit's SDMolSupplier treats an empty file as invalid
+        with pytest.raises(SystemExit) as exc_info:
+            screening_module.run_screening(str(sdf_path), str(output_dir))
+        assert exc_info.value.code == 1
+
+        # Verify failure metadata was still written
+        metadata_path = output_dir / "run_metadata.json"
+        assert metadata_path.exists()
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        assert metadata["status"] == "failed"

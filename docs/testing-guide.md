@@ -1,4 +1,6 @@
-# How This Drug Discovery Pipeline Works — A Plain-Language Guide
+# How This Pipeline Works and How to Validate It
+
+A plain-language guide to the science behind the pipeline and every validation experiment run to date. For operational usage (commands, parameters, modes), see [pipeline-guide.md](pipeline-guide.md). For querying results, see [telemetry-guide.md](telemetry-guide.md).
 
 ## The Big Picture
 
@@ -120,143 +122,13 @@ For each target, we want to see:
 
 ---
 
-## How to Run It Yourself
-
-### Prerequisites
-- The conda environment is already set up with all dependencies
-- You need a `.pdb` file — a 3D structure of a protein (downloadable free from rcsb.org)
-
-### Running the full pipeline on a target
-
-```bash
-cd /home/vladsft/agent-harness/autonomous_drug_discovery
-
-# Run the full pipeline on EGFR (already downloaded)
-conda run -n base python orchestrator.py run data/processed/1M17.pdb --mode production
-
-# Run on BCR-ABL
-conda run -n base python orchestrator.py run data/processed/2HYY.pdb --mode production
-
-# Run on BRAF V600E
-conda run -n base python orchestrator.py run data/processed/6P3D.pdb --mode production
-```
-
-Each run takes 5-20 minutes depending on the target (docking is the slow part).
-
-### Running the benchmark comparison
-
-After at least one pipeline run completes:
-
-```bash
-conda run -n base python benchmark.py
-```
-
-This prints a formatted report comparing all completed targets.
-
-### Running individual stages
-
-If you want to understand each stage separately:
-
-```bash
-# Stage 1: Find pockets on a protein
-conda run -n base python orchestrator.py ingest data/processed/1M17.pdb
-
-# Stage 2: Generate molecules (needs manifest from stage 1)
-conda run -n base python orchestrator.py generate data/processed/1M17_manifest.json --mode production
-
-# Stage 3: Screen generated molecules
-conda run -n base python orchestrator.py screen data/candidates/generated_molecules.sdf
-
-# Stage 4: Dock screened molecules (needs manifest from stage 1)
-conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json --mode production
-```
-
-### Trying a new protein target
-
-1. Go to https://www.rcsb.org and search for your protein of interest
-2. Download the `.pdb` file
-3. Place it in `data/processed/`
-4. Run: `conda run -n base python orchestrator.py run data/processed/YOUR_FILE.pdb --mode production`
-
-### Looking at results
-
-**Docking results** are in CSV format:
-```bash
-# View top docked molecules (sorted by score, most negative first)
-cat data/results/docking_results.csv
-```
-
-**Screening report** shows which molecules passed and why others were rejected:
-```bash
-cat data/screened/screening_report.json | python -m json.tool | head -50
-```
-
-**Telemetry database** has everything in SQLite:
-```bash
-conda run -n base python -c "
-import sqlite3
-conn = sqlite3.connect('data/telemetry.db')
-
-# See all campaigns
-for row in conn.execute('SELECT campaign_id, module_name, status FROM runs ORDER BY started_at'):
-    print(row)
-
-# See best molecules across ALL runs
-print('\nTop 10 molecules by docking score:')
-for row in conn.execute('''
-    SELECT smiles, docking_score, qed, sa_score
-    FROM molecule_scores
-    WHERE docking_score IS NOT NULL
-    ORDER BY docking_score LIMIT 10
-'''):
-    print(f'  Score: {row[1]:.2f} kcal/mol | QED: {row[2]} | SA: {row[3]} | {row[0][:60]}')
-"
-```
-
----
-
-## Common-Sense Sanity Checks
-
-Here are checks anyone can do, no chemistry background required:
-
-### 1. "Did anything actually run?"
-```bash
-conda run -n base python -c "
-import sqlite3
-conn = sqlite3.connect('data/telemetry.db')
-for row in conn.execute('SELECT status, COUNT(*) FROM runs GROUP BY status'):
-    print(f'{row[0]}: {row[1]} runs')
-"
-```
-You should see multiple "success" entries. "failed" or "abandoned" entries are fine — they happen when runs are interrupted.
-
-### 2. "Are the numbers physically meaningful?"
-- Docking scores should be negative (positive scores = molecule is repelled, not attracted)
-- Molecular weights should be 100-600 (smaller = too simple, bigger = can't enter cells)
-- QED should be 0-1 (anything else is a bug)
-- SA scores should be 1-10
-
-### 3. "Is the pipeline consistent?"
-Run the same target twice. The molecule generation uses a fixed random seed, so results should be identical. If they differ, something is non-deterministic (not necessarily bad, but worth knowing).
-
-### 4. "How does it compare to known drugs?"
-Look up the known drug for each target (Erlotinib, Imatinib, Ponatinib) and compare:
-- Are our best docking scores in the same range?
-- Are our molecules of similar size (molecular weight)?
-- The benchmark script does this comparison automatically.
-
-### 5. "Is the pocket the right one?"
-For EGFR (1M17), the known erlotinib binding site is near residues around the ATP-binding cleft. P2Rank and fpocket both output which amino acid residues are in each pocket. A domain expert can verify whether these match the known binding site. For a non-expert: the pocket with the highest score should be picked. P2Rank's pocket center should be within ~3 Angstroms of the known drug binding site for well-characterized targets.
-
----
-
-## Validation Tests Run (as of 2026-04-03)
+## Validation Tests Run
 
 This section documents every validation experiment that has been completed, with results.
 
 ### Test 1: Full Pipeline with fpocket (2026-03-21)
 
-**What:** End-to-end pipeline (fpocket pocket detection → RDKit generation → RDKit screening → Vina docking) on 3 cancer targets with known drugs.
+**What:** End-to-end pipeline (fpocket pocket detection -> RDKit generation -> RDKit screening -> Vina docking) on 3 cancer targets with known drugs.
 
 **Setup:** fpocket backend, 100 molecules generated per target, exhaustiveness=8 for Vina.
 
@@ -330,6 +202,30 @@ Total campaigns: 7 (6 successful end-to-end, 1 failed at ingestion)
 | campaign_c6122296 | P2Rank | BCR-ABL (2HYY) | All 4 | 2026-03-21 |
 
 TargetDiff experiments (standalone, not in telemetry): 2 molecules generated and docked for BRAF V600E.
+
+---
+
+## Common-Sense Sanity Checks
+
+Here are checks anyone can do, no chemistry background required:
+
+### 1. "Did anything actually run?"
+Check the telemetry database for successful stages. See [telemetry-guide.md](telemetry-guide.md) for query examples. You should see multiple "success" entries. "failed" entries are fine — they happen when runs are interrupted.
+
+### 2. "Are the numbers physically meaningful?"
+- Docking scores should be negative (positive scores = molecule is repelled, not attracted)
+- Molecular weights should be 100-600 (smaller = too simple, bigger = can't enter cells)
+- QED should be 0-1 (anything else is a bug)
+- SA scores should be 1-10
+
+### 3. "Is the pipeline consistent?"
+Run the same target twice. The molecule generation uses a fixed random seed, so results should be identical. If they differ, something is non-deterministic (not necessarily bad, but worth knowing).
+
+### 4. "How does it compare to known drugs?"
+Look up the known drug for each target (Erlotinib, Imatinib, Ponatinib) and compare: are our best docking scores in the same range? Are our molecules of similar size (molecular weight)? The benchmark script does this comparison automatically — see [pipeline-guide.md](pipeline-guide.md).
+
+### 5. "Is the pocket the right one?"
+For EGFR (1M17), the known erlotinib binding site is near residues around the ATP-binding cleft. P2Rank and fpocket both output which amino acid residues are in each pocket. A domain expert can verify whether these match the known binding site. For a non-expert: the pocket with the highest score should be picked. P2Rank's pocket center should be within ~3 Angstroms of the known drug binding site for well-characterized targets.
 
 ---
 
