@@ -15,14 +15,17 @@ Each stage reads the output of the previous stage and writes structured output (
 ```bash
 cd autonomous_drug_discovery
 
-# Production mode: real generation, screening, and docking
+# Production mode: RDKit generation + Vina docking (default full pipeline)
 conda run -n base python orchestrator.py run data/processed/1M17.pdb --mode production
+
+# Pocket2Mol mode: autoregressive pocket-conditioned generation (requires pocket2mol_env)
+conda run -n base python orchestrator.py run data/processed/6P3D.pdb --mode pocket2mol
+
+# TargetDiff mode: diffusion-based generation (requires targetdiff_env)
+conda run -n base python orchestrator.py run data/processed/6P3D.pdb --mode targetdiff
 
 # Simulation mode: stub data, tests pipeline plumbing only
 conda run -n base python orchestrator.py run data/processed/1M17.pdb --mode simulation
-
-# TargetDiff mode: diffusion-based generation (requires targetdiff_env)
-conda run -n base python orchestrator.py run data/processed/1M17.pdb --mode targetdiff
 ```
 
 Each full pipeline run creates a unique campaign ID (e.g. `campaign_fd4fad48`) and writes outputs to `data/<campaign_id>/`.
@@ -60,11 +63,14 @@ conda run -n base python modules/01_ingestion/run_pocket.py \
 Generates candidate molecules that fit the detected pocket.
 
 ```bash
-# RDKit fragment-based (default for production)
+# RDKit fragment-based (default for production mode)
 conda run -n base python orchestrator.py generate data/processed/1M17_manifest.json --mode rdkit
 
-# TargetDiff diffusion model
-conda run -n base python orchestrator.py generate data/processed/1M17_manifest.json --mode targetdiff
+# Pocket2Mol autoregressive (requires pocket2mol_env; see docs/pocket2mol-setup.md)
+conda run -n base python orchestrator.py generate data/processed/6P3D_manifest.json --mode pocket2mol
+
+# TargetDiff diffusion model (requires targetdiff_env; see docs/targetdiff-setup.md)
+conda run -n base python orchestrator.py generate data/processed/6P3D_manifest.json --mode targetdiff
 
 # Simulation stub
 conda run -n base python orchestrator.py generate data/processed/1M17_manifest.json --mode simulation
@@ -74,9 +80,20 @@ conda run -n base python orchestrator.py generate data/processed/1M17_manifest.j
 
 **Output:** `generated_molecules.sdf` containing 100 molecules (default) with 3D coordinates
 
-**Parameters** (edit in `modules/02_generation/run_generation.py`):
+**Parameters** (edit in `modules/02_generation/run_generation.py`, `DEFAULT_PARAMS`):
 - `num_samples`: number of molecules to generate (default: 100)
 - `seed`: random seed for reproducibility (default: 42)
+- `device`: `cpu` or `cuda` (default: `cpu`; used by TargetDiff / Pocket2Mol)
+- `sampling_steps`: denoising steps for TargetDiff (default: 1000)
+
+**Backend comparison:**
+
+| Mode | Paradigm | Speed (per molecule) | Pocket-aware | GPU needed? |
+|---|---|---|---|---|
+| `rdkit` | Fragment combinatorial | ~10 ms | Size-only | No |
+| `pocket2mol` | Autoregressive GNN | ~7 s GPU / 1–3 min CPU | Yes (3D) | Recommended |
+| `targetdiff` | E(3)-equivariant diffusion | ~1 min GPU / ~12 min CPU | Yes (3D) | Strongly recommended |
+| `simulation` | Stub (single benzene) | instant | No | No |
 
 ### Stage 3: Screening
 

@@ -1,0 +1,35 @@
+# Pocket2Mol Environment
+# Autoregressive pocket-conditioned molecule generation (~11x faster than TargetDiff)
+# Setup:
+#   conda env create -f env_pocket2mol.yml
+#   conda activate pocket2mol_env
+#   git clone https://github.com/pengxingang/Pocket2Mol.git \
+#       autonomous_drug_discovery/modules/02_generation/pocket2mol
+#   # Download checkpoint from:
+#   # https://drive.google.com/drive/folders/1KfdOczjUPITPhIvCuBmnj4xFTV-iI2xB
+#   # Place at: modules/02_generation/pocket2mol/ckpt/pretrained.pt
+
+name: pocket2mol_env
+channels:
+  - pytorch
+  - nvidia
+  - pyg
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pytorch=1.10.1
+  - cudatoolkit=11.3
+  - pyg
+  - pytorch-cluster
+  - pytorch-scatter
+  - pytorch-sparse
+  - rdkit=2022.03
+  - biopython
+  - pyyaml
+  - pandas
+  - tqdm
+  - pip
+  - pip:
+    - lmdb
+    - easydict

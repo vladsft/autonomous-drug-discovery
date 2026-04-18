@@ -7,7 +7,10 @@ An end-to-end computational drug discovery system that takes a protein structure
 Given a protein target, the pipeline:
 
 1. **Detects binding pockets** on the protein surface using P2Rank (ML-based, default) or fpocket (fallback)
-2. **Generates candidate molecules** using fragment-based combinatorial chemistry (RDKit), sized to fit the detected pocket
+2. **Generates candidate molecules** using one of three backends:
+   - RDKit fragment-based combinatorial chemistry (default, fast, CPU)
+   - Pocket2Mol autoregressive generator (pocket-conditioned, ~7 s/molecule on GPU)
+   - TargetDiff E(3)-equivariant diffusion (pocket-conditioned, slower, highest-fidelity 3D)
 3. **Screens candidates** against drug-likeness filters (Lipinski, QED, SA, PAINS) and annotates with ADMET-AI predictions (104 properties: toxicity, absorption, metabolism, etc.)
 4. **Docks survivors** into the binding pocket using AutoDock Vina to estimate binding affinity
 5. **Ranks and reports** the results, with all intermediate data logged to SQLite
@@ -50,8 +53,14 @@ tar -xzf p2rank_2.5.1.tar.gz && rm p2rank_2.5.1.tar.gz
 ```bash
 cd autonomous_drug_discovery
 
-# Production mode: real generation, screening, and docking
+# Production mode: real generation (RDKit), screening, and docking
 conda run -n base python orchestrator.py run data/processed/1M17.pdb --mode production
+
+# Pocket2Mol mode: autoregressive pocket-conditioned generation (requires pocket2mol_env)
+conda run -n base python orchestrator.py run data/processed/6P3D.pdb --mode pocket2mol
+
+# TargetDiff mode: diffusion-based generation (requires targetdiff_env)
+conda run -n base python orchestrator.py run data/processed/6P3D.pdb --mode targetdiff
 
 # Simulation mode: stub data, for testing the pipeline plumbing
 conda run -n base python orchestrator.py run data/processed/1UYD.pdb --mode simulation
@@ -77,6 +86,7 @@ conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json 
 | [docs/installation.md](docs/installation.md) | How do I set this up? Prerequisites, install steps, troubleshooting |
 | [docs/telemetry-guide.md](docs/telemetry-guide.md) | How do I query the data? DB schema, SQL queries, Python API |
 | [docs/targetdiff-setup.md](docs/targetdiff-setup.md) | How do I set up TargetDiff? Separate env, standalone testing, performance |
+| [docs/pocket2mol-setup.md](docs/pocket2mol-setup.md) | How do I set up Pocket2Mol? Separate env, checkpoint download, troubleshooting |
 
 ## Repository structure
 
@@ -130,7 +140,8 @@ conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json 
 **Modes:**
 - `simulation` — writes a single stub molecule (benzene) for pipeline testing.
 - `rdkit` — fragment-based combinatorial generation using RDKit. Assembles drug-like scaffolds (indole, quinazoline, piperidine, etc.) with functional group substituents and linkers. Uses BRICS decomposition for additional diversity. Molecules are sized to fit the pocket (estimated from pocket radius). 3D conformers are generated and MMFF-optimized.
-- `targetdiff` — wraps the [TargetDiff](https://github.com/guanjq/targetdiff) diffusion model. Requires a separate conda environment and pretrained checkpoint (not included). Reserved for future use.
+- `pocket2mol` — wraps the [Pocket2Mol](https://github.com/pengxingang/Pocket2Mol) autoregressive generator. Builds molecules atom-by-atom inside the pocket using a graph neural network. ~11× faster than TargetDiff. Requires the `pocket2mol_env` conda environment and a pretrained checkpoint. See [docs/pocket2mol-setup.md](docs/pocket2mol-setup.md).
+- `targetdiff` — wraps the [TargetDiff](https://github.com/guanjq/targetdiff) E(3)-equivariant diffusion model. Denoises from random noise over 1000 steps, conditioned on the pocket shape. Highest-fidelity 3D generation but slowest. Requires the `targetdiff_env` conda environment. See [docs/targetdiff-setup.md](docs/targetdiff-setup.md).
 
 **Input:** `manifest.json` from Stage 1 (specifically the `best_pocket` path).
 
@@ -266,8 +277,12 @@ The fragment library (scaffolds, substituents, linkers) is defined at the top of
 - Validated against 3 cancer targets (EGFR, BCR-ABL, BRAF V600E) with crystallographic ground truth
 - Benchmark comparison script (`benchmark.py`)
 
+### Recently added (M2.6)
+- Pocket2Mol autoregressive generation wired into the orchestrator (`--mode pocket2mol`)
+- TargetDiff diffusion generation wired into the orchestrator (`--mode targetdiff`)
+
 ### Planned next
-- TargetDiff diffusion generation (environment ready, checkpoint downloaded)
+- Empirical comparison: Pocket2Mol vs TargetDiff vs RDKit on the validated cancer targets
 - GNINA CNN-based rescoring
 - AiZynthFinder retrosynthetic feasibility
 - Domain expert review (M3)

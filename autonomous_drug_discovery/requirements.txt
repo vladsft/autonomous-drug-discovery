@@ -1,27 +1,26 @@
 # Autonomous Drug Discovery Pipeline — Python Dependencies
 #
-# Two-step install (conda handles packages that need compiled extensions):
+# QUICK START:
+#   conda install -n base -c conda-forge rdkit vina openjdk=17 -y
+#   pip install -r requirements.txt
 #
-#   Step 1 — conda (run once):
-#     conda install -n base -c conda-forge rdkit vina openjdk=17 -y
+# FULL SETUP (including all conda envs):
+#   See docs/installation.md
 #
-#   Step 2 — pip (this file):
-#     pip install -r requirements.txt
+# External binaries:
+#   P2Rank:  download p2rank_2.5.1.tar.gz → expected at ~/p2rank_2.5.1/prank
+#   fpocket: build from source → expected at ~/fpocket/bin/fpocket
 #
-# External binaries (not pip/conda-installable):
-#   P2Rank:  wget https://github.com/rdk/p2rank/releases/download/2.5.1/p2rank_2.5.1.tar.gz
-#            tar -xzf p2rank_2.5.1.tar.gz  →  expected at ~/p2rank_2.5.1/prank
-#   fpocket: git clone https://github.com/Discngine/fpocket && cd fpocket && make install
-#            expected at ~/fpocket/bin/fpocket
-#
-# TargetDiff diffusion model — separate conda env (Python 3.8, PyTorch 1.13):
-#   See envs/env_targetdiff.yml
+# Separate conda envs (deep learning backends):
+#   TargetDiff:  envs/env_targetdiff.yml   (Python 3.8, PyTorch 1.13, CUDA 11.7)
+#   Pocket2Mol:  envs/env_pocket2mol.yml   (Python 3.8, PyTorch 1.10.1, CUDA 11.3)
 
 # ── Stage 1: Pocket detection ─────────────────────────────────────────────────
-# (P2Rank and fpocket are external binaries; no pip packages needed)
+# P2Rank and fpocket are external binaries — no pip packages required
 
 # ── Stage 2: Molecule generation ─────────────────────────────────────────────
-# (RDKit installed via conda above; no additional pip packages needed)
+# RDKit installed via conda above
+pyyaml>=6.0            # YAML config generation for TargetDiff / Pocket2Mol sampling
 
 # ── Stage 3: Screening ───────────────────────────────────────────────────────
 molscore>=0.3          # Primary screening backend (descriptor calc + PAINS filters)
@@ -30,10 +29,11 @@ admet-ai>=1.0          # 104-property ADMET prediction (toxicity, absorption, me
 # ── Stage 4: Docking ─────────────────────────────────────────────────────────
 meeko>=0.5             # Ligand PDBQT preparation for AutoDock Vina
 gemmi>=0.6             # Receptor PDB parsing and AutoDock atom typing
-pytdc>=0.4             # TDC Oracle for triage docking mode (Vina under the hood)
+# pytdc>=0.4           # TDC Oracle for triage docking — INCOMPATIBLE with Python 3.13
+#                      # (pins scikit-learn==1.2.2 which requires Python ≤3.11)
+#                      # Production Vina docking works without it.
 
 # ── Utilities ────────────────────────────────────────────────────────────────
-numpy>=1.24            # Numerical arrays (also a transitive dep of rdkit/vina)
+numpy>=1.24            # Numerical arrays
 pandas>=2.0            # Tabular results handling
 scipy>=1.10            # Scientific utilities (geometry, stats)
-pyyaml>=6.0            # YAML config generation for TargetDiff sampling

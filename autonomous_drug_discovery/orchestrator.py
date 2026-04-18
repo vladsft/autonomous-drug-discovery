@@ -36,7 +36,8 @@ def ensure_dirs():
 
 def get_python_cmd(env_name):
     """Return the command to run python in a specific conda environment."""
-    return ["conda", "run", "-n", env_name, "python"]
+    conda_bin = os.environ.get("CONDA_EXE", "conda")
+    return [conda_bin, "run", "-n", env_name, "python"]
 
 
 def run_ingestion(pdb_path, db_path, campaign_id, clean_pdb=False, pocket_backend="p2rank"):
@@ -84,11 +85,8 @@ def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
 
     out_dir = output_dir or str(DATA_DIR / "candidates")
 
-    # Use targetdiff_env only for targetdiff mode; base env for everything else
-    if mode == "targetdiff":
-        cmd = get_python_cmd("targetdiff_env")
-    else:
-        cmd = get_python_cmd("base")
+    env_map = {"targetdiff": "targetdiff_env", "pocket2mol": "pocket2mol_env"}
+    cmd = get_python_cmd(env_map.get(mode, "base"))
 
     cmd += [
         str(script_path),
@@ -215,7 +213,7 @@ def main():
     # Generate command
     gen_parser = subparsers.add_parser("generate", help="Generate molecules from a manifest")
     gen_parser.add_argument("manifest", help="Path to ingestion manifest.json")
-    gen_parser.add_argument("--mode", choices=["simulation", "rdkit", "targetdiff", "production"],
+    gen_parser.add_argument("--mode", choices=["simulation", "rdkit", "targetdiff", "pocket2mol", "production"],
                             default="simulation", help="Execution mode")
 
     # Screen command
@@ -231,7 +229,7 @@ def main():
     # Full Pipeline command
     pipeline_parser = subparsers.add_parser("run", help="Run full pipeline")
     pipeline_parser.add_argument("pdb_file", help="Path to input PDB file")
-    pipeline_parser.add_argument("--mode", choices=["simulation", "production", "targetdiff"],
+    pipeline_parser.add_argument("--mode", choices=["simulation", "production", "targetdiff", "pocket2mol"],
                                  default="simulation", help="Execution mode")
 
     args = parser.parse_args()
@@ -268,6 +266,8 @@ def main():
             gen_mode, dock_mode = "simulation", "simulation"
         elif mode == "targetdiff":
             gen_mode, dock_mode = "targetdiff", "production"
+        elif mode == "pocket2mol":
+            gen_mode, dock_mode = "pocket2mol", "production"
         else:
             gen_mode, dock_mode = "rdkit", "production"
 

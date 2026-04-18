@@ -1,23 +1,27 @@
-# Orchestrator Environment
-# Core environment for the pipeline driver, screening (MolScore), docking triage (TDC),
-# and the Agent Planner (LangChain).
+# Base / Orchestrator Environment
+# Used for all pipeline stages except TargetDiff and Pocket2Mol generation.
+# Install: conda env update -n base -f env_orchestrator.yml
+#
+# Then install pip deps:
+#   conda run -n base pip install -r requirements.txt
 
-name: orchestrator_env
+name: base
 channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.10
+  - python>=3.10
   - rdkit
+  - vina
+  - openjdk=17          # Required for P2Rank pocket detection
   - numpy
   - pandas
   - scipy
+  - pyyaml
   - pip
   - pip:
-    - molscore
-    - PyTDC
-    - langchain
-    - langchain-core
-    - langchain-google-genai
-    - posecheck
-    - pytest
+    - molscore>=0.3
+    - admet-ai>=1.0
+    - meeko>=0.5
+    - gemmi>=0.6
+    - pytdc>=0.4

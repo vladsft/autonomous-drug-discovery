@@ -7,7 +7,7 @@
 The pipeline runs end-to-end with real tools on real proteins. All four stages are production-grade:
 
 - **Pocket detection**: P2Rank (ML-based, default) and fpocket (geometry-based fallback) both integrated. P2Rank is the default.
-- **Molecule generation**: RDKit fragment-based generation integrated. TargetDiff diffusion model has a working standalone proof-of-concept (BRAF V600E) but is not yet wired into the orchestrator pipeline.
+- **Molecule generation**: RDKit fragment-based generation integrated. TargetDiff (diffusion) and Pocket2Mol (autoregressive) are both wired into the orchestrator as selectable backends via `--mode targetdiff` / `--mode pocket2mol`. Empirical comparison across validated targets is the next step.
 - **Screening**: MolScore (primary backend) or RDKit fallback, with ADMET-AI enrichment (104 properties) on survivors.
 - **Docking**: AutoDock Vina (production), TDC Oracle (triage), and simulation stubs all supported.
 - **Telemetry**: Full SQLite logging across all stages.
@@ -20,7 +20,7 @@ Validated against three cancer targets with crystallographic ground truth:
 | BCR-ABL (2HYY) | -12.59 kcal/mol | 2.7 A | 92% |
 | BRAF V600E (6P3D) | -11.20 kcal/mol | 3.1 A | 89% |
 
-The immediate priorities are: M3 domain expert review (non-negotiable), TargetDiff orchestrator integration, and per-campaign output directories to prevent file collisions.
+The immediate priorities are: M3 domain expert review (non-negotiable), empirical comparison of the generation backends (RDKit / Pocket2Mol / TargetDiff) on validated targets, and tightening screening thresholds with expert input.
 
 ## Architecture
 
@@ -121,11 +121,11 @@ Both should be available as interchangeable modules behind a common interface. T
 ### Step 1 — M3: Domain Expert Review (Highest Priority)
 Engage a medicinal chemistry or cancer research collaborator to review pipeline output on the three validated targets. Ask: are the generated molecules sensible, are the rankings meaningful, are the failure modes expected? This feedback shapes filter thresholds, scoring weights, and generation constraints. Without medicinal chemistry judgment, the pipeline produces numbers without meaning.
 
-### Step 2 — TargetDiff Orchestrator Integration
-The TargetDiff standalone POC is done (BRAF V600E, 2 molecules, CPU inference ~12 min/molecule). Wire it into the orchestrator as a selectable generation backend via `--mode targetdiff`. Requires passing config YAML to the targetdiff environment.
+### Step 2 — Empirical Backend Comparison (TargetDiff vs Pocket2Mol vs RDKit)
+TargetDiff and Pocket2Mol are now wired into the orchestrator (`--mode targetdiff` / `--mode pocket2mol`). Run each on the three validated cancer targets (EGFR, BCR-ABL, BRAF) and compare: docking score distribution, QED/SA/ADMET distributions, novelty (Tanimoto to known drugs), and runtime. Document which backend wins under which conditions — the answer will inform the agent planner's strategy selection in Step 7.
 
-### Step 3 — Per-Campaign Output Directories
-Currently all campaigns write to shared output directories with hardcoded filenames. Concurrent runs collide. Each campaign should write to a timestamped subdirectory (e.g., `data/campaigns/{campaign_id}/`).
+### Step 3 — Per-Campaign Output Directories (DONE)
+Campaigns now write to `data/{campaign_id}/{candidates,screened,results}/` when using the full `run` command. Independent stage invocations still use shared `data/candidates/`, `data/screened/`, `data/results/` directories.
 
 ### Step 4 — Tighten Screening Thresholds
 Current survival rates are 73-98% (target: 40-60%). This means the generator is over-producing junk or filters are too loose. Tighten based on Step 1 expert input. This is a config-only change (`default_scoring_config.json`).

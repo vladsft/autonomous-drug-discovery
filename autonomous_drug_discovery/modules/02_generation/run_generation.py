@@ -27,6 +27,7 @@ from pathlib import Path
 MODULE_DIR = Path(__file__).parent.resolve()
 PROJECT_ROOT = MODULE_DIR.parent.parent
 TARGETDIFF_REPO = MODULE_DIR / "targetdiff"
+POCKET2MOL_REPO = MODULE_DIR / "pocket2mol"
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from telemetry import TelemetryDB
@@ -475,7 +476,7 @@ def run_generation_targetdiff(manifest, out_path, parameters):
     td_result_path = out_path / "targetdiff_raw"
 
     cmd = [
-        "conda", "run", "-n", "targetdiff_env", "python",
+        os.environ.get("CONDA_EXE", "conda"), "run", "-n", "targetdiff_env", "python",
         str(sample_script),
         str(sampling_config),
         "--pdb_path", str(pocket_pdb),
@@ -524,6 +525,154 @@ def run_generation_targetdiff(manifest, out_path, parameters):
     return str(output_sdf)
 
 
+def _compute_pocket_centroid(pocket_pdb_path):
+    """Return (cx, cy, cz) centroid of atoms in a pocket PDB file."""
+    coords = []
+    with open(pocket_pdb_path) as f:
+        for line in f:
+            if line.startswith(("ATOM", "HETATM")):
+                coords.append((float(line[30:38]), float(line[38:46]), float(line[46:54])))
+    if not coords:
+        raise ValueError(f"No atoms found in pocket PDB: {pocket_pdb_path}")
+    n = len(coords)
+    return sum(c[0] for c in coords) / n, sum(c[1] for c in coords) / n, sum(c[2] for c in coords) / n
+
+
+def run_generation_pocket2mol(manifest, out_path, parameters):
+    """Pocket2Mol mode: autoregressive pocket-conditioned molecule generation.
+
+    Pocket2Mol generates molecules atom-by-atom conditioned on the binding pocket
+    geometry. ~11x faster than TargetDiff (7s/molecule vs 78s on GPU).
+
+    Requires:
+      - pocket2mol_env conda environment (envs/env_pocket2mol.yml)
+      - Pocket2Mol repo cloned at modules/02_generation/pocket2mol/
+      - Pretrained checkpoint at pocket2mol/ckpt/pretrained.pt
+        (download: https://drive.google.com/drive/folders/1KfdOczjUPITPhIvCuBmnj4xFTV-iI2xB)
+    """
+    if not POCKET2MOL_REPO.exists():
+        raise FileNotFoundError(
+            f"Pocket2Mol repo not found at {POCKET2MOL_REPO}. "
+            f"Clone it: git clone https://github.com/pengxingang/Pocket2Mol.git {POCKET2MOL_REPO}"
+        )
+
+    checkpoint = POCKET2MOL_REPO / "ckpt" / "pretrained_Pocket2Mol.pt"
+    if not checkpoint.exists():
+        raise FileNotFoundError(
+            f"Pocket2Mol checkpoint not found at {checkpoint}. "
+            f"Download from https://drive.google.com/drive/folders/1KfdOczjUPITPhIvCuBmnj4xFTV-iI2xB"
+        )
+
+    sample_script = POCKET2MOL_REPO / "sample_for_pdb.py"
+    if not sample_script.exists():
+        raise FileNotFoundError(f"Pocket2Mol sample script not found at {sample_script}")
+
+    # Get the full protein PDB (not the pocket PDB — Pocket2Mol needs the full structure)
+    input_pdb = Path(manifest.get("input_pdb", ""))
+    if not input_pdb.exists():
+        raise FileNotFoundError(f"Input PDB not found: {input_pdb}")
+
+    # Get pocket center: P2Rank provides it directly; fpocket requires centroid computation
+    center = manifest.get("best_pocket_center")
+    if center is not None:
+        cx, cy, cz = center
+    else:
+        pocket_pdb = manifest.get("best_pocket")
+        if not pocket_pdb or not Path(pocket_pdb).exists():
+            raise ValueError("No pocket center or pocket PDB available in manifest.")
+        cx, cy, cz = _compute_pocket_centroid(pocket_pdb)
+
+    print(f"[Generation] (POCKET2MOL MODE) Pocket center: ({cx:.2f}, {cy:.2f}, {cz:.2f})")
+    print(f"[Generation] Running Pocket2Mol on {input_pdb.name}...")
+
+    out_path.mkdir(parents=True, exist_ok=True)
+    p2m_raw = out_path / "pocket2mol_raw"
+    p2m_raw.mkdir(parents=True, exist_ok=True)
+
+    num_samples = parameters.get("num_samples", 100)
+
+    # Write a run-specific config so we can set the absolute checkpoint path
+    # and num_samples without mutating the repo's config file.
+    import yaml
+    base_config_path = POCKET2MOL_REPO / "configs" / "sample_for_pdb.yml"
+    with open(base_config_path) as f:
+        run_config = yaml.safe_load(f)
+
+    run_config["model"]["checkpoint"] = str(checkpoint)
+    run_config["sample"]["num_samples"] = num_samples
+
+    run_config_path = out_path / "pocket2mol_run_config.yml"
+    with open(run_config_path, "w") as f:
+        yaml.dump(run_config, f)
+
+    # Center passed as a plain comma-separated string — no leading space needed
+    # when using subprocess list args (the leading-space trick is shell-only).
+    center_str = f"{cx:.3f},{cy:.3f},{cz:.3f}"
+
+    device = parameters.get("device", "cpu")
+
+    conda_bin = os.environ.get("CONDA_EXE", "conda")
+    cmd = [
+        conda_bin, "run", "-n", "pocket2mol_env", "python",
+        str(sample_script),
+        "--pdb_path", str(input_pdb),
+        "--center", center_str,
+        "--outdir", str(p2m_raw),
+        "--config", str(run_config_path),
+        "--device", device,
+    ]
+
+    subprocess.check_call(cmd, cwd=str(POCKET2MOL_REPO))
+
+    # Consolidate all SDF outputs into a single generated_molecules.sdf
+    if not HAS_RDKIT:
+        raise ImportError("RDKit is required to consolidate Pocket2Mol output.")
+
+    RDLogger.DisableLog("rdApp.*")
+    output_sdf = out_path / "generated_molecules.sdf"
+    # Pocket2Mol writes to {outdir}/{timestamp}/SDF/*.sdf
+    sdf_files = sorted(p2m_raw.glob("**/SDF/*.sdf"))
+
+    if not sdf_files:
+        raise RuntimeError(
+            f"Pocket2Mol produced no SDF files in {p2m_raw}. "
+            "Check for initialization failures (known issue on some targets)."
+        )
+
+    writer = Chem.SDWriter(str(output_sdf))
+    mol_count = 0
+    fail_count = 0
+    for sdf_file in sdf_files:
+        supplier = Chem.SDMolSupplier(str(sdf_file), removeHs=False)
+        for mol in supplier:
+            if mol is None:
+                fail_count += 1
+                continue
+            try:
+                smi = Chem.MolToSmiles(mol)
+            except Exception:
+                fail_count += 1
+                continue
+            mol.SetProp("molecule_id", f"mol_{mol_count:04d}")
+            mol.SetProp("_Name", f"mol_{mol_count:04d}")
+            mol.SetProp("smiles", smi)
+            mol.SetProp("generator", "pocket2mol")
+            writer.write(mol)
+            mol_count += 1
+    writer.close()
+
+    if mol_count == 0:
+        raise RuntimeError(
+            f"No valid molecules produced by Pocket2Mol. "
+            f"{fail_count} reconstruction failures. "
+            "Try re-running — diffusion models have stochastic failure modes."
+        )
+
+    print(f"[Generation] Pocket2Mol: {mol_count} valid molecules ({fail_count} reconstruction failures)")
+    print(f"[Generation] Output: {output_sdf}")
+    return str(output_sdf)
+
+
 def run_generation(manifest_path, output_dir, mode="simulation",
                    db_path=None, campaign_id=None):
     """Run molecule generation with full telemetry.
@@ -568,6 +717,8 @@ def run_generation(manifest_path, output_dir, mode="simulation",
             output_sdf = run_generation_rdkit(manifest, out_path, parameters)
         elif mode == "targetdiff":
             output_sdf = run_generation_targetdiff(manifest, out_path, parameters)
+        elif mode == "pocket2mol":
+            output_sdf = run_generation_pocket2mol(manifest, out_path, parameters)
         # Backwards compat: "production" maps to "rdkit" (was targetdiff stub)
         elif mode == "production":
             output_sdf = run_generation_rdkit(manifest, out_path, parameters)
@@ -626,7 +777,7 @@ def main():
     parser = argparse.ArgumentParser(description="Module 02: Generation")
     parser.add_argument("--manifest", required=True, help="Input manifest from ingestion")
     parser.add_argument("--output_dir", required=True, help="Output directory")
-    parser.add_argument("--mode", choices=["simulation", "rdkit", "targetdiff", "production"],
+    parser.add_argument("--mode", choices=["simulation", "rdkit", "targetdiff", "pocket2mol", "production"],
                         default="simulation", help="Execution mode")
     parser.add_argument("--db_path", default=None, help="Path to telemetry database")
     parser.add_argument("--campaign_id", default=None, help="Campaign ID for telemetry")

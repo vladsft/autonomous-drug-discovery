@@ -4,8 +4,21 @@
 
 - Linux or macOS (tested on Ubuntu 22.04+)
 - [Miniconda](https://docs.conda.io/en/latest/miniconda.html) or Anaconda
-- Java 17+ (for P2Rank)
-- ~4 GB disk space (dependencies + pretrained models)
+- Java 17+ (for P2Rank, installed via conda below)
+- ~8 GB disk space (dependencies + pretrained models, including optional deep-learning envs)
+
+### Installing Miniconda (if you don't have it)
+
+```bash
+curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh
+bash /tmp/miniconda.sh -b -p ~/miniconda3
+~/miniconda3/bin/conda init bash
+# Restart your shell, or source ~/.bashrc
+
+# Accept Anaconda Terms of Service for default channels
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+```
 
 ## Step 1: Conda Packages
 
@@ -19,7 +32,7 @@ conda install -n base -c conda-forge rdkit vina openjdk=17 -y
 
 ```bash
 cd autonomous_drug_discovery
-pip install -r requirements.txt
+conda run -n base pip install -r requirements.txt
 ```
 
 This installs:
@@ -30,9 +43,10 @@ This installs:
 | admet-ai | 104-property ADMET prediction (toxicity, absorption, metabolism) |
 | meeko | Ligand PDBQT preparation for AutoDock Vina |
 | gemmi | Receptor PDB parsing and AutoDock atom typing |
-| pytdc | TDC Oracle for triage docking mode |
 | numpy, pandas, scipy | Numerical utilities |
-| pyyaml | YAML config generation for TargetDiff |
+| pyyaml | YAML config generation for TargetDiff / Pocket2Mol |
+
+**Note on `pytdc`:** The TDC Oracle (used by `--mode triage` in docking) pins `scikit-learn==1.2.2`, which does not compile on Python 3.13. It is therefore commented out in `requirements.txt`. Triage docking mode is unavailable on Python 3.13+, but production Vina docking is unaffected. To enable triage mode, install the base env on Python ≤3.11 and `pip install PyTDC` manually.
 
 ## Step 3: P2Rank (Pocket Detection)
 
@@ -73,13 +87,29 @@ The pipeline expects fpocket at `~/fpocket/bin/fpocket`. To use a different loca
 export FPOCKET_BIN=/your/path/to/fpocket
 ```
 
-## Step 5: TargetDiff (Optional, GPU Recommended)
+## Step 5: Deep-Learning Generation Backends (Optional)
 
-TargetDiff is an E(3)-equivariant diffusion model for structure-based drug design. It requires a separate conda environment due to PyTorch version constraints.
+The pipeline supports two optional deep-learning molecule generators, each in its own conda environment. Both are optional — the default RDKit fragment-based generator works without either.
 
-See [targetdiff-setup.md](targetdiff-setup.md) for full instructions.
+### Pocket2Mol (fast autoregressive generator, recommended)
 
-This step is optional. The default RDKit fragment-based generator works without TargetDiff.
+Pocket2Mol is ~11× faster than TargetDiff and easier to run on modest hardware. See [pocket2mol-setup.md](pocket2mol-setup.md) for full instructions. Summary:
+
+```bash
+conda env create -f autonomous_drug_discovery/envs/env_pocket2mol.yml
+git clone https://github.com/pengxingang/Pocket2Mol.git \
+    autonomous_drug_discovery/modules/02_generation/pocket2mol
+# Download pretrained_Pocket2Mol.pt (44.9 MB) to pocket2mol/ckpt/
+```
+
+### TargetDiff (diffusion generator, highest-fidelity 3D)
+
+TargetDiff uses diffusion sampling (1000 denoising steps), producing higher-fidelity 3D geometry but much slower. See [targetdiff-setup.md](targetdiff-setup.md) for full instructions. Summary:
+
+```bash
+conda env create -f autonomous_drug_discovery/envs/env_targetdiff.yml
+# Clone TargetDiff + download checkpoint — see targetdiff-setup.md
+```
 
 ## Verify Installation
 
@@ -150,3 +180,22 @@ Check your `default_scoring_config.json` thresholds. If you modified them too ag
 ```bash
 git checkout modules/03_screening/default_scoring_config.json
 ```
+
+### `CondaToSNonInteractiveError: Terms of Service have not been accepted`
+
+Happens on fresh Miniconda installs before any environment is created. Accept the ToS for the default channels:
+
+```bash
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+```
+
+### `conda: command not found` in subprocess / orchestrator
+
+The orchestrator uses `subprocess.check_call` to invoke conda, which does not inherit shell aliases. If conda is not on the system PATH (common when conda is only initialized in `~/.bashrc` interactively), set `CONDA_EXE`:
+
+```bash
+export CONDA_EXE=$HOME/miniconda3/bin/conda
+```
+
+The orchestrator reads this variable and falls back to the bare `conda` command if unset.

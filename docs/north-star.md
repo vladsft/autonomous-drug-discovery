@@ -43,7 +43,7 @@ Input: a PDB structure file for a protein of interest. The system identifies can
 
 ### Stage 2 — Molecule Generation
 
-Given a prioritised binding pocket, the system generates candidate molecules. Two backends: RDKit fragment-based (current default, fast, no GPU) and TargetDiff diffusion (E(3)-equivariant, designs molecules conditioned on 3D pocket shape, requires hours on CPU / minutes on GPU).
+Given a prioritised binding pocket, the system generates candidate molecules. Three backends: RDKit fragment-based (current default, fast, no GPU), Pocket2Mol autoregressive (pocket-conditioned GNN, ~11× faster than TargetDiff, ~7 s/molecule on GPU), and TargetDiff diffusion (E(3)-equivariant, highest-fidelity 3D generation conditioned on pocket shape, requires hours on CPU / minutes on GPU).
 
 Critical caveat from the literature: an ICLR 2025 paper demonstrated that SBDD models routinely generate molecules with better Vina docking scores than known ligands — but this improvement is largely an artifact of generating larger molecules, not better binders. We must always evaluate molecular weight alongside docking score.
 
@@ -95,9 +95,12 @@ With sufficient campaign history, implement an AI planning layer that adjusts pi
 
 ### Technical Roadmap
 
-Near-term (M3 timeline):
-- Wire TargetDiff into orchestrator pipeline (standalone POC done, needs config YAML integration)
+Recently completed:
+- Wired TargetDiff and Pocket2Mol into the orchestrator as selectable generation backends (`--mode targetdiff` / `--mode pocket2mol`)
 - Per-campaign output directories (prevent file collisions between concurrent runs)
+
+Near-term (M3 timeline):
+- Empirical comparison: Pocket2Mol vs TargetDiff vs RDKit across the validated cancer targets (EGFR, BCR-ABL, BRAF)
 - Add GNINA CNN-based rescoring alongside Vina (needs GPU)
 - Add AiZynthFinder retrosynthetic feasibility
 - Tighten screening thresholds based on expert feedback (current survival: 73-98%, target: 40-60%)
