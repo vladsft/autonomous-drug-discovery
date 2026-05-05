@@ -62,6 +62,20 @@ CREATE INDEX IF NOT EXISTS idx_molscores_run ON molecule_scores(run_id);
 CREATE INDEX IF NOT EXISTS idx_molscores_triage ON molecule_scores(passed_triage);
 """
 
+# Schema version bump protocol:
+#   1. Append a new entry to _MIGRATIONS with the next integer version.
+#   2. The body is a list of SQL statements that bring the DB forward to
+#      that version. Each runs inside a single transaction.
+# SQLite tracks the current schema version via PRAGMA user_version.
+_MIGRATIONS: list[tuple[int, list[str]]] = [
+    # (target_version, [statements...]) — add new entries below.
+    # Example:
+    # (2, ["ALTER TABLE molecule_scores ADD COLUMN admet_hERG REAL"]),
+]
+
+# Current baseline schema version. Bump this only when _MIGRATIONS grows.
+_SCHEMA_VERSION = 1 + len(_MIGRATIONS)
+
 
 def _compute_file_hash(filepath: str) -> str | None:
     """Compute SHA256 hash of a file. Returns None if file doesn't exist."""
@@ -102,10 +116,37 @@ class TelemetryDB:
         self._initialize_schema()
 
     def _initialize_schema(self):
-        """Create tables and indexes if they don't exist."""
+        """Create tables/indexes and apply any pending schema migrations."""
         cursor = self._conn.cursor()
         cursor.executescript(_SCHEMA_RUNS + _SCHEMA_MOLECULE_SCORES + _SCHEMA_INDEXES)
         self._conn.commit()
+        self._apply_migrations()
+
+    def _apply_migrations(self):
+        """Advance schema to the current version using `PRAGMA user_version`.
+
+        Each migration runs inside its own transaction so a failure rolls back
+        cleanly. Idempotent: running twice on the same DB is a no-op.
+        """
+        cur = self._conn.execute("PRAGMA user_version")
+        current = cur.fetchone()[0]
+        for target_version, statements in _MIGRATIONS:
+            if current >= target_version:
+                continue
+            try:
+                self._conn.execute("BEGIN")
+                for stmt in statements:
+                    self._conn.execute(stmt)
+                self._conn.execute(f"PRAGMA user_version = {target_version}")
+                self._conn.commit()
+                current = target_version
+            except Exception:
+                self._conn.rollback()
+                raise
+        # Stamp version on fresh DBs that had no migrations to apply.
+        if current == 0 and _SCHEMA_VERSION > 0:
+            self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            self._conn.commit()
 
     def start_run(
         self,

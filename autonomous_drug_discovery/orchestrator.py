@@ -29,8 +29,14 @@ DEFAULT_DB_PATH = str(DATA_DIR / "telemetry.db")
 
 
 def ensure_dirs():
-    """Ensure data directories exist."""
-    for subdir in ["raw", "processed", "candidates", "screened", "results"]:
+    """Ensure data directories exist.
+
+    `processed/` holds ingestion outputs (manifests + pocket PDBs) that are
+    keyed by PDB stem and shared across campaigns. `candidates/`, `screened/`,
+    and `results/` are fallback shared directories for single-stage invocations;
+    full pipeline runs use per-campaign subdirectories instead.
+    """
+    for subdir in ["processed", "candidates", "screened", "results"]:
         (DATA_DIR / subdir).mkdir(parents=True, exist_ok=True)
 
 
@@ -73,7 +79,12 @@ def run_ingestion(pdb_path, db_path, campaign_id, clean_pdb=False, pocket_backen
 
 def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
                    output_dir=None):
-    """Run the generation module (TargetDiff wrapper)."""
+    """Run the generation module.
+
+    Dispatches to the appropriate conda env based on `mode`:
+    RDKit/simulation stay in `base`, `targetdiff` → `targetdiff_env`,
+    `pocket2mol` → `pocket2mol_env`.
+    """
     print(f"\n{'='*60}")
     print(f"[Orchestrator] Stage 2: GENERATION — mode={mode}")
     print(f"{'='*60}")
@@ -107,7 +118,7 @@ def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
 
 
 def run_screening(sdf_path, db_path, campaign_id, output_dir=None):
-    """Run the screening module (RDKit fast triage)."""
+    """Run the screening module (MolScore descriptors + ADMET-AI enrichment)."""
     print(f"\n{'='*60}")
     print(f"[Orchestrator] Stage 3: SCREENING (Fast Triage)")
     print(f"{'='*60}")
@@ -208,7 +219,10 @@ def main():
     # Ingest command
     ingest_parser = subparsers.add_parser("ingest", help="Ingest a PDB file and identify pockets")
     ingest_parser.add_argument("pdb_file", help="Path to input PDB file")
-    ingest_parser.add_argument("--clean", action="store_true", help="Clean PDB before processing")
+    ingest_parser.add_argument("--backend", choices=["p2rank", "fpocket"], default="p2rank",
+                               help="Pocket detection backend (default: p2rank)")
+    ingest_parser.add_argument("--clean", action="store_true",
+                               help="Drop HETATM/waters/alt locs before detection")
 
     # Generate command
     gen_parser = subparsers.add_parser("generate", help="Generate molecules from a manifest")
@@ -223,7 +237,7 @@ def main():
     # Dock command
     dock_parser = subparsers.add_parser("dock", help="Dock generated molecules")
     dock_parser.add_argument("manifest", help="Path to ingestion manifest.json")
-    dock_parser.add_argument("--mode", choices=["simulation", "production"],
+    dock_parser.add_argument("--mode", choices=["simulation", "triage", "production"],
                             default="simulation", help="Execution mode")
 
     # Full Pipeline command
@@ -231,6 +245,10 @@ def main():
     pipeline_parser.add_argument("pdb_file", help="Path to input PDB file")
     pipeline_parser.add_argument("--mode", choices=["simulation", "production", "targetdiff", "pocket2mol"],
                                  default="simulation", help="Execution mode")
+    pipeline_parser.add_argument("--backend", choices=["p2rank", "fpocket"], default="p2rank",
+                                 help="Pocket detection backend (default: p2rank)")
+    pipeline_parser.add_argument("--clean", action="store_true",
+                                 help="Drop HETATM/waters/alt locs before detection")
 
     args = parser.parse_args()
 
@@ -243,19 +261,21 @@ def main():
     print(f"[Orchestrator] Campaign ID: {campaign_id}")
     print(f"[Orchestrator] Telemetry DB: {db_path}")
 
+    ok = True
     if args.command == "ingest":
-        run_ingestion(args.pdb_file, db_path, campaign_id, args.clean)
+        ok = run_ingestion(args.pdb_file, db_path, campaign_id,
+                           clean_pdb=args.clean, pocket_backend=args.backend)
 
     elif args.command == "generate":
         mode = getattr(args, "mode", "simulation")
-        run_generation(args.manifest, db_path, campaign_id, mode)
+        ok = run_generation(args.manifest, db_path, campaign_id, mode)
 
     elif args.command == "screen":
-        run_screening(args.input_sdf, db_path, campaign_id)
+        ok = run_screening(args.input_sdf, db_path, campaign_id)
 
     elif args.command == "dock":
         mode = getattr(args, "mode", "simulation")
-        run_docking(args.manifest, db_path, campaign_id, mode)
+        ok = run_docking(args.manifest, db_path, campaign_id, mode)
 
     elif args.command == "run":
         mode = getattr(args, "mode", "simulation")
@@ -280,20 +300,27 @@ def main():
         print(f"[Orchestrator] Running FULL PIPELINE — gen={gen_mode}, dock={dock_mode}")
         print(f"[Orchestrator] Campaign directory: {campaign_dir}")
 
-        if run_ingestion(pdb_path, db_path, campaign_id):
+        ok = run_ingestion(pdb_path, db_path, campaign_id,
+                           clean_pdb=args.clean, pocket_backend=args.backend)
+        if ok:
             manifest_path = DATA_DIR / "processed" / f"{pdb_path.stem}_manifest.json"
-            if run_generation(manifest_path, db_path, campaign_id, gen_mode,
-                              output_dir=gen_dir):
-                sdf_path = Path(gen_dir) / "generated_molecules.sdf"
-                if run_screening(sdf_path, db_path, campaign_id,
-                                 output_dir=screen_dir):
-                    run_docking(manifest_path, db_path, campaign_id, dock_mode,
-                                candidates_dir=screen_dir, output_dir=dock_dir)
+            ok = run_generation(manifest_path, db_path, campaign_id, gen_mode,
+                                output_dir=gen_dir)
+        if ok:
+            sdf_path = Path(gen_dir) / "generated_molecules.sdf"
+            ok = run_screening(sdf_path, db_path, campaign_id,
+                               output_dir=screen_dir)
+        if ok:
+            ok = run_docking(manifest_path, db_path, campaign_id, dock_mode,
+                             candidates_dir=screen_dir, output_dir=dock_dir)
 
         print_campaign_summary(db_path, campaign_id)
     else:
         parser.print_help()
+        return 2
+
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

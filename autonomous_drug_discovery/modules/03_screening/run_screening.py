@@ -38,21 +38,33 @@ try:
 except ImportError:
     HAS_RDKIT = False
 
+# Try multiple import paths for MolScore descriptors — the package has
+# reorganised modules across versions. We only promote BACKEND to "molscore"
+# if we can actually instantiate a MolScore descriptor callable.
+HAS_MOLSCORE = False
+_molscore_descriptor_fn = None
 try:
-    from molscore.scoring_functions.descriptors import MolecularDescriptors
-    from molscore.scoring_functions.substructure_filters import SubstructureFilters
-    HAS_MOLSCORE = True
-    BACKEND = "molscore"
+    # Newer MolScore (>=0.9) exposes RDKitDescriptors / MolecularDescriptors
+    # under scoring_functions.descriptors.
+    from molscore.scoring_functions import descriptors as _ms_desc  # type: ignore
+    if hasattr(_ms_desc, "RDKitDescriptors"):
+        _molscore_descriptor_fn = _ms_desc.RDKitDescriptors
+    elif hasattr(_ms_desc, "MolecularDescriptors"):
+        _molscore_descriptor_fn = _ms_desc.MolecularDescriptors
+    if _molscore_descriptor_fn is not None:
+        HAS_MOLSCORE = True
+        BACKEND = "molscore"
 except ImportError:
-    HAS_MOLSCORE = False
-    if HAS_RDKIT:
-        BACKEND = "rdkit_fallback"
+    pass
+
+if BACKEND is None and HAS_RDKIT:
+    BACKEND = "rdkit"
 
 if BACKEND is None:
     raise ImportError(
-        "Neither MolScore nor RDKit are available. Install one:\n"
-        "  pip install molscore   (recommended)\n"
-        "  conda install -c conda-forge rdkit   (fallback)"
+        "Neither MolScore nor RDKit are available. Install at least one:\n"
+        "  conda install -c conda-forge rdkit   (required baseline)\n"
+        "  pip install molscore                  (optional, preferred)"
     )
 
 # Default config path
@@ -78,18 +90,111 @@ def _get_sa_scorer():
 
 
 # ---------------------------------------------------------------------------
-# MolScore Backend
+# Property computation + filter application (shared across backends)
 # ---------------------------------------------------------------------------
 
-def _screen_with_molscore(mols, smiles_list, config):
-    """Screen molecules using MolScore scoring functions."""
-    thresholds = config.get("filter_thresholds", {})
+def _pains_catalog():
+    """Return a cached PAINS filter catalog, or None if unavailable."""
+    try:
+        from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
+        params = FilterCatalogParams()
+        params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
+        return FilterCatalog(params)
+    except Exception:
+        return None
 
-    # Compute descriptors for all molecules at once
+
+def _compute_properties(mol, sa_scorer, pains_catalog, molscore_fn=None) -> dict:
+    """Compute all descriptors + PAINS flag for a single molecule.
+
+    If `molscore_fn` is provided (a MolScore descriptor callable), it is used
+    as the source of truth for the RDKit descriptors it exposes. Missing values
+    fall back to direct RDKit calls so the property dict is always complete.
+    """
+    props: dict = {}
+
+    if molscore_fn is not None:
+        try:
+            ms_out = molscore_fn(mols=[mol], prefix="desc_")
+            if isinstance(ms_out, list) and ms_out:
+                # MolScore returns one dict per input molecule; values may be
+                # prefixed (e.g. desc_MolWt). Normalise keys to our schema.
+                for k, v in ms_out[0].items():
+                    props[k if k.startswith("desc_") else f"desc_{k}"] = v
+        except Exception:
+            # Any MolScore failure → fall through to RDKit.
+            props = {}
+
+    # RDKit descriptors (fills in anything MolScore didn't provide).
+    props.setdefault("desc_MolWt", round(Descriptors.MolWt(mol), 2))
+    props.setdefault("desc_MolLogP", round(Descriptors.MolLogP(mol), 2))
+    props.setdefault("desc_NumHBD", rdMolDescriptors.CalcNumHBD(mol))
+    props.setdefault("desc_NumHBA", rdMolDescriptors.CalcNumHBA(mol))
+    props.setdefault("desc_TPSA", round(Descriptors.TPSA(mol), 2))
+    props.setdefault("desc_QED", round(QED.qed(mol), 4))
+    props.setdefault("desc_NumRotatableBonds", Descriptors.NumRotatableBonds(mol))
+    props.setdefault("desc_NumHeavyAtoms", mol.GetNumHeavyAtoms())
+    props.setdefault("desc_SAScore", round(sa_scorer(mol), 2))
+
+    if pains_catalog is not None:
+        try:
+            props["filter_PAINS"] = 1 if pains_catalog.HasMatch(mol) else 0
+        except Exception:
+            props["filter_PAINS"] = 0
+    else:
+        props["filter_PAINS"] = 0
+
+    return props
+
+
+def _violations(props: dict, thresholds: dict) -> list[str]:
+    """Return a list of threshold violations. Empty list = passes all filters."""
+    reasons = []
+    for prop_name, spec in thresholds.items():
+        val = props.get(prop_name)
+        if val is None:
+            continue
+        if "max" in spec and val > spec["max"]:
+            reasons.append(f"{prop_name}_exceeded (val={val}, max={spec['max']})")
+        if "min" in spec and val < spec["min"]:
+            reasons.append(f"{prop_name}_below (val={val}, min={spec['min']})")
+        if "equals" in spec and val != spec["equals"]:
+            reasons.append(f"{prop_name}_mismatch (val={val}, expected={spec['equals']})")
+    return reasons
+
+
+def _mol_id_from_supplier(mol, idx: int) -> str:
+    """Preserve upstream mol_id if present in the SDF; otherwise assign by index.
+
+    Pocket2Mol and TargetDiff tag molecules with `molecule_id` during
+    consolidation; preserving it keeps telemetry joins across stages correct.
+    """
+    if mol is not None and mol.HasProp("molecule_id"):
+        return mol.GetProp("molecule_id")
+    return f"mol_{idx:04d}"
+
+
+def _screen_molecules(mols, smiles_list, config, backend):
+    """Apply property computation + threshold filters to all molecules.
+
+    Returns a list of per-molecule result dicts. Each dict has keys:
+    molecule_id, smiles, passed, eliminated_by, violations (full list), properties.
+    """
+    thresholds = config.get("filter_thresholds", {})
+    sa_scorer = _get_sa_scorer()
+    pains_catalog = _pains_catalog()
+
+    # Instantiate MolScore descriptor object once if available.
+    molscore_fn = None
+    if backend == "molscore" and _molscore_descriptor_fn is not None:
+        try:
+            molscore_fn = _molscore_descriptor_fn(prefix="desc_")
+        except Exception:
+            molscore_fn = None
+
     results = []
     for i, (mol, smi) in enumerate(zip(mols, smiles_list)):
-        mol_id = f"mol_{i:04d}"
-        props = {}
+        mol_id = _mol_id_from_supplier(mol, i)
 
         if mol is None:
             results.append({
@@ -97,141 +202,32 @@ def _screen_with_molscore(mols, smiles_list, config):
                 "smiles": smi,
                 "passed": False,
                 "eliminated_by": "invalid_chemistry",
+                "violations": ["invalid_chemistry"],
                 "properties": {},
             })
             continue
 
-        # Compute RDKit descriptors (MolScore uses RDKit under the hood)
         try:
-            props = {
-                "desc_MolWt": round(Descriptors.MolWt(mol), 2),
-                "desc_MolLogP": round(Descriptors.MolLogP(mol), 2),
-                "desc_NumHBD": rdMolDescriptors.CalcNumHBD(mol),
-                "desc_NumHBA": rdMolDescriptors.CalcNumHBA(mol),
-                "desc_TPSA": round(Descriptors.TPSA(mol), 2),
-                "desc_QED": round(QED.qed(mol), 4),
-                "desc_NumRotatableBonds": Descriptors.NumRotatableBonds(mol),
-                "desc_NumHeavyAtoms": mol.GetNumHeavyAtoms(),
-            }
-
-            # SA Score
-            sa_scorer = _get_sa_scorer()
-            props["desc_SAScore"] = round(sa_scorer(mol), 2)
-
-            # PAINS filter via RDKit FilterCatalog
-            try:
-                from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
-                pains_params = FilterCatalogParams()
-                pains_params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
-                catalog = FilterCatalog(pains_params)
-                props["filter_PAINS"] = 1 if catalog.HasMatch(mol) else 0
-            except Exception:
-                props["filter_PAINS"] = 0
-
+            props = _compute_properties(mol, sa_scorer, pains_catalog, molscore_fn)
         except Exception as e:
             results.append({
                 "molecule_id": mol_id,
                 "smiles": smi,
                 "passed": False,
                 "eliminated_by": f"property_computation_error: {e}",
-                "properties": props,
+                "violations": [f"property_computation_error: {e}"],
+                "properties": {},
             })
             continue
 
-        # Apply threshold filters
-        eliminated_by = None
-        for prop_name, threshold in thresholds.items():
-            val = props.get(prop_name)
-            if val is None:
-                continue
-
-            if "max" in threshold and val > threshold["max"]:
-                eliminated_by = f"{prop_name}_exceeded (val={val}, max={threshold['max']})"
-                break
-            if "min" in threshold and val < threshold["min"]:
-                eliminated_by = f"{prop_name}_below (val={val}, min={threshold['min']})"
-                break
-            if "equals" in threshold and val != threshold["equals"]:
-                eliminated_by = f"{prop_name}_mismatch (val={val}, expected={threshold['equals']})"
-                break
-
+        violations = _violations(props, thresholds)
         results.append({
             "molecule_id": mol_id,
             "smiles": smi,
-            "passed": eliminated_by is None,
-            "eliminated_by": eliminated_by,
+            "passed": not violations,
+            "eliminated_by": violations[0] if violations else None,
+            "violations": violations,
             "properties": props,
-        })
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# RDKit Fallback Backend (from Iteration 1)
-# ---------------------------------------------------------------------------
-
-def _screen_with_rdkit_fallback(mols, smiles_list, config):
-    """Screen molecules using hand-rolled RDKit filters (fallback)."""
-    thresholds = config.get("filter_thresholds", {})
-    results = []
-
-    sa_scorer = _get_sa_scorer()
-
-    for i, (mol, smi) in enumerate(zip(mols, smiles_list)):
-        mol_id = f"mol_{i:04d}"
-
-        if mol is None:
-            results.append({
-                "molecule_id": mol_id, "smiles": smi,
-                "passed": False, "eliminated_by": "invalid_chemistry", "properties": {},
-            })
-            continue
-
-        try:
-            props = {
-                "desc_MolWt": round(Descriptors.MolWt(mol), 2),
-                "desc_MolLogP": round(Descriptors.MolLogP(mol), 2),
-                "desc_NumHBD": rdMolDescriptors.CalcNumHBD(mol),
-                "desc_NumHBA": rdMolDescriptors.CalcNumHBA(mol),
-                "desc_QED": round(QED.qed(mol), 4),
-                "desc_SAScore": round(sa_scorer(mol), 2),
-            }
-
-            # PAINS filter
-            try:
-                from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
-                params = FilterCatalogParams()
-                params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
-                catalog = FilterCatalog(params)
-                props["filter_PAINS"] = 1 if catalog.HasMatch(mol) else 0
-            except Exception:
-                props["filter_PAINS"] = 0
-        except Exception as e:
-            results.append({
-                "molecule_id": mol_id, "smiles": smi,
-                "passed": False, "eliminated_by": f"error: {e}", "properties": {},
-            })
-            continue
-
-        eliminated_by = None
-        for prop_name, threshold in thresholds.items():
-            val = props.get(prop_name)
-            if val is None:
-                continue
-            if "max" in threshold and val > threshold["max"]:
-                eliminated_by = f"{prop_name}_exceeded"
-                break
-            if "min" in threshold and val < threshold["min"]:
-                eliminated_by = f"{prop_name}_below"
-                break
-            if "equals" in threshold and val != threshold["equals"]:
-                eliminated_by = f"{prop_name}_mismatch"
-                break
-
-        results.append({
-            "molecule_id": mol_id, "smiles": smi,
-            "passed": eliminated_by is None,
-            "eliminated_by": eliminated_by, "properties": props,
         })
 
     return results
@@ -307,73 +303,91 @@ def run_screening(input_sdf: str, output_dir: str, config_path: str | None = Non
             else:
                 smiles_list.append(None)
 
-        # Route to backend
-        if BACKEND == "molscore":
-            results = _screen_with_molscore(mols, smiles_list, config)
-        else:
-            results = _screen_with_rdkit_fallback(mols, smiles_list, config)
+        results = _screen_molecules(mols, smiles_list, config, BACKEND)
 
         # Separate survivors and rejected
         survivors = [r for r in results if r["passed"]]
         rejected = [r for r in results if not r["passed"]]
 
-        # Attrition analysis
-        attrition = {}
+        # Attrition analysis — count every violation, so a molecule that fails
+        # three filters contributes to three attrition buckets.
+        attrition: dict[str, int] = {}
         for r in rejected:
-            reason = r["eliminated_by"] or "unknown"
-            # Group by filter category
-            category = reason.split("_")[0] if "_" in reason else reason
-            attrition[category] = attrition.get(category, 0) + 1
+            for v in (r["violations"] or ["unknown"]):
+                category = v.split("_")[0] if "_" in v else v
+                attrition[category] = attrition.get(category, 0) + 1
 
-        # Write filtered SDF — use a lookup from molecule_id to list index
-        mol_id_to_idx = {f"mol_{i:04d}": i for i in range(len(mols))}
+        # Write filtered SDF — zip results with the input mol list by position.
         output_sdf = out_path / "screened_molecules.sdf"
         writer = Chem.SDWriter(str(output_sdf))
-        for r in survivors:
-            idx = mol_id_to_idx.get(r["molecule_id"])
-            if idx is not None and idx < len(mols) and mols[idx] is not None:
-                writer.write(mols[idx])
+        for r, mol in zip(results, mols):
+            if r["passed"] and mol is not None:
+                # Ensure the preserved molecule_id is stamped into the SDF so
+                # downstream stages (docking, telemetry) see the same key.
+                mol.SetProp("molecule_id", r["molecule_id"])
+                writer.write(mol)
         writer.close()
 
-        # ADMET-AI enrichment for survivors
-        admet_results = {}
+        # ADMET-AI enrichment for survivors.
+        # Run in small chunks so one poisoned SMILES can't sink the whole batch.
+        admet_results: dict[str, dict] = {}
+        admet_errors: dict[str, str] = {}
+        ADMET_KEY_PROPS = [
+            "hERG", "AMES", "DILI", "CYP2D6_Veith", "CYP3A4_Veith",
+            "Caco2_Wang", "HIA_Hou", "BBB_Martins", "Clearance_Hepatocyte_AZ",
+            "Bioavailability_Ma", "LD50_Zhu",
+        ]
         try:
             from admet_ai import ADMETModel
             admet_model = ADMETModel()
             survivor_smiles = [r["smiles"] for r in survivors if r["smiles"]]
             if survivor_smiles:
                 print(f"[Screening] Running ADMET-AI on {len(survivor_smiles)} survivors...")
-                admet_preds = admet_model.predict(smiles=survivor_smiles)
-                # admet_preds is a pandas DataFrame (rows=molecules, cols=properties)
-                for i, smi in enumerate(survivor_smiles):
-                    row = admet_preds.iloc[i]
-                    admet_results[smi] = {
-                        k: round(float(v), 4) if isinstance(v, (float, int)) else v
-                        for k, v in row.items()
-                    }
-                # Select key ADMET properties for the report
-                admet_key_props = [
-                    "hERG", "AMES", "DILI", "CYP2D6_Veith", "CYP3A4_Veith",
-                    "Caco2_Wang", "HIA_Hou", "BBB_Martins", "Clearance_Hepatocyte_AZ",
-                    "Bioavailability_Ma", "LD50_Zhu",
-                ]
+                chunk_size = 32
+                for start in range(0, len(survivor_smiles), chunk_size):
+                    chunk = survivor_smiles[start:start + chunk_size]
+                    try:
+                        preds = admet_model.predict(smiles=chunk)
+                        for i, smi in enumerate(chunk):
+                            row = preds.iloc[i]
+                            admet_results[smi] = {
+                                k: round(float(v), 4) if isinstance(v, (float, int)) else v
+                                for k, v in row.items()
+                            }
+                    except Exception as chunk_err:
+                        # Retry one-by-one so we can pinpoint and skip the bad SMILES.
+                        for smi in chunk:
+                            try:
+                                single = admet_model.predict(smiles=[smi])
+                                row = single.iloc[0]
+                                admet_results[smi] = {
+                                    k: round(float(v), 4) if isinstance(v, (float, int)) else v
+                                    for k, v in row.items()
+                                }
+                            except Exception as single_err:
+                                admet_errors[smi] = str(single_err)
+                        print(f"[Screening] ADMET-AI: chunk starting at {start} failed ({chunk_err}); "
+                              f"fell back to per-molecule, {len(admet_errors)} failures so far")
+
                 for r in survivors:
                     smi = r["smiles"]
                     if smi in admet_results:
-                        for prop in admet_key_props:
+                        for prop in ADMET_KEY_PROPS:
                             if prop in admet_results[smi]:
                                 r["properties"][f"admet_{prop}"] = admet_results[smi][prop]
-                print(f"[Screening] ADMET-AI: {len(admet_results)} molecules annotated")
+                    elif smi in admet_errors:
+                        r["properties"]["admet_error"] = admet_errors[smi]
+                print(f"[Screening] ADMET-AI: {len(admet_results)} annotated, "
+                      f"{len(admet_errors)} failed")
         except ImportError:
             print("[Screening] ADMET-AI not installed, skipping ADMET predictions")
-        except Exception as e:
-            print(f"[Screening] ADMET-AI warning: {e} (continuing without ADMET)")
 
         # Build report
         report = {
             "timestamp": timestamp,
             "backend": BACKEND,
             "admet_ai": len(admet_results) > 0,
+            "admet_failures": len(admet_errors),
             "config": config.get("name", "custom"),
             "input_file": str(input_path),
             "output_file": str(output_sdf),
@@ -385,6 +399,11 @@ def run_screening(input_sdf: str, output_dir: str, config_path: str | None = Non
             "survivors": [
                 {"molecule_id": r["molecule_id"], "smiles": r["smiles"], **r["properties"]}
                 for r in survivors
+            ],
+            "rejections": [
+                {"molecule_id": r["molecule_id"], "smiles": r["smiles"],
+                 "violations": r["violations"]}
+                for r in rejected
             ],
         }
 
@@ -411,6 +430,9 @@ def run_screening(input_sdf: str, output_dir: str, config_path: str | None = Non
         if db and run_id:
             mol_batch = []
             for r in results:
+                # Join the full violations list so expert tuning sees every
+                # filter that fired, not only the first.
+                reasons = r["violations"] or ([] if r["passed"] else ["unknown"])
                 mol_batch.append({
                     "molecule_id": r["molecule_id"],
                     "smiles": r["smiles"],
@@ -419,7 +441,7 @@ def run_screening(input_sdf: str, output_dir: str, config_path: str | None = Non
                     "logp": r["properties"].get("desc_MolLogP"),
                     "mol_weight": r["properties"].get("desc_MolWt"),
                     "passed_triage": 1 if r["passed"] else 0,
-                    "stage_eliminated": r["eliminated_by"],
+                    "stage_eliminated": "; ".join(reasons) if reasons else None,
                 })
             db.log_molecules_batch(run_id, mol_batch)
             db.complete_run(run_id, "success", str(output_sdf))

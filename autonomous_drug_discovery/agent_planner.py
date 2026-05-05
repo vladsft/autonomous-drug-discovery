@@ -42,6 +42,19 @@ from telemetry import TelemetryDB
 DEFAULT_MAX_ITERATIONS = 5
 DATA_DIR = PROJECT_ROOT / "data"
 
+# Map generation mode → conda env. Keeps the subprocess launcher consistent
+# with the orchestrator's routing so the planner works for every mode.
+_ENV_FOR_MODE = {
+    "targetdiff": "targetdiff_env",
+    "pocket2mol": "pocket2mol_env",
+}
+
+
+def _conda_python(env_name: str) -> list[str]:
+    """Return the command prefix for running python in a specific conda env."""
+    conda_bin = os.environ.get("CONDA_EXE", "conda")
+    return [conda_bin, "run", "-n", env_name, "python"]
+
 # Check for LangChain availability
 try:
     from langchain_core.tools import tool
@@ -83,12 +96,18 @@ def make_tools(campaign_id: str, db_path: str, data_dir: Path, exec_mode: str = 
     decorated as @tool so they can be bound to an LLM.
     """
 
+    gen_env = _ENV_FOR_MODE.get(exec_mode, "base")
+
+    # Only the `simulation` mode uses stub docking; every real generation
+    # backend (rdkit / pocket2mol / targetdiff / production) gets real Vina.
+    dock_mode = "simulation" if exec_mode == "simulation" else "production"
+
     def run_ingestion(pdb_path: str) -> str:
-        """Ingest a PDB file and identify binding pockets using fpocket.
+        """Run P2Rank (default) or fpocket to identify binding pockets.
         Returns the path to the manifest JSON file."""
         output_dir = str(data_dir / "01_ingestion")
-        cmd = [
-            sys.executable, str(PROJECT_ROOT / "modules" / "01_ingestion" / "run_pocket.py"),
+        cmd = _conda_python("base") + [
+            str(PROJECT_ROOT / "modules" / "01_ingestion" / "run_pocket.py"),
             "--pdb", pdb_path,
             "--output_dir", output_dir,
             "--db_path", db_path,
@@ -97,25 +116,26 @@ def make_tools(campaign_id: str, db_path: str, data_dir: Path, exec_mode: str = 
         return _run_module(cmd, f"Ingesting {pdb_path}")
 
     def run_generation(manifest_path: str) -> str:
-        """Generate candidate ligands using TargetDiff. Takes a manifest JSON from ingestion.
-        Returns path to generated SDF file."""
+        """Generate candidate ligands using the configured backend
+        (simulation / rdkit / pocket2mol / targetdiff). Takes a manifest JSON
+        from ingestion. Returns path to generated SDF file."""
         output_dir = str(data_dir / "02_generation")
-        cmd = [
-            sys.executable, str(PROJECT_ROOT / "modules" / "02_generation" / "run_generation.py"),
+        cmd = _conda_python(gen_env) + [
+            str(PROJECT_ROOT / "modules" / "02_generation" / "run_generation.py"),
             "--manifest", manifest_path,
             "--output_dir", output_dir,
             "--mode", exec_mode,
             "--db_path", db_path,
             "--campaign_id", campaign_id,
         ]
-        return _run_module(cmd, f"Generating molecules (mode={exec_mode})")
+        return _run_module(cmd, f"Generating molecules (mode={exec_mode}, env={gen_env})")
 
     def run_screening(sdf_path: str) -> str:
-        """Screen molecules through drug-likeness and PAINS filters using MolScore.
+        """Screen molecules through drug-likeness filters + PAINS + ADMET-AI.
         Returns path to screening report JSON."""
         output_dir = str(data_dir / "03_screening")
-        cmd = [
-            sys.executable, str(PROJECT_ROOT / "modules" / "03_screening" / "run_screening.py"),
+        cmd = _conda_python("base") + [
+            str(PROJECT_ROOT / "modules" / "03_screening" / "run_screening.py"),
             "--input_sdf", sdf_path,
             "--output_dir", output_dir,
             "--db_path", db_path,
@@ -124,12 +144,11 @@ def make_tools(campaign_id: str, db_path: str, data_dir: Path, exec_mode: str = 
         return _run_module(cmd, "Screening molecules")
 
     def run_docking(manifest_path: str, candidates_dir: str) -> str:
-        """Score molecules via docking. Uses TDC oracle in triage mode or full Vina in production.
-        Returns path to docking results CSV."""
+        """Score molecules via AutoDock Vina (production) or return
+        simulation scores. Returns path to docking results CSV."""
         output_dir = str(data_dir / "04_docking")
-        dock_mode = "triage" if exec_mode != "production" else "production"
-        cmd = [
-            sys.executable, str(PROJECT_ROOT / "modules" / "04_docking" / "run_docking.py"),
+        cmd = _conda_python("base") + [
+            str(PROJECT_ROOT / "modules" / "04_docking" / "run_docking.py"),
             "--manifest", manifest_path,
             "--candidates_dir", candidates_dir,
             "--output_dir", output_dir,
@@ -198,10 +217,11 @@ SYSTEM_PROMPT = """You are the Adaptive Discovery Orchestrator — an autonomous
 Your mission: Given a target protein PDB file, plan and execute a discovery campaign to identify promising small-molecule drug candidates.
 
 You have these tools available:
-- run_ingestion: Identify binding pockets on the target protein
-- run_generation: Generate candidate ligands using TargetDiff
-- run_screening: Filter molecules for drug-likeness, SA, and PAINS
-- run_docking: Score surviving molecules via docking
+- run_ingestion: Identify binding pockets on the target protein (P2Rank by default)
+- run_generation: Generate candidate ligands. Backend is fixed per campaign by --mode
+  (simulation, rdkit, pocket2mol, targetdiff, or production)
+- run_screening: Filter molecules for drug-likeness, SA, PAINS, and ADMET
+- run_docking: Score surviving molecules via AutoDock Vina (or stubs in simulation mode)
 - query_telemetry: Check campaign progress and historical data
 - read_file: Read output files for analysis
 
@@ -450,8 +470,10 @@ class AgentController:
 def main():
     parser = argparse.ArgumentParser(description="Adaptive Discovery Orchestrator — Agent Planner")
     parser.add_argument("--target", required=True, help="Target PDB file")
-    parser.add_argument("--mode", choices=["simulation", "triage", "production"],
-                        default="simulation", help="Execution mode")
+    parser.add_argument("--mode",
+                        choices=["simulation", "rdkit", "pocket2mol", "targetdiff", "production"],
+                        default="simulation",
+                        help="Generation backend (production = rdkit + Vina docking)")
     parser.add_argument("--max_iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
                         help="Maximum agent iterations (dead-man switch)")
     parser.add_argument("--db_path", default=None, help="Telemetry DB path")

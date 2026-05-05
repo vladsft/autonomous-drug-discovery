@@ -14,10 +14,10 @@ Output contract: generated_molecules.sdf + run_metadata.json
 
 import os
 import sys
+import shutil
 import argparse
 import subprocess
 import json
-import hashlib
 import random
 import traceback
 from datetime import datetime, timezone
@@ -35,7 +35,7 @@ from telemetry import TelemetryDB
 # Check for RDKit
 try:
     from rdkit import Chem, RDLogger
-    from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors, rdFMCS
+    from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
     from rdkit.Chem import BRICS
     HAS_RDKIT = True
 except ImportError:
@@ -54,14 +54,33 @@ def _get_git_commit(repo_path):
         return None
 
 
-# Default generation parameters
-DEFAULT_PARAMS = {
-    "num_samples": 100,
-    "sampling_steps": 1000,
-    "noise_schedule": "polynomial_2",
-    "batch_size": 16,
-    "device": "cpu",
+# Per-mode generation defaults. Only the keys relevant to a given backend
+# are logged to telemetry, so parameter audits aren't polluted with
+# TargetDiff-specific knobs for RDKit runs (or vice versa).
+_DEFAULT_PARAMS_BY_MODE = {
+    "simulation": {"num_samples": 1},
+    "rdkit": {"num_samples": 100, "seed": 42},
+    "targetdiff": {
+        "num_samples": 100,
+        "sampling_steps": 1000,
+        "noise_schedule": "polynomial_2",
+        "batch_size": 16,
+        "device": "cpu",
+        "seed": 2021,
+    },
+    "pocket2mol": {
+        "num_samples": 100,
+        "device": "cpu",
+        "seed": 2020,
+    },
 }
+
+
+def _default_params(mode: str) -> dict:
+    """Return the defaults for a given generation mode."""
+    if mode == "production":  # legacy alias → rdkit
+        mode = "rdkit"
+    return dict(_DEFAULT_PARAMS_BY_MODE.get(mode, _DEFAULT_PARAMS_BY_MODE["rdkit"]))
 
 
 # ---------------------------------------------------------------------------
@@ -311,20 +330,31 @@ def _assemble_molecule(scaffolds, substituents, linkers, rng):
     return mol
 
 
+# Loose pre-screening bounds. Intentionally wider than default_scoring_config.json
+# so the generator doesn't silently shrink the candidate pool before the real
+# screening step gets to apply its own (tunable) thresholds.
+_PRESCREEN_MW_RANGE = (80, 650)
+_PRESCREEN_LOGP_RANGE = (-3, 7)
+_PRESCREEN_MAX_RINGS = 6
+
+
 def _is_drug_like_quick(mol, min_ha, max_ha):
-    """Fast pre-filter before full screening. Rejects obvious junk."""
+    """Fast pre-filter. Rejects molecules clearly outside drug-like envelope.
+
+    Tuned to be strictly looser than the Stage-3 screening config so we never
+    eliminate a molecule the user-configurable screener would have kept.
+    """
     ha = mol.GetNumHeavyAtoms()
     if ha < min_ha or ha > max_ha:
         return False
     mw = Descriptors.MolWt(mol)
-    if mw < 100 or mw > 600:
+    if mw < _PRESCREEN_MW_RANGE[0] or mw > _PRESCREEN_MW_RANGE[1]:
         return False
     logp = Descriptors.MolLogP(mol)
-    if logp < -3 or logp > 6:
+    if logp < _PRESCREEN_LOGP_RANGE[0] or logp > _PRESCREEN_LOGP_RANGE[1]:
         return False
-    # Reject molecules with too many rings (likely polymeric junk)
     ring_info = mol.GetRingInfo()
-    if ring_info.NumRings() > 6:
+    if ring_info.NumRings() > _PRESCREEN_MAX_RINGS:
         return False
     return True
 
@@ -472,20 +502,23 @@ def run_generation_targetdiff(manifest, out_path, parameters):
     with open(sampling_config, "w") as f:
         yaml.dump(config_data, f)
 
-    # TargetDiff writes individual SDFs to {result_path}/sdf/
+    # Wipe stale outputs so a rerun can't silently include molecules from a
+    # previous campaign when we glob the SDF directory.
     td_result_path = out_path / "targetdiff_raw"
+    if td_result_path.exists():
+        shutil.rmtree(td_result_path)
 
+    # num_samples is set in the YAML above; do not pass --num_samples here,
+    # otherwise the CLI flag silently overrides the config (order-dependent).
     cmd = [
         os.environ.get("CONDA_EXE", "conda"), "run", "-n", "targetdiff_env", "python",
         str(sample_script),
         str(sampling_config),
         "--pdb_path", str(pocket_pdb),
         "--result_path", str(td_result_path),
-        "--device", parameters.get("device", "cpu"),
+        "--device", parameters["device"],
         "--batch_size", str(parameters.get("batch_size", 16)),
     ]
-    if num_samples:
-        cmd += ["--num_samples", str(num_samples)]
 
     subprocess.check_call(cmd, cwd=str(TARGETDIFF_REPO))
 
@@ -587,6 +620,9 @@ def run_generation_pocket2mol(manifest, out_path, parameters):
 
     out_path.mkdir(parents=True, exist_ok=True)
     p2m_raw = out_path / "pocket2mol_raw"
+    # Wipe stale SDFs so we don't mistakenly sweep in molecules from a prior run.
+    if p2m_raw.exists():
+        shutil.rmtree(p2m_raw)
     p2m_raw.mkdir(parents=True, exist_ok=True)
 
     num_samples = parameters.get("num_samples", 100)
@@ -695,7 +731,7 @@ def run_generation(manifest_path, output_dir, mode="simulation",
     with open(manifest_path, "r") as f:
         manifest = json.load(f)
 
-    parameters = {**DEFAULT_PARAMS, "mode": mode}
+    parameters = {**_default_params(mode), "mode": mode}
     git_commit = _get_git_commit(TARGETDIFF_REPO) if TARGETDIFF_REPO.exists() else None
 
     db = None

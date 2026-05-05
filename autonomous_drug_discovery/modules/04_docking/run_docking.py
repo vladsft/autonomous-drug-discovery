@@ -89,10 +89,14 @@ def run_docking_simulation(manifest, candidates_dir, out_path, parameters, db=No
             writer.writerow([r["ligand_id"], r["smiles"], r["affinity"]])
 
     if db and run_id:
-        for r in simulated:
-            db.log_molecule(run_id, r["ligand_id"], r["smiles"], {
+        db.log_molecules_batch(run_id, [
+            {
+                "molecule_id": r["ligand_id"],
+                "smiles": r["smiles"],
                 "docking_score": r["affinity"],
-            })
+            }
+            for r in simulated
+        ])
 
     print(f"[Docking] Simulated results: {results_file}")
     return str(results_file)
@@ -107,11 +111,15 @@ def run_docking_triage(manifest, candidates_dir, out_path, parameters, db=None, 
     if not HAS_TDC or not HAS_RDKIT:
         missing = []
         if not HAS_TDC:
-            missing.append("PyTDC (pip install PyTDC)")
+            missing.append(
+                "PyTDC (note: not installable on Python 3.13+; "
+                "requires base env on Python ≤3.11)"
+            )
         if not HAS_RDKIT:
             missing.append("RDKit (conda install -c conda-forge rdkit)")
-        print(f"[Docking] WARNING: Triage mode requires {', '.join(missing)}.")
-        print(f"[Docking] Falling back to simulation mode.")
+        print(f"[Docking] Triage mode requires: {', '.join(missing)}.")
+        print(f"[Docking] Falling back to simulation mode — "
+              "use --mode production for real docking without PyTDC.")
         return run_docking_simulation(manifest, candidates_dir, out_path, parameters, db, run_id)
 
     receptor_pdb = Path(manifest.get("input_pdb"))
@@ -131,9 +139,10 @@ def run_docking_triage(manifest, candidates_dir, out_path, parameters, db=None, 
     # Read molecules from SDF
     supplier = Chem.SDMolSupplier(str(sdf_file), removeHs=False)
     results = []
+    mol_batch = []
 
     for idx, mol in enumerate(supplier):
-        mol_id = f"mol_{idx:04d}"
+        mol_id = _mol_id_from_mol(mol, idx)
         if mol is None:
             results.append({"ligand_id": mol_id, "smiles": None, "affinity": None, "error": "invalid_mol"})
             continue
@@ -142,15 +151,20 @@ def run_docking_triage(manifest, candidates_dir, out_path, parameters, db=None, 
             smiles = Chem.MolToSmiles(mol)
             score = oracle(smiles)
             results.append({"ligand_id": mol_id, "smiles": smiles, "affinity": float(score)})
-
-            if db and run_id:
-                db.log_molecule(run_id, mol_id, smiles, {"docking_score": float(score)})
+            mol_batch.append({
+                "molecule_id": mol_id,
+                "smiles": smiles,
+                "docking_score": float(score),
+            })
 
             print(f"  {mol_id}: {smiles[:40]}... → {score:.2f} kcal/mol")
 
         except Exception as e:
             results.append({"ligand_id": mol_id, "smiles": None, "affinity": None, "error": str(e)})
             print(f"  {mol_id}: ERROR — {e}")
+
+    if db and run_id and mol_batch:
+        db.log_molecules_batch(run_id, mol_batch)
 
     # Sort by affinity (best = most negative)
     scored = [r for r in results if r["affinity"] is not None]
@@ -174,7 +188,12 @@ def run_docking_triage(manifest, candidates_dir, out_path, parameters, db=None, 
 # ---------------------------------------------------------------------------
 
 def run_docking_production(manifest, candidates_dir, out_path, parameters, db=None, run_id=None):
-    """Production mode: full Vina docking pipeline using Python API + Meeko."""
+    """Production mode: full Vina docking pipeline using Python API + Meeko.
+
+    Creates one Vina instance, loads the receptor and computes grid maps ONCE,
+    then iterates ligands. This is ~50x faster than per-ligand setup when
+    docking 100 molecules against the same target.
+    """
     if not HAS_VINA or not HAS_MEEKO or not HAS_RDKIT:
         missing = []
         if not HAS_VINA:
@@ -194,47 +213,64 @@ def run_docking_production(manifest, candidates_dir, out_path, parameters, db=No
 
     print(f"[Docking] (PRODUCTION MODE) Full Vina docking against {receptor_pdb.name}...")
 
-    # 1. Prepare Receptor: PDB -> PDBQT (always regenerate to match current target)
+    # 1. Prepare receptor ONCE.
     receptor_pdbqt = out_path / f"{receptor_pdb.stem}_receptor.pdbqt"
     print(f"[Docking] Preparing receptor PDBQT for {receptor_pdb.name}...")
     _prepare_receptor_pdbqt(receptor_pdb, receptor_pdbqt)
 
-    # 2. Box center: use P2Rank's pre-computed center if available, else compute from pocket PDB
-    pocket_pdb = manifest.get("best_pocket")
+    # 2. Box center: prefer ingestion's pre-computed centroid.
     if manifest.get("best_pocket_center"):
         box_center = manifest["best_pocket_center"]
-    elif pocket_pdb:
-        box_center = _compute_pocket_centroid(pocket_pdb)
+    elif manifest.get("best_pocket"):
+        box_center = _compute_pocket_centroid(manifest["best_pocket"])
     else:
-        box_center = [0, 0, 0]
+        raise ValueError("Manifest has neither best_pocket_center nor best_pocket.")
     box_size = parameters.get("box_size", [20, 20, 20])
     print(f"[Docking] Box center: {box_center}, size: {box_size}")
 
-    # 3. Read candidate molecules
+    # 3. Create Vina instance and load receptor + maps ONCE.
+    v = Vina(sf_name="vina")
+    v.set_receptor(str(receptor_pdbqt))
+    v.compute_vina_maps(center=box_center, box_size=box_size)
+
+    exhaustiveness = parameters.get("exhaustiveness", 8)
+    n_poses = parameters.get("num_modes", 9)
+
+    # 4. Iterate ligands; reuse the same Vina/receptor/maps across all of them.
     supplier = Chem.SDMolSupplier(str(sdf_file), removeHs=False)
     results = []
+    mol_batch = []
 
     for idx, mol in enumerate(supplier):
-        mol_id = f"mol_{idx:04d}"
+        mol_id = _mol_id_from_mol(mol, idx)
         if mol is None:
             results.append({"ligand_id": mol_id, "smiles": None, "affinity": None, "error": "invalid_mol"})
             continue
 
         smiles = Chem.MolToSmiles(mol)
         try:
-            affinity = _dock_single_vina_api(
-                receptor_pdbqt, mol, box_center, box_size, parameters, out_path, mol_id
-            )
+            affinity = _dock_one_ligand(v, mol, exhaustiveness, n_poses, out_path, mol_id)
             results.append({"ligand_id": mol_id, "smiles": smiles, "affinity": affinity})
-
-            if db and run_id:
-                db.log_molecule(run_id, mol_id, smiles, {"docking_score": affinity})
-
+            mol_batch.append({
+                "molecule_id": mol_id,
+                "smiles": smiles,
+                "docking_score": affinity,
+            })
             print(f"  {mol_id}: {smiles[:50]} → {affinity:.2f} kcal/mol")
 
         except Exception as e:
             results.append({"ligand_id": mol_id, "smiles": smiles, "affinity": None, "error": str(e)})
+            mol_batch.append({
+                "molecule_id": mol_id,
+                "smiles": smiles,
+                "docking_score": None,
+                "stage_eliminated": f"docking_error: {e}",
+            })
             print(f"  {mol_id}: ERROR — {e}")
+
+    # Batch-write telemetry (one transaction instead of per-ligand commits).
+    if db and run_id and mol_batch:
+        db.log_molecules_batch(run_id, mol_batch)
 
     # Sort by affinity (most negative = best)
     scored = [r for r in results if r["affinity"] is not None]
@@ -288,61 +324,79 @@ def _compute_pocket_centroid(pocket_pdb_path):
     return [0.0, 0.0, 0.0]
 
 
-def _prepare_receptor_pdbqt(receptor_pdb, output_pdbqt):
-    """Convert receptor PDB to PDBQT with proper AutoDock atom typing."""
-    import gemmi
+# --- Atom typing and charge assignment for the receptor PDBQT ---------------
+#
+# AutoDock Vina atom types: C, A (aromatic C), N, NA (H-bond acceptor N),
+# OA (H-bond acceptor O), S, SA (H-bond acceptor S), HD (polar H), F, Cl, Br,
+# I, P. We also apply simple integer charges on known charged side chains
+# (ASP/GLU -1, LYS/ARG +1, HIS +1 on NE2/ND1 when protonated) so that the
+# electrostatics term isn't entirely zero for the receptor.
 
-    # AutoDock atom type mapping for standard amino acid atoms
-    # Vina recognises: C, A (aromatic C), N, NA (H-bond acceptor N),
-    # NS (amide N), OA (H-bond acceptor O), OS, S, SA, HD (polar H),
-    # H, F, Cl, Br, I, P
-    def _autodock_type(atom_name, residue_name, element):
-        el = element.strip().upper()
-        name = atom_name.strip().upper()
+_AROMATIC_CARBONS = {
+    "PHE": {"CG", "CD1", "CD2", "CE1", "CE2", "CZ"},
+    "TYR": {"CG", "CD1", "CD2", "CE1", "CE2", "CZ"},
+    "TRP": {"CG", "CD1", "CD2", "CE2", "CE3", "CZ2", "CZ3", "CH2"},
+    "HIS": {"CG", "CD2", "CE1"},
+}
 
-        if el == "C":
-            # Aromatic carbons in HIS, PHE, TYR, TRP
-            aromatic_residues = {"PHE", "TYR", "TRP", "HIS"}
-            aromatic_atoms = {
-                "CG", "CD1", "CD2", "CE1", "CE2", "CZ", "CZ2", "CZ3",
-                "CH2", "CE3", "NE1",
-            }
-            if residue_name in aromatic_residues and name in aromatic_atoms:
-                return "A"
-            return "C"
-        elif el == "N":
-            # Backbone N and side-chain NHx are H-bond donors (type N)
-            # Acceptor nitrogens (sp2 in ring): NA
-            if residue_name == "HIS" and name in ("ND1", "NE2"):
-                return "NA"
-            if residue_name == "PRO" and name == "N":
-                return "N"  # no H on proline N
-            return "N"
-        elif el == "O":
-            return "OA"  # most protein oxygens are H-bond acceptors
-        elif el == "S":
-            if residue_name in ("CYS", "MET"):
-                return "SA"
+# Simple residue-level charges distributed over the key side-chain atoms.
+# We keep it integer-valued because we don't have Gasteiger calculations.
+_CHARGED_ATOMS = {
+    ("ASP", "OD1"): -0.5, ("ASP", "OD2"): -0.5,
+    ("GLU", "OE1"): -0.5, ("GLU", "OE2"): -0.5,
+    ("LYS", "NZ"): +1.0,
+    ("ARG", "NH1"): +0.5, ("ARG", "NH2"): +0.5,
+    # HIS is often neutral at physiological pH; leave it at 0.
+}
+
+
+def _autodock_type(atom_name: str, residue_name: str, element: str) -> str:
+    el = element.strip().upper()
+    name = atom_name.strip().upper()
+
+    if el == "C":
+        if name in _AROMATIC_CARBONS.get(residue_name, ()):
+            return "A"
+        return "C"
+    if el == "N":
+        # Aromatic sp2 nitrogen acceptors in HIS
+        if residue_name == "HIS" and name in ("ND1", "NE2"):
+            return "NA"
+        # TRP NE1 is a donor (H-bond donor); leave as N so HD gets the donor mark.
+        return "N"
+    if el == "O":
+        return "OA"
+    if el == "S":
+        if residue_name == "CYS" and name == "SG":
+            return "SA"
+        if residue_name == "MET" and name == "SD":
             return "S"
-        elif el == "H":
-            # Polar H (attached to N or O)
-            if name.startswith("H") and any(
-                n in name for n in ("HN", "HE", "HD", "HH", "HG", "HZ")
-            ):
-                return "HD"
-            return "H"
-        elif el == "F":
-            return "F"
-        elif el == "CL":
-            return "Cl"
-        elif el == "BR":
-            return "Br"
-        elif el == "I":
-            return "I"
-        elif el == "P":
-            return "P"
-        else:
-            return el
+        return "S"
+    if el == "H":
+        if name.startswith(("HN", "HE", "HD", "HH", "HG", "HZ")):
+            return "HD"
+        return "H"
+    if el == "F":
+        return "F"
+    if el == "CL":
+        return "Cl"
+    if el == "BR":
+        return "Br"
+    if el == "I":
+        return "I"
+    if el == "P":
+        return "P"
+    return el
+
+
+def _prepare_receptor_pdbqt(receptor_pdb, output_pdbqt):
+    """Convert receptor PDB to PDBQT with AutoDock atom typing + basic charges.
+
+    Waters, ligands, and non-standard residues are stripped. Alt-loc atoms
+    other than A/blank are skipped. Charges are zero for uncharged atoms and
+    integer-valued on classic charged side chains (ASP/GLU/LYS/ARG).
+    """
+    import gemmi
 
     structure = gemmi.read_structure(str(receptor_pdb))
     structure.remove_ligands_and_waters()
@@ -357,11 +411,14 @@ def _prepare_receptor_pdbqt(receptor_pdb, output_pdbqt):
         for chain in model:
             for residue in chain:
                 for atom in residue:
+                    # Skip alt-loc atoms that aren't the primary one.
+                    alt = (atom.altloc or "").strip()
+                    if alt and alt.upper() != "A":
+                        continue
                     x, y, z = atom.pos.x, atom.pos.y, atom.pos.z
                     element = atom.element.name.strip()
                     ad_type = _autodock_type(atom.name, residue.name, element)
-                    charge = 0.000
-                    # Standard PDBQT format (PDB columns + charge + type)
+                    charge = _CHARGED_ATOMS.get((residue.name, atom.name.strip().upper()), 0.0)
                     line = (
                         f"ATOM  {atom.serial:5d} {atom.name:<4s} {residue.name:>3s} "
                         f"{chain.name:1s}{residue.seqid.num:4d}    "
@@ -369,6 +426,7 @@ def _prepare_receptor_pdbqt(receptor_pdb, output_pdbqt):
                         f"{charge:+6.3f} {ad_type:<2s}"
                     )
                     lines.append(line)
+        break  # only the first model (NMR ensembles)
     lines.append("END")
 
     with open(output_pdbqt, "w") as f:
@@ -389,29 +447,27 @@ def _prepare_ligand_pdbqt(mol):
     return pdbqt_string
 
 
-def _dock_single_vina_api(receptor_pdbqt, mol, box_center, box_size, params, work_dir, mol_id):
-    """Dock a single ligand using the Vina Python API."""
-    v = Vina(sf_name='vina')
-    v.set_receptor(str(receptor_pdbqt))
+def _mol_id_from_mol(mol, idx: int) -> str:
+    """Preserve upstream molecule_id property if present; else derive from index."""
+    if mol is not None and mol.HasProp("molecule_id"):
+        return mol.GetProp("molecule_id")
+    return f"mol_{idx:04d}"
 
-    # Prepare ligand PDBQT via Meeko
+
+def _dock_one_ligand(v, mol, exhaustiveness, n_poses, work_dir, mol_id):
+    """Dock a single ligand against a pre-configured Vina instance.
+
+    The receptor and grid maps must already be loaded into `v` — we only
+    swap the ligand. This is dramatically faster than rebuilding the grid
+    maps for every molecule.
+    """
     ligand_pdbqt_str = _prepare_ligand_pdbqt(mol)
     v.set_ligand_from_string(ligand_pdbqt_str)
-
-    v.compute_vina_maps(
-        center=box_center,
-        box_size=box_size,
-    )
-
-    v.dock(
-        exhaustiveness=params.get("exhaustiveness", 8),
-        n_poses=params.get("num_modes", 9),
-    )
+    v.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)
 
     energies = v.energies()
     best_affinity = float(energies[0][0])  # first pose, total energy
 
-    # Save docked pose
     out_pdbqt = work_dir / f"docked_{mol_id}.pdbqt"
     v.write_poses(str(out_pdbqt), n_poses=1, overwrite=True)
 
