@@ -139,6 +139,20 @@ Add GNINA CNN-based rescoring alongside Vina. Needs GPU; download binary from gi
 ### Step 7 — Agent Planner (Only After M3 Feedback)
 By this point you have real telemetry data, validated benchmarks, and expert-informed parameter ranges. Now you can build the agent planner with actual knowledge to encode, not guesses.
 
+### Step 8 — Provision a GPU Workflow for Diffusion Backends
+The current dev machine has no discrete GPU (Intel HD Graphics 520 only), so TargetDiff and Pocket2Mol can run but only painfully slowly on CPU. Before Step 2 (empirical backend comparison) can produce a fair head-to-head, we need a reproducible GPU workflow:
+
+- **Short term (demos, validation runs):** rent on demand from a GPU-specialist provider — RunPod or Vast.ai for an RTX 3090 or A10 (~$0.25-0.40/hr). One hour of GPU time covers a TargetDiff run on all three validated targets with `num_samples=100`.
+- **Medium term (campaigns):** standardise on a single template (CUDA 11.7 + the `targetdiff_env` / `pocket2mol_env` conda envs), check it into the repo as a setup script, and document the spin-up sequence in `docs/installation.md` so any contributor can reproduce a GPU run from a fresh box.
+- **Free-tier escape hatch:** Google Colab (T4) for one-off interactive demos when paying isn't desirable. Reproducing the conda envs in Colab is awkward but doable with `pip` equivalents.
+
+Why this is a step and not infrastructure: the empirical comparison in Step 2 is gated on it, and the agent planner in Step 7 needs the comparison data to make backend selection decisions.
+
+### Step 9 — Interactive Pipeline Visualisation Frontend
+Build a web UI that surfaces the pipeline's work as it happens — campaigns in flight, attrition funnel, generated molecules, docking poses, telemetry queries — instead of leaving everything in CSV/SDF/SQLite. The visual goal is the kind of "live agentic workflow" panel popularised by recent demos (e.g. Chris Yoo's OpenAI hackathon project): clear stage-by-stage status, intermediate artefacts visible, expert-friendly review surface.
+
+Mockups under `reports/ui_mockups/` capture the intended look and feel. This is downstream of Steps 1-7 — the UI should visualise a system that already produces trustworthy results.
+
 ## Principles
 
 **Ship the deterministic pipeline before the adaptive one.** A reliable fixed pipeline that produces good results is more valuable than an adaptive one that produces unreliable results intelligently.

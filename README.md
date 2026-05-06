@@ -87,6 +87,7 @@ conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json 
 | [docs/telemetry-guide.md](docs/telemetry-guide.md) | How do I query the data? DB schema, SQL queries, Python API |
 | [docs/targetdiff-setup.md](docs/targetdiff-setup.md) | How do I set up TargetDiff? Separate env, standalone testing, performance |
 | [docs/pocket2mol-setup.md](docs/pocket2mol-setup.md) | How do I set up Pocket2Mol? Separate env, checkpoint download, troubleshooting |
+| [autonomous_drug_discovery/plan.md](autonomous_drug_discovery/plan.md) | What is the architectural design? Layer model, agent planner philosophy, future direction |
 
 ## Repository structure
 
@@ -105,8 +106,9 @@ conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json 
 │   │   ├── 03_screening/
 │   │   │   ├── run_screening.py     # Drug-likeness filters — Lipinski, QED, SA, PAINS, ADMET-AI
 │   │   │   └── default_scoring_config.json  # Filter thresholds (editable)
-│   │   └── 04_docking/
-│   │       └── run_docking.py       # AutoDock Vina docking — simulation, triage, or production mode
+│   │   ├── 04_docking/
+│   │   │   └── run_docking.py       # AutoDock Vina docking — simulation, triage, or production mode
+│   │   └── 05_ranking/              # Reserved for the planned multi-criteria ranker (empty placeholder)
 │   │
 │   ├── data/
 │   │   └── processed/               # PDB files and manifests
@@ -131,7 +133,8 @@ conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json 
 
 **Output:**
 - `{stem}_manifest.json` — best pocket location, score, probability, and pre-computed center coordinates.
-- `{stem}_p2rank/` (or `{stem}_out/` for fpocket) — predictions CSV and pocket atom PDB files.
+- `{stem}_p2rank/` for P2Rank — contains `{stem}.pdb_predictions.csv`, `{stem}.pdb_residues.csv`, and one `{stem}_pocket{N}_atm.pdb` per ranked pocket (e.g. `1M17_pocket1_atm.pdb`).
+- `{stem}_out/` for fpocket — contains `pockets/pocket{N}_atm.pdb` plus fpocket's per-pocket info files.
 
 **P2Rank advantages over fpocket:** 10-20 percentage point better recall on standard benchmarks. On EGFR (1M17), P2Rank places the pocket 2.7 A from the known drug (vs fpocket's 6.3 A) with 82% residue overlap (vs 53%).
 
@@ -285,6 +288,7 @@ The fragment library (scaffolds, substituents, linkers) is defined at the top of
 - Empirical comparison: Pocket2Mol vs TargetDiff vs RDKit on the validated cancer targets
 - GNINA CNN-based rescoring
 - AiZynthFinder retrosynthetic feasibility
+- Multi-criteria ranker (`modules/05_ranking/`, currently an empty placeholder) — combines docking, ADMET, and synthesis-feasibility into a single ranked output
 - Domain expert review (M3)
 - Agent planner with empirical strategy selection
 

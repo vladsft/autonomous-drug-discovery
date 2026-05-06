@@ -111,6 +111,18 @@ conda env create -f autonomous_drug_discovery/envs/env_targetdiff.yml
 # Clone TargetDiff + download checkpoint — see targetdiff-setup.md
 ```
 
+## Step 6: LLM Agent Planner (Optional)
+
+`agent_planner.py` adds an LLM-driven adaptive loop on top of the deterministic pipeline. It is optional — without these dependencies (or without `DISCOVERY_LLM_API_KEY`), the planner falls back to a deterministic run.
+
+```bash
+conda run -n base pip install langchain langchain-core langchain-google-genai
+export DISCOVERY_LLM_API_KEY=your_gemini_api_key
+# Optional: export DISCOVERY_LLM_PROVIDER=google   # default; "openai" / "anthropic" are reserved
+```
+
+These packages are intentionally excluded from `requirements.txt` so the core pipeline stays slim.
+
 ## Verify Installation
 
 Run the pipeline in simulation mode (no GPU, no external tools needed beyond P2Rank):
