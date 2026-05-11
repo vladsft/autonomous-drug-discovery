@@ -31,10 +31,11 @@ autonomous_drug_discovery/
   modules/
     01_ingestion/run_pocket.py       # P2Rank (default) or fpocket via --backend
     02_generation/run_generation.py  # Modes: simulation, rdkit, targetdiff, pocket2mol
-    02_generation/targetdiff/        # TargetDiff repo + checkpoint (pretrained_diffusion.pt)
-    02_generation/pocket2mol/        # Pocket2Mol repo + checkpoint (pretrained_Pocket2Mol.pt)
+    02_generation/targetdiff/        # NOT checked in — user clones per docs/targetdiff-setup.md (needs pretrained_diffusion.pt)
+    02_generation/pocket2mol/        # Pocket2Mol repo + checkpoint (pretrained_Pocket2Mol.pt) — present
     03_screening/run_screening.py    # MolScore (primary) or RDKit fallback + ADMET-AI (104 properties)
     04_docking/run_docking.py        # AutoDock Vina + Meeko; modes: simulation, triage, production
+    05_ranking/run_ranking.py        # Multi-criteria final ranker — wired into orchestrator `run` + `rank` subcommand. Composite = 0.5·docking + 0.3·ADMET + 0.2·synthesis (synth = 0.5 placeholder until AiZynth slot is wired)
   envs/
     env_orchestrator.yml             # base env spec
     env_targetdiff.yml               # targetdiff_env spec
@@ -49,7 +50,7 @@ docs/                                # north-star, pipeline-guide, installation,
 - P2Rank: `/home/vladsft/p2rank_2.5.1/prank`
 - fpocket: `/home/vladsft/fpocket/bin/fpocket`
 
-## Project status (as of 2026-04-18)
+## Project status (as of 2026-05-10)
 - **M1 (Working Pipeline):** DONE
 - **M2 (Validation):** DONE — 3 cancer targets validated against X-ray crystallography (fpocket and P2Rank)
 - **M2.5 (TargetDiff POC):** DONE — standalone diffusion generation on BRAF V600E
@@ -78,12 +79,22 @@ docs/                                # north-star, pipeline-guide, installation,
 - **Screening survival rates are high** (73-98%). Should be 40-60%. Thresholds in `default_scoring_config.json` need tightening with expert input.
 - **Diffusion models (TargetDiff) have ~50% reconstruction failure** — generate more than needed.
 - **Pocket2Mol is autoregressive, not diffusion** — uses pocket bounding box (default 23 Å), known "initialization failed" edge cases on some targets.
+- **Pocket2Mol GPU mode is broken on this machine because of a PyTorch ↔ GPU architecture mismatch.** Root cause confirmed 2026-05-10:
+  - RTX 5060 is **Blackwell, sm_120**, released late 2024.
+  - `pocket2mol_env` pins `pytorch=1.10.1` + `cudatoolkit=11.3` (mirrors upstream Pocket2Mol's 2022 spec). CUDA 11.3 only knows architectures up to **sm_86 (Ampere)**.
+  - The driver's PTX-JIT forward-compatibility path *technically* runs but is pathologically slow for sm_120 from sm_86-vintage PTX — minutes per kernel call. Pocket2Mol's autoregressive loop fires thousands of small kernel calls, each one re-triggering JIT.
+  - Diagnostic: a trivial `torch.randn(2000,2000).cuda(); for _ in range(10): x @ x.T` test ran for 2:26 with no output before being killed. Same script in any modern env runs in <1 sec.
+  - **CPU mode (`--device cpu`) works**: init completed in 4 sec on the official `4yhj.pdb` example (vs >10 min stalled on broken GPU), then proceeded to actual atom-by-atom sampling. Slower than a properly-configured GPU but functional.
+  - **Same root cause likely affects the planned `targetdiff_env`** — its spec also pins pre-Blackwell PyTorch (1.13 + cu117). Once we recover the TargetDiff checkpoint, expect the same wall.
+  - **Fix planned (see plan.md Step 9)**: rebuild both envs on PyTorch 2.4+ / CUDA 12.x.
+- **TargetDiff is not reproducible on this machine.** The standalone POC referenced in `validation_results` (BRAF, 2 molecules, ~7 kcal/mol) was a one-off run on 2026-04-18; the `targetdiff_env`, the `targetdiff/` repo subdirectory, and `pretrained_diffusion.pt` are all gone, and the original Google Drive folder for the checkpoint now returns 404. The only surviving artefacts are the PNG visualisations in `reports/`. To re-run, you need a backup checkpoint or to contact the paper authors.
 - **pytdc is not installed** on this system (incompatible with Python 3.13). Triage docking mode unavailable; production Vina is unaffected.
+- **GPU available**: NVIDIA RTX 5060 (8 GB VRAM, CUDA 13.2) — TargetDiff/Pocket2Mol now feasible at full speed.
 
-## What to work on next
-1. Empirical validation: run Pocket2Mol on EGFR / BCR-ABL / BRAF and compare to RDKit+TargetDiff results
-2. Tighten screening thresholds with domain expert input
-3. Add GNINA CNN re-scoring (needs GPU binary from github.com/gnina/gnina/releases)
-4. Add AiZynthFinder retrosynthetic feasibility (`pip install aizynthfinder`, needs policy models)
-5. Docker containerization for reproducible deployment
-6. Engage medicinal chemistry advisor for M3
+## What to work on next (4-phase roadmap — see `autonomous_drug_discovery/plan.md`)
+1. **Phase 1 — Cloud GPU + more targets.** Recover TargetDiff checkpoint; rebuild `pocket2mol_env_v2` / `targetdiff_env_v2` on PyTorch 2.4 + cu121 (current envs don't run on RTX 5060); rent ~$5-10 of cloud GPU time; run cascade on 5-10 oncology kinase targets (KRAS G12C, JAK2, CDK4/6, ER-α, AR + the existing three).
+2. **Phase 2 — Professor review (M3).** Walk advisor through dashboard, capture per-candidate annotations, calibrate filters, get input on the adaptive layer design.
+3. **Phase 3 — Adaptive layer.** Ship in order: (a) Obsidian campaign emitter, (b) Bayesian (Thompson-sampling) strategy recommender, (c) Sonnet-in-the-loop agent for retrieval / mid-campaign sanity checks / report writing.
+4. **Phase 4 — Bayesian evaluation.** Posteriors with credible intervals on lift vs deterministic baseline. Honest, even if null.
+
+Already done: AiZynthFinder integration, Stage 5 ranker wiring, multi-backend dashboard, Pocket2Mol CPU-mode patch.

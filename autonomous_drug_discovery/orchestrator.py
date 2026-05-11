@@ -9,6 +9,7 @@ Usage:
     python orchestrator.py generate manifest.json
     python orchestrator.py screen candidates.sdf
     python orchestrator.py dock manifest.json
+    python orchestrator.py rank docking_results.csv [--screening_json screening_report.json]
     python orchestrator.py run target.pdb [--mode simulation|production]
 """
 
@@ -182,6 +183,38 @@ def run_docking(manifest_path, db_path, campaign_id, mode="simulation",
         return False
 
 
+def run_ranking(docking_csv, screening_json, db_path, campaign_id, output_dir=None):
+    """Run the ranking module (multi-criteria final ranker)."""
+    print(f"\n{'='*60}")
+    print(f"[Orchestrator] Stage 5: RANKING")
+    print(f"{'='*60}")
+
+    script_path = MODULES_DIR / "05_ranking" / "run_ranking.py"
+    if not script_path.exists():
+        print(f"Error: Ranking module not found at {script_path}")
+        return False
+
+    out_dir = output_dir or str(DATA_DIR / "results")
+
+    cmd = get_python_cmd("base") + [
+        str(script_path),
+        "--docking_csv", str(docking_csv),
+        "--output_dir", out_dir,
+        "--db_path", db_path,
+        "--campaign_id", campaign_id,
+    ]
+    if screening_json:
+        cmd += ["--screening_json", str(screening_json)]
+
+    try:
+        subprocess.check_call(cmd)
+        print("[Orchestrator] Ranking complete.\n")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[Orchestrator] ERROR: Ranking failed with code {e.returncode}")
+        return False
+
+
 def print_campaign_summary(db_path, campaign_id):
     """Print a summary of the campaign from telemetry."""
     try:
@@ -240,6 +273,12 @@ def main():
     dock_parser.add_argument("--mode", choices=["simulation", "triage", "production"],
                             default="simulation", help="Execution mode")
 
+    # Rank command (Stage 5: multi-criteria ranker)
+    rank_parser = subparsers.add_parser("rank", help="Multi-criteria ranking of docked candidates")
+    rank_parser.add_argument("docking_csv", help="Path to docking_results.csv (Stage 4 output)")
+    rank_parser.add_argument("--screening_json", default=None,
+                             help="Optional screening_report.json for ADMET enrichment")
+
     # Full Pipeline command
     pipeline_parser = subparsers.add_parser("run", help="Run full pipeline")
     pipeline_parser.add_argument("pdb_file", help="Path to input PDB file")
@@ -277,6 +316,10 @@ def main():
         mode = getattr(args, "mode", "simulation")
         ok = run_docking(args.manifest, db_path, campaign_id, mode)
 
+    elif args.command == "rank":
+        ok = run_ranking(args.docking_csv, args.screening_json,
+                         db_path, campaign_id)
+
     elif args.command == "run":
         mode = getattr(args, "mode", "simulation")
         pdb_path = Path(args.pdb_file)
@@ -296,6 +339,7 @@ def main():
         gen_dir = str(campaign_dir / "candidates")
         screen_dir = str(campaign_dir / "screened")
         dock_dir = str(campaign_dir / "results")
+        rank_dir = str(campaign_dir / "ranked")
 
         print(f"[Orchestrator] Running FULL PIPELINE — gen={gen_mode}, dock={dock_mode}")
         print(f"[Orchestrator] Campaign directory: {campaign_dir}")
@@ -313,6 +357,12 @@ def main():
         if ok:
             ok = run_docking(manifest_path, db_path, campaign_id, dock_mode,
                              candidates_dir=screen_dir, output_dir=dock_dir)
+        if ok:
+            docking_csv = Path(dock_dir) / "docking_results.csv"
+            screening_json = Path(screen_dir) / "screening_report.json"
+            ok = run_ranking(docking_csv,
+                             screening_json if screening_json.exists() else None,
+                             db_path, campaign_id, output_dir=rank_dir)
 
         print_campaign_summary(db_path, campaign_id)
     else:

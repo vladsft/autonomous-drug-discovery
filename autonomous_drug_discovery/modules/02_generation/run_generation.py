@@ -1,12 +1,15 @@
 """
 Module 02: Generation — Structure-Aware Molecule Generator.
 
-Three generation backends:
+Four generation backends (plus a `production` legacy alias for `rdkit`):
   - simulation: Stub SDF for pipeline testing.
   - rdkit: Fragment-based combinatorial generation using RDKit. Produces
     diverse drug-like molecules with 3D conformers, optionally filtered by
     pocket volume. No GPU required.
-  - targetdiff: TargetDiff diffusion model (requires separate conda env + checkpoint).
+  - pocket2mol: Pocket2Mol autoregressive generator (requires `pocket2mol_env`
+    + checkpoint). Pocket-conditioned, ~11x faster than TargetDiff.
+  - targetdiff: TargetDiff diffusion model (requires `targetdiff_env`
+    + checkpoint). Highest-fidelity 3D, slowest.
 
 Input contract:  manifest.json (from ingestion module)
 Output contract: generated_molecules.sdf + run_metadata.json
@@ -69,9 +72,13 @@ _DEFAULT_PARAMS_BY_MODE = {
         "seed": 2021,
     },
     "pocket2mol": {
-        "num_samples": 100,
+        "num_samples": 1,
+        # device=cpu because pocket2mol_env's pytorch 1.10/cu113 doesn't support
+        # Blackwell sm_120 (RTX 5060). Until the env is rebuilt on torch 2.4+/cu121
+        # (plan.md Step 9), GPU mode JIT-thrashes and never produces molecules.
         "device": "cpu",
         "seed": 2020,
+        "beam_size": 20,  # repo default 300; small for fast init on CPU
     },
 }
 
@@ -636,6 +643,8 @@ def run_generation_pocket2mol(manifest, out_path, parameters):
 
     run_config["model"]["checkpoint"] = str(checkpoint)
     run_config["sample"]["num_samples"] = num_samples
+    if "beam_size" in parameters:
+        run_config["sample"]["beam_size"] = parameters["beam_size"]
 
     run_config_path = out_path / "pocket2mol_run_config.yml"
     with open(run_config_path, "w") as f:

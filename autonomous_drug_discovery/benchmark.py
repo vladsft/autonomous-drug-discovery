@@ -237,7 +237,8 @@ def main():
         target = info.get("target")
         if target is None:
             continue
-        # Must have completed all 4 stages successfully
+        # Require Stage 4 (docking) success — the metric we benchmark on.
+        # Older campaigns predate Stage 5 (ranking) so we don't gate on that here.
         stages = info["stages"]
         if stages.get("04_docking") == "success":
             # Keep the most recent one per target

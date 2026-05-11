@@ -2,10 +2,10 @@
 
 ## Overview
 
-The pipeline takes a protein structure (PDB file) and produces a ranked list of candidate drug molecules through 4 stages:
+The pipeline takes a protein structure (PDB file) and produces a ranked list of candidate drug molecules through 5 stages:
 
 ```
-PDB file  -->  [1. Pocket Detection]  -->  [2. Molecule Generation]  -->  [3. Screening]  -->  [4. Docking]  -->  Ranked candidates
+PDB file  -->  [1. Pocket Detection]  -->  [2. Molecule Generation]  -->  [3. Screening]  -->  [4. Docking]  -->  [5. Ranking]  -->  Ranked candidates
 ```
 
 Each stage reads the output of the previous stage and writes structured output (JSON manifests, SDF files, CSV results). Everything is logged to a SQLite telemetry database.

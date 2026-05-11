@@ -132,7 +132,7 @@ cd autonomous_drug_discovery
 conda run -n base python orchestrator.py run data/processed/1M17.pdb --mode simulation
 ```
 
-Expected output: campaign completes with all 4 stages showing `success`.
+Expected output: campaign completes with all 5 stages showing `success`.
 
 Run in production mode to verify the full stack:
 

@@ -57,9 +57,20 @@ Binding affinity estimation via AutoDock Vina. Honest limitation: the Pearson co
 
 ### Stage 5 — Reporting and Handoff
 
-Ranked candidates with per-molecule scorecards, ADMET profiles, explicit assumptions and limitations. All results logged to a SQLite telemetry database for full provenance tracking.
+Ranked candidates with per-molecule scorecards, ADMET profiles, explicit assumptions and limitations. All results logged to a SQLite telemetry database for full provenance tracking. The chemist-facing dashboard (multi-backend toggle, AiZynth route trees, ADMET pass/fail badges) is the primary review surface; in parallel, each campaign emits an Obsidian-friendly Markdown bundle so per-target knowledge accumulates in the chemist's own tool over time (see Adaptive Layer below).
 
 This is the deliverable. Not a cure, not a clinical candidate, not a paper. A prioritised, transparent, auditable set of hypotheses that helps a researcher decide what to make and test next.
+
+### The Adaptive Layer (in development)
+
+The deterministic five-stage pipeline above is the foundation. On top of it sits a four-part adaptive layer that turns the system from a one-shot pipeline into one that learns from its own campaigns:
+
+- **Cascade generation** — Pocket2Mol for breadth, TargetDiff for refinement around top-ranked seeds, AiZynthFinder for synthesis feasibility on the survivors. Combines speed and fidelity without sacrificing either.
+- **Bayesian strategy selection** — Thompson sampling over (backend, parameters) given pocket descriptors. The system maintains a posterior over which configuration works for which pocket family, exploring less as the posterior tightens. Multi-criteria reward (composite score) blunts the known Vina-bigger-is-better reward-hacking trap.
+- **Sonnet-in-the-loop** — A Claude Sonnet agent retrieves over local telemetry + open-source corpora (CrossDocked2020, BindingDB, ChEMBL), surfaces structured recommendations with cited evidence, watches mid-campaign attrition for pathological runs, and writes the chemist-facing campaign report. Recommendations are never auto-applied; the chemist accepts or overrides each one, and every decision is logged.
+- **Obsidian knowledge graph** — Each campaign emits a folder of cross-linked Markdown notes that becomes a queryable record of what worked, what failed, and what the expert thought. The graph compounds with each campaign — this is what makes the data advantage durable.
+
+What the adaptive layer is *not*: it is not a generative-model fine-tuning loop (no wet-lab labels), not a fully autonomous agent (overpromising and unsafe), and not a replacement for the chemist's judgment.
 
 ## Where We Are
 
@@ -77,39 +88,48 @@ The pipeline independently finds molecules scoring in the same range as known ap
 
 ## Where We Are Going
 
-### M3 — Domain Expert Integration (next)
+The roadmap is four phases. Each is a prerequisite for the next; we don't skip ahead. See [`autonomous_drug_discovery/plan.md`](../autonomous_drug_discovery/plan.md) for the detailed technical decomposition under each phase.
 
-A computational chemistry or cancer research collaborator reviews pipeline output and feeds back: are the generated molecules sensible, are the rankings meaningful, are the failure modes expected or surprising. This feedback shapes filter thresholds, scoring weights, and generation constraints.
+### Phase 1 — Cloud GPU + more targets (deterministic pipeline)
 
-**This is non-negotiable.** Without medicinal chemistry judgment, the pipeline produces numbers without meaning. Imperial's Chemistry department or Cancer Research center should be engaged now.
+Recover the TargetDiff checkpoint, rebuild both deep-learning envs against PyTorch 2.4 / CUDA 12 (the pinned 2022-era envs don't run on Blackwell GPUs), spin up a $5-10 RunPod / Vast.ai session, and run the cascade across 5-10 oncology kinase targets — well-characterised, with crystal structures and known SAR. Output: a set of campaigns the dashboard can present per target. **No agent yet. No Sonnet. Just the deterministic five-stage pipeline running cleanly at scale.**
 
-### M4 — First Novel Campaign
+### Phase 2 — Show the professor (M3, non-negotiable)
 
-Run the pipeline against a target with genuine unmet need — where the answer is not known — and produce a candidate set that a research group considers worth synthesising. This is the point at which the system produces real scientific value.
+Walk a medicinal chemistry advisor through the dashboard for the Phase 1 targets. Capture per-candidate annotations (`promising` / `borderline` / `reject`) plus free-text reasoning. Calibrate filter thresholds. Get explicit feedback on the proposed adaptive layer (cascade + Bayesian + Sonnet + Obsidian) so we shape Phase 3 around what they need.
 
-Oncology kinase targets are the most computationally tractable starting point: abundant crystal structures, well-defined binding pockets, extensive SAR data. KRAS G12D, novel EGFR resistance mutations, or emerging kinase targets would be strong M4 candidates.
+**Without medicinal chemistry judgment, the pipeline produces numbers without meaning.** Imperial Chemistry or Cancer Research collaborators should be engaged once Phase 1 has data to show.
 
-### M5 — Adaptive Planning
+### Phase 3 — Sonnet-in-the-loop + Bayesian recommender + Obsidian
 
-With sufficient campaign history, implement an AI planning layer that adjusts pipeline parameters mid-campaign based on observed attrition. This is the long-term differentiator, but it earns its existence only after M3-M4 are solid.
+Wire the four-part Adaptive Layer described above into the orchestrator. Three sub-deliverables, in order:
 
-### Technical Roadmap
+- **Obsidian campaign emitter** — every `orchestrator.py run` writes a folder of cross-linked MD notes (per-mol scorecards, route trees, embedded structure SVGs, tags). Independent of the agent; ships first because it's the highest-leverage / lowest-risk piece. The accumulating knowledge graph is the durable moat.
+- **Bayesian strategy recommender** — Thompson sampling over (backend, num_samples, beam_size, screening thresholds) conditional on pocket descriptors. Cold-started from Phase 1 telemetry; updates after each new campaign. Honest framing of "the system learns": no fine-tuning, no RL on noisy proxies, just a principled exploration/exploitation trade-off over a small set of well-defined choices.
+- **Sonnet agent shell** — wraps the existing `agent_planner.py` with retrieval over telemetry + open-source corpora (CrossDocked2020, BindingDB, ChEMBL), structured recommendations citing evidence, an attrition-funnel watcher for mid-campaign sanity checks, and a chemist-facing report writer. Every recommendation is logged, never auto-applied.
 
-Recently completed:
-- Wired TargetDiff and Pocket2Mol into the orchestrator as selectable generation backends (`--mode targetdiff` / `--mode pocket2mol`)
-- Per-campaign output directories (prevent file collisions between concurrent runs)
+### Phase 4 — Bayesian evaluation; investor / university narrative
 
-Near-term (M3 timeline):
-- Empirical comparison: Pocket2Mol vs TargetDiff vs RDKit across the validated cancer targets (EGFR, BCR-ABL, BRAF)
-- Add GNINA CNN-based rescoring alongside Vina (needs GPU)
-- Add AiZynthFinder retrosynthetic feasibility
-- Tighten screening thresholds based on expert feedback (current survival: 73-98%, target: 40-60%)
+Quantify whether the Phase 3 agent loop produces measurably better candidates than the Phase 1 deterministic baseline. Report posteriors with credible intervals — never point estimates — on every lift metric: composite-score uplift, recall against expert-`promising`-annotated molecules, calibration of the recommender's posterior. Honest, even if the lift is null.
 
-Medium-term:
-- AlphaFold/ESMFold integration for targets without crystal structures
+If the lift is real and credible: this is the defensible case for non-dilutive grants or seed funding to scale targets, agent quality, and (eventually) wet-lab validation partnerships. If the lift is null: that result is also publishable and tells us where to invest next (better retrieval? better reward signal? more wet-lab grounding?). Reporting credible intervals — not point estimates — is the antidote to the BenevolentAI failure mode of investor-friendly numbers that don't survive peer review.
+
+### Recently completed (today's snapshot)
+
+- Wired TargetDiff and Pocket2Mol into the orchestrator (`--mode targetdiff` / `--mode pocket2mol`)
+- Per-campaign output directories (prevent file collisions)
+- AiZynthFinder retrosynthetic feasibility integrated and used in the multi-criteria ranker (Stage 5)
+- Stage 5 (multi-criteria ranker) shipped — composite score = 0.5·docking + 0.3·ADMET + 0.2·synthesis
+- Multi-backend chemist dashboard (`dashboard/index.html`) with backend toggle, ADMET badges, and AiZynth route-tree viewer
+- Pocket2Mol patched (`models/maskfill.py`) so CPU mode works end-to-end on Blackwell hardware where the pinned PyTorch can't run on GPU
+
+### Medium-term (post-Phase 4)
+
+- AlphaFold / ESMFold integration for targets without crystal structures
 - Multi-pocket docking (top 3 pockets, not just best)
-- Docker containerization for reproducible deployment
-- Publishable methods paper (Journal of Cheminformatics or JCIM)
+- GNINA CNN-based rescoring alongside Vina
+- Docker / cloud-image distribution for reproducible deployment
+- Publishable methods paper (Journal of Cheminformatics or JCIM) — most defensible after Phase 4 has Bayesian evaluation data
 
 ## Strategic Positioning
 
@@ -117,7 +137,10 @@ Medium-term:
 
 **Who we serve:** Academic labs, small biotechs, and chemistry groups at institutions who have domain expertise but not the engineering resources to chain P2Rank, TargetDiff, RDKit, Vina, ADMET-AI, and AiZynthFinder into a reproducible, documented workflow.
 
-**How we differentiate:** Not by algorithmic novelty (the individual tools are freely available), but by integration quality, reproducibility, transparency, and honest communication of limitations. The COVID Moonshot project proved that open-source, community-driven drug discovery can produce real candidates. The hunger for accessible, integrated tools is genuine.
+**How we differentiate:** Not by algorithmic novelty (the individual tools are freely available), but by:
+1. **Integration quality, reproducibility, transparency, and honest communication of limitations.** The COVID Moonshot project proved that open-source, community-driven drug discovery can produce real candidates. The hunger for accessible, integrated tools is genuine.
+2. **A compounding knowledge graph.** Every campaign produces structured, cross-linked Obsidian notes that accumulate per-target SAR, expert annotations, and what-worked/what-didn't. Over time this is the durable moat — much more than the orchestration layer itself.
+3. **Bayesian rigour over computational bravado.** The adaptive layer is a Thompson-sampling recommender, not a black-box RL agent; reported lifts come with credible intervals, not point estimates. This signals the kind of scientific honesty that a sceptical reviewer or grant committee actually trusts.
 
 **Business model path:** Freemium open-source — release the pipeline openly to build adoption and credibility, then monetize through cloud-hosted premium features, consulting/customization, or partnership deals based on demonstrated utility.
 
@@ -148,3 +171,4 @@ Medium-term:
 3. **Show your work.** Full provenance tracking, explicit limitations, auditable decisions. If a result can't be traced back to its inputs, it doesn't count.
 4. **The domain expert is the customer.** Build for the computational chemist who needs to decide what to synthesise next, not for the investor who wants to hear about AI.
 5. **Publish early and openly.** A well-documented, benchmarked, open-source pipeline paper establishes credibility and attracts the community contributions that any future commercial model requires.
+6. **Posteriors, not point estimates.** Every empirical claim downstream of a campaign — "the agent improves rank quality by X" — must be reported with a credible interval, the prior used, and the sample size. Single-number results invite the BenevolentAI failure mode (investor-friendly headline, doesn't survive peer review). Bayesian framing is both more honest and more durable.

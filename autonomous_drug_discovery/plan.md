@@ -4,12 +4,13 @@
 
 **M1 (Working Pipeline) and M2 (Validation) are complete.**
 
-The pipeline runs end-to-end with real tools on real proteins. All four stages are production-grade:
+The pipeline runs end-to-end with real tools on real proteins. All five stages are production-grade:
 
 - **Pocket detection**: P2Rank (ML-based, default) and fpocket (geometry-based fallback) both integrated. P2Rank is the default.
 - **Molecule generation**: RDKit fragment-based generation integrated. TargetDiff (diffusion) and Pocket2Mol (autoregressive) are both wired into the orchestrator as selectable backends via `--mode targetdiff` / `--mode pocket2mol`. Empirical comparison across validated targets is the next step.
 - **Screening**: MolScore (primary backend) or RDKit fallback, with ADMET-AI enrichment (104 properties) on survivors.
 - **Docking**: AutoDock Vina (production), TDC Oracle (triage), and simulation stubs all supported.
+- **Ranking**: Multi-criteria final ranker (`05_ranking/run_ranking.py`) blends docking + ADMET into a composite score and writes `ranked_candidates.json`. AiZynthFinder retrosynthetic feasibility is wired as an optional add-on for top-N candidates.
 - **Telemetry**: Full SQLite logging across all stages.
 
 Validated against three cancer targets with crystallographic ground truth:
@@ -78,25 +79,30 @@ For each target, run the full pipeline and measure:
 
 Document the results honestly. Where the pipeline fails, diagnose why. This produces the evidence needed to justify the next layers.
 
-### Layer 4 — The Agent Planner (Build Last)
+### Layer 4 — Adaptive Orchestration: Cascade + Sonnet-in-the-loop + Knowledge Graph
 
-Only after Layers 1-3 are solid does adaptive orchestration become meaningful. The agent planner requires two things that do not exist yet: real telemetry data from real campaigns, and empirical knowledge of which parameter adjustments improve outcomes for which pocket types. Both come from running the pipeline repeatedly and analysing the results.
+Only after Layers 1-3 are solid does adaptive orchestration become meaningful. This layer has four cooperating sub-components, each independently shippable and each contributing to the *compounding* differentiation the project depends on (no single tool here is novel; the value is the loop).
 
-When the time comes, the agent's scope is:
+**4a. Cascaded generation pipeline (no agent required).** Use Pocket2Mol for breadth (~7 sec/mol on GPU, novel scaffold exploration) → triage by docking + ADMET → TargetDiff to refine the top 10-20 (denoise around them as 3D seeds) → AiZynthFinder synthesis check → multi-criteria rank. The cascade pattern captures the "best of both" without any agent: speed where it matters, fidelity where it pays off. This is the lowest-risk, highest-value architectural change.
 
-**Strategy selection.** Given a new target and its pocket profile, query the telemetry database for similar past campaigns. Recommend which generation method to use (Pocket2Mol for broad exploration of novel space, TargetDiff for refinement around known scaffolds), what filter thresholds to start with, and how many candidates to generate.
+**4b. Bayesian strategy selection.** For each new target, the question "which generator + parameters?" is a multi-armed bandit. Maintain a posterior over each backend's expected composite-score distribution conditional on pocket descriptors (volume, polarity, residue composition, druggability score). Use **Thompson sampling** to choose: occasionally explore weaker arms, mostly exploit the leading one, and the posterior tightens with each campaign. This is the *honest* version of "the system learns" — no fine-tuning, no RL on noisy proxies; a principled exploration/exploitation trade-off over a small set of well-defined choices. Multi-criteria rewards (composite score from Stage 5) blunt the ICLR 2025 "Vina-bigger-is-better" reward-hacking trap.
 
-**Mid-campaign adjustment.** Monitor attrition rates during a run. If screening is killing more than 95% of candidates, the generation parameters may be miscalibrated — flag this and suggest loosening or tightening constraints. This does not require an LLM. A rule-based system with well-chosen thresholds, informed by data from Layer 3, is more reliable and more interpretable than an LLM making judgment calls about chemistry.
+**4c. Sonnet-in-the-loop (LLM agent).** A Claude Sonnet agent sits next to the orchestrator with three concrete jobs:
+- *Retrieval over campaigns.* Given a new target, surface similar past campaigns from the telemetry DB and the open-source corpus (CrossDocked2020, BindingDB, ChEMBL) and recommend a starting strategy with cited evidence.
+- *Mid-campaign sanity checks.* Watch attrition funnels and ADMET distributions; flag pathological generation runs ("95% Lipinski violations", "all mols < 200 Da", "no aromatic rings against an aromatic-rich pocket") and suggest a parameter adjustment with rationale.
+- *Reporting.* Translate the multi-criteria ranked output into a chemist-readable campaign report — three top candidates, why they ranked there, what's uncertain, what to test next.
 
-**Reporting.** Summarise campaign results in natural language. Explain why candidates were ranked as they were, what assumptions were made, and where uncertainty is highest. This is a genuine LLM strength — translating structured data into readable narrative — and is the most defensible use of an LLM in this system.
+Crucially: the agent never decides autonomously. It surfaces structured recommendations the chemist can accept, modify, or reject. Every recommendation is logged so we can later measure the agent's hit rate.
 
-Do not build the agent planner as an autonomous decision-maker. Build it as a recommendation engine that a human chemist can override at every step. Autonomy is earned through demonstrated reliability, not assumed at launch.
+**4d. Obsidian knowledge graph (the moat).** Each campaign emits a folder of Markdown notes with embedded SMILES, scorecards, 2D structure SVGs, and `[[wikilinks]]` to other campaigns sharing scaffolds, pockets, or expert annotations. Tags surface common patterns (`#kinase`, `#hERG-flag`, `#3-step-synth`). Over a year, this becomes a queryable knowledge graph of *what worked, what didn't, and why* — sitting in the chemist's existing tool, not behind a custom UI. This is what makes the data advantage compound: every campaign makes the next campaign cheaper to scope and easier to interpret, and expert annotations live next to the data instead of in lab notebooks.
+
+**What this layer is NOT.** Not a generative-model fine-tuning loop (needs wet-lab data we don't have). Not a fully autonomous agent (overpromising and unsafe). Not a replacement for the chemist's judgment (their domain expertise is the user's input, not the target).
 
 ## Tool Selection
 
 ### Pocket Detection
-- **fpocket**: Already integrated. Fast, reliable, well-validated. Keep as primary.
-- **P2Rank** (optional addition): ML-based, sometimes catches pockets fpocket misses. Worth adding as a second opinion, not a replacement.
+- **P2Rank**: ML-based, default backend. 10-20 percentage points better recall than fpocket on standard benchmarks; on EGFR (1M17) places the pocket 2.7 A from the known drug vs fpocket's 6.1 A.
+- **fpocket**: Geometry-based fallback. Comparable to P2Rank on large/well-defined pockets (BCR-ABL, BRAF), but markedly worse on smaller/cryptic ones. Kept as a backup when Java is unavailable or for cross-checking.
 
 ### Molecule Generation
 - **Pocket2Mol**: Fast autoregressive sampling, E(3)-equivariant. Good for generating diverse scaffolds quickly when exploring new chemical space. Lower per-molecule compute cost. Use for breadth.
@@ -116,13 +122,73 @@ Both should be available as interchangeable modules behind a common interface. T
 - **RDKit SA score**: Basic but fast. Include in the screening stage.
 - **Retrosynthetic analysis** (AiZynthFinder or similar): Much more informative than SA score — actually proposes synthesis routes. Add as a later enhancement for top-ranked candidates only (it is slow and heavyweight).
 
-## Immediate Next Steps (In Order)
+## Roadmap (4 phases)
 
-### Step 1 — M3: Domain Expert Review (Highest Priority)
-Engage a medicinal chemistry or cancer research collaborator to review pipeline output on the three validated targets. Ask: are the generated molecules sensible, are the rankings meaningful, are the failure modes expected? This feedback shapes filter thresholds, scoring weights, and generation constraints. Without medicinal chemistry judgment, the pipeline produces numbers without meaning.
+The roadmap is organised as four phases, in order. Earlier phases are prerequisites for later ones — don't skip ahead. Each phase has concrete success criteria; if they aren't met, stop and diagnose before moving on.
+
+### Phase 1 — Get TargetDiff working on cloud GPU; pull more validated targets
+**Goal:** Reproducible TargetDiff + Pocket2Mol runs on a rented GPU instance, applied across more than the current three kinase targets (e.g. add KRAS G12C, JAK2, CDK4/6, ER-alpha, AR — all well-characterised oncology targets with crystal structures). No agent yet, no Sonnet — just the deterministic cascade running cleanly at scale.
+
+**Success criteria:**
+- TargetDiff `pretrained_diffusion.pt` recovered (paper authors / colleague / mirror search) — see Step 1 below for the blocker
+- `pocket2mol_env_v2` and `targetdiff_env_v2` rebuilt on PyTorch 2.4 / cu121 (Step 9 below) so we get the quoted ~7 sec/mol and ~30 sec/mol on a real GPU
+- 5–10 targets, 100 mols each, full pipeline (P2Rank → cascade gen → ADMET screen → Vina dock → AiZynth on top 10 → Stage 5 rank), all logged to telemetry
+- Cost estimate: $5-10 on RunPod / Vast.ai for an RTX 3090 or A10 (~$0.25-0.40/hr × ~10 hrs total)
+
+Why this is Phase 1: without diverse, reproducible per-target results we have nothing to show the professor. Anything more sophisticated downstream is built on this data.
+
+### Phase 2 — Show the professor; capture qualitative feedback
+**Goal:** Walk a medicinal chemistry advisor through the dashboard for the targets from Phase 1. Capture which ranked candidates they think are sensible, which look like generative junk, what they'd modify, what's missing. The conversation includes our forward-looking architecture (cascade, Bayesian recommender, Sonnet-in-the-loop, Obsidian knowledge graph) so we can shape Phase 3 with their input.
+
+**Success criteria:**
+- 1–2 hour review session with at least one medicinal chemistry expert (Imperial Chemistry / Cancer Research / etc.)
+- Per-candidate annotations captured: `(promising | borderline | reject)` + free-text reason
+- Tightened screening thresholds (current 73-98% survival → target 40-60%) calibrated against expert judgment
+- Decision: which targets are worth running the agent loop on in Phase 3
+
+Why this is Phase 2: M3 is the gate north-star.md calls non-negotiable. Without expert validation that current output is *interpretable*, no amount of agent intelligence makes it useful. The expert is also the one who tells us where the Bayesian reward signal should point.
+
+### Phase 3 — Sonnet-in-the-loop: agent learns from past campaigns + open-source data
+**Goal:** Wire a Claude Sonnet agent into the pipeline. It retrieves over the local telemetry DB and the open-source SBDD corpus (CrossDocked2020, BindingDB, ChEMBL), recommends generation strategy and parameters per new target, watches mid-campaign attrition, and writes the chemist-facing report. Bayesian strategy selection (Thompson sampling over backend × parameter combos) sits underneath the agent and provides the principled exploration/exploitation control. Obsidian campaign emitter ships in this phase too — every campaign produces a folder of cross-linked MD notes.
+
+See Layer 4 above for the architectural detail. Three sub-deliverables:
+- **3a. Obsidian campaign emitter** — every `orchestrator.py run` writes `campaigns/{date}-{target}-{id}/{summary.md, top10/{mol_xxx.md}, route_trees/...}` with `[[wikilinks]]` and embedded structure SVGs. Independent of agent — ships first.
+- **3b. Bayesian recommender** — Thompson sampling over (backend, num_samples, beam_size, screening thresholds) given pocket descriptors. Cold-started from the Phase 1 telemetry; updates after each new campaign. Outputs a recommendation + a confidence band; chemist can override.
+- **3c. Sonnet agent shell** — wraps `agent_planner.py` with retrieval (telemetry + open-source), structured recommendations citing evidence, attrition-funnel watcher, and report writer. Logs every recommendation so we can later measure hit rate.
+
+**Success criteria:**
+- All three sub-deliverables shipped end-to-end on at least one validated target
+- Agent recommendations logged with rationale; baseline campaigns also retained for comparison
+- Chemist (Phase 2 advisor) can answer "did the agent's recommendations match yours, and where did it diverge?"
+
+### Phase 4 — Bayesian evaluation of progress; investor / university narrative
+**Goal:** Quantify whether the agent loop produces measurably better candidates than the deterministic baseline. Use a Bayesian evaluation framework — credible intervals on the lift in composite score, multi-criteria recall against expert-annotated `promising` molecules, calibration of the Bayesian recommender's posterior. Present the result honestly (positive, negative, or null) with credible intervals, not point estimates.
+
+**Success criteria:**
+- Quantitative comparison: agent-loop campaigns vs deterministic-pipeline campaigns on a held-out set of targets, with Bayesian credible intervals on every lift metric
+- Calibration plot for the recommender: are 90% credible intervals actually 90% empirically?
+- Honest write-up of where the agent helps, where it doesn't, and where the system still needs the chemist
+- If lift is real and credible: this is the substantive case for a grant / seed funding (academic labs paying for hosted access, or non-dilutive grants to scale targets and agent quality)
+- If lift is null: that's also publishable and tells us where to invest next (better retrieval? better reward? more wet-lab grounding?)
+
+Why Bayesian here: deep-learning chemistry is a graveyard of point-estimate hype. Reporting a single number ("agent improves Vina by 0.4 kcal/mol!") invites the BenevolentAI critique. Reporting a *posterior over lift* with explicit prior, sample size, and credible interval signals the kind of scientific rigour that convinces sceptical reviewers and serious investors.
+
+---
+
+## Supporting technical work (referenced from the phases above)
+
+The numbered steps below are the lower-level technical tasks that the four phases pull from. Many can be done in parallel within a phase.
+
+### Step 1 — Recover TargetDiff checkpoint (Phase 1 blocker)
+Google Drive folder `1-ftaIrTXjWFhw3-0Twkrs5m0yX6CNarz` returns 404 (confirmed 2026-05-10). Need to source `pretrained_diffusion.pt` from one of: paper authors (open an issue on the GitHub repo), an academic colleague who has a copy, or an alternative mirror. Until this is recovered, Phase 1 cannot ship TargetDiff results — only Pocket2Mol + RDKit.
 
 ### Step 2 — Empirical Backend Comparison (TargetDiff vs Pocket2Mol vs RDKit)
-TargetDiff and Pocket2Mol are now wired into the orchestrator (`--mode targetdiff` / `--mode pocket2mol`). Run each on the three validated cancer targets (EGFR, BCR-ABL, BRAF) and compare: docking score distribution, QED/SA/ADMET distributions, novelty (Tanimoto to known drugs), and runtime. Document which backend wins under which conditions — the answer will inform the agent planner's strategy selection in Step 7.
+TargetDiff and Pocket2Mol are wired into the orchestrator (`--mode targetdiff` / `--mode pocket2mol`), but as of 2026-05-10 neither produces output end-to-end on this machine:
+
+- **TargetDiff** — checkpoint cannot be downloaded (Google Drive folder returns 404; no HuggingFace/Zenodo mirror found). The earlier 2026-04-18 standalone POC (2 BRAF molecules, ~7 kcal/mol) is therefore not reproducible without a backup checkpoint.
+- **Pocket2Mol** — install + checkpoint work, but `sample_for_pdb.py`'s InitSample beam search is single-threaded CPU-bound and stalls for 10+ minutes even at `beam_size=100` / `num_samples=3` on EGFR, BRAF, and the repo's own `4yhj.pdb` example. GPU sits at 4–38% util; the bottleneck is the Python controller. Reproduced cleanly across three targets, so this is a setup limitation, not a per-pocket bug.
+
+To unblock Step 2: either (a) source a TargetDiff checkpoint via paper authors / a backup, or (b) patch Pocket2Mol's beam-search loop to use multi-process or torch-vectorised candidate evaluation. Until one of these is done, the comparison can only run on RDKit.
 
 ### Step 3 — Per-Campaign Output Directories (DONE)
 Campaigns now write to `data/{campaign_id}/{candidates,screened,results}/` when using the full `run` command. Independent stage invocations still use shared `data/candidates/`, `data/screened/`, `data/results/` directories.
@@ -139,16 +205,27 @@ Add GNINA CNN-based rescoring alongside Vina. Needs GPU; download binary from gi
 ### Step 7 — Agent Planner (Only After M3 Feedback)
 By this point you have real telemetry data, validated benchmarks, and expert-informed parameter ranges. Now you can build the agent planner with actual knowledge to encode, not guesses.
 
-### Step 8 — Provision a GPU Workflow for Diffusion Backends
-The current dev machine has no discrete GPU (Intel HD Graphics 520 only), so TargetDiff and Pocket2Mol can run but only painfully slowly on CPU. Before Step 2 (empirical backend comparison) can produce a fair head-to-head, we need a reproducible GPU workflow:
+### Step 8 — Reproducible GPU Workflow for Diffusion Backends
+The dev machine now has an NVIDIA RTX 5060 (8 GB VRAM, CUDA 13.2), so TargetDiff and Pocket2Mol can run at full speed locally. The remaining work is making this reproducible for collaborators who may be on different hardware:
 
-- **Short term (demos, validation runs):** rent on demand from a GPU-specialist provider — RunPod or Vast.ai for an RTX 3090 or A10 (~$0.25-0.40/hr). One hour of GPU time covers a TargetDiff run on all three validated targets with `num_samples=100`.
-- **Medium term (campaigns):** standardise on a single template (CUDA 11.7 + the `targetdiff_env` / `pocket2mol_env` conda envs), check it into the repo as a setup script, and document the spin-up sequence in `docs/installation.md` so any contributor can reproduce a GPU run from a fresh box.
-- **Free-tier escape hatch:** Google Colab (T4) for one-off interactive demos when paying isn't desirable. Reproducing the conda envs in Colab is awkward but doable with `pip` equivalents.
+- **Local (now):** verify both `targetdiff_env` (CUDA 11.7) and `pocket2mol_env` (CUDA 11.3) work against the system CUDA 13.2 driver via PyTorch's bundled runtime. Document the verification command for each.
+- **Portable (campaigns at scale):** standardise on a single template, check it into the repo as a setup script, and document the spin-up sequence in `docs/installation.md` so any contributor can reproduce a GPU run from a fresh box. Cloud target: RunPod / Vast.ai RTX 3090 or A10 (~$0.25-0.40/hr) covers a TargetDiff run on all three validated targets with `num_samples=100` in ~1 hour.
+- **Free-tier escape hatch:** Google Colab (T4) for one-off interactive demos. Reproducing the conda envs in Colab is awkward but doable with `pip` equivalents.
 
-Why this is a step and not infrastructure: the empirical comparison in Step 2 is gated on it, and the agent planner in Step 7 needs the comparison data to make backend selection decisions.
+Why this is a step and not infrastructure: the empirical comparison in Step 2 is gated on it producing reproducible results across machines, and the agent planner in Step 7 needs the comparison data to make backend selection decisions.
 
-### Step 9 — Interactive Pipeline Visualisation Frontend
+### Step 9 — Rebuild deep-learning conda envs for Blackwell+ GPUs
+Confirmed 2026-05-10: both `pocket2mol_env` (pytorch 1.10 + cu113) and `targetdiff_env` (pytorch 1.13 + cu117) target pre-Blackwell architectures. The RTX 5060 (sm_120) on this machine triggers PTX-JIT in the driver's forward-compatibility path, which is so slow per kernel that Pocket2Mol's autoregressive loop never finishes. CPU mode is the only functional workaround today.
+
+Plan:
+1. **Pocket2Mol**: new `pocket2mol_env_v2` with `pytorch=2.4.*` + `pytorch-cuda=12.1`, latest `torch_geometric` + matching `torch-cluster`/`torch-scatter`/`torch-sparse` wheels from the PyG wheel index (https://data.pyg.org/whl/). Run `sample_for_pdb.py` against the existing `pretrained_Pocket2Mol.pt` checkpoint — checkpoints are weight files only, they don't pin PyTorch versions. Expect 0–3 small import patches (PyG API churn around `MessagePassing`).
+2. **TargetDiff**: same approach for `targetdiff_env_v2` (pytorch 2.4 + cu121 + matching PyG). Gated on first recovering `pretrained_diffusion.pt` (Google Drive 404, paper authors / backup needed).
+3. Verify with the trivial diagnostic: `python -c "import torch; x=torch.randn(2000,2000).cuda(); [x@x.T for _ in range(10)]; torch.cuda.synchronize(); print('ok')"` should return in <1 sec, not 2+ minutes.
+4. Re-run the empirical backend comparison (Step 2). With a working GPU, Pocket2Mol's quoted ~7 sec/molecule and TargetDiff's ~30 sec/molecule become realistic for full 100-molecule campaigns.
+
+Estimated effort: 30–60 min per env, mostly conda dependency babysitting. The model code itself uses standard PyG ops (no custom CUDA kernels), so the upgrade risk is low.
+
+### Step 10 — Interactive Pipeline Visualisation Frontend
 Build a web UI that surfaces the pipeline's work as it happens — campaigns in flight, attrition funnel, generated molecules, docking poses, telemetry queries — instead of leaving everything in CSV/SDF/SQLite. The visual goal is the kind of "live agentic workflow" panel popularised by recent demos (e.g. Chris Yoo's OpenAI hackathon project): clear stage-by-stage status, intermediate artefacts visible, expert-friendly review surface.
 
 Mockups under `reports/ui_mockups/` capture the intended look and feel. This is downstream of Steps 1-7 — the UI should visualise a system that already produces trustworthy results.

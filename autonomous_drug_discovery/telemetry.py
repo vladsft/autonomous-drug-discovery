@@ -12,6 +12,12 @@ Usage:
     db.log_molecule(run_id, "mol_001", "CCO", {"qed": 0.8, "sa_score": 2.1})
 """
 
+# PEP 563: defer annotation evaluation so PEP 585 generics (list[...]) and
+# PEP 604 unions (str | None) work under Python 3.8 — needed because this
+# module is imported inside the pocket2mol_env / targetdiff_env subprocess
+# (Python 3.8) when those backends are dispatched.
+from __future__ import annotations
+
 import sqlite3
 import uuid
 import json

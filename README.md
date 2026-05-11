@@ -13,15 +13,15 @@ Given a protein target, the pipeline:
    - TargetDiff E(3)-equivariant diffusion (pocket-conditioned, slower, highest-fidelity 3D)
 3. **Screens candidates** against drug-likeness filters (Lipinski, QED, SA, PAINS) and annotates with ADMET-AI predictions (104 properties: toxicity, absorption, metabolism, etc.)
 4. **Docks survivors** into the binding pocket using AutoDock Vina to estimate binding affinity
-5. **Ranks and reports** the results, with all intermediate data logged to SQLite
+5. **Ranks** the docked survivors with a multi-criteria composite (docking + ADMET, with an optional AiZynthFinder synthesis-feasibility slot) and writes a final scorecard. All intermediate data is logged to SQLite.
 
 Validated against three cancer targets with crystallographic ground truth:
 
 | Target | Disease | Best Dock Score | Pocket Accuracy |
 |--------|---------|----------------|-----------------|
 | EGFR (1M17) | Lung cancer | -9.32 kcal/mol | 2.7 A from erlotinib, 82% residue overlap |
-| BCR-ABL (2HYY) | Leukemia | -12.56 kcal/mol | 2.7 A from imatinib, 92% residue overlap |
-| BRAF V600E (6P3D) | Melanoma | -10.40 kcal/mol | 3.1 A from ponatinib, 89% residue overlap |
+| BCR-ABL (2HYY) | Leukemia | -12.59 kcal/mol | 2.7 A from imatinib, 92% residue overlap |
+| BRAF V600E (6P3D) | Melanoma | -11.20 kcal/mol | 3.1 A from ponatinib, 89% residue overlap |
 
 ## Quick start
 
@@ -73,6 +73,7 @@ conda run -n base python orchestrator.py ingest data/processed/1M17.pdb
 conda run -n base python orchestrator.py generate data/processed/1M17_manifest.json --mode rdkit
 conda run -n base python orchestrator.py screen data/candidates/generated_molecules.sdf
 conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json --mode production
+conda run -n base python orchestrator.py rank data/results/docking_results.csv --screening_json data/screened/screening_report.json
 ```
 
 ## Documentation
@@ -108,7 +109,8 @@ conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json 
 │   │   │   └── default_scoring_config.json  # Filter thresholds (editable)
 │   │   ├── 04_docking/
 │   │   │   └── run_docking.py       # AutoDock Vina docking — simulation, triage, or production mode
-│   │   └── 05_ranking/              # Reserved for the planned multi-criteria ranker (empty placeholder)
+│   │   └── 05_ranking/
+│   │       └── run_ranking.py       # Multi-criteria ranker — combines docking + ADMET (composite score); AiZynthFinder synthesis slot stubbed
 │   │
 │   ├── data/
 │   │   └── processed/               # PDB files and manifests
@@ -284,13 +286,12 @@ The fragment library (scaffolds, substituents, linkers) is defined at the top of
 - Pocket2Mol autoregressive generation wired into the orchestrator (`--mode pocket2mol`)
 - TargetDiff diffusion generation wired into the orchestrator (`--mode targetdiff`)
 
-### Planned next
-- Empirical comparison: Pocket2Mol vs TargetDiff vs RDKit on the validated cancer targets
-- GNINA CNN-based rescoring
-- AiZynthFinder retrosynthetic feasibility
-- Multi-criteria ranker (`modules/05_ranking/`, currently an empty placeholder) — combines docking, ADMET, and synthesis-feasibility into a single ranked output
-- Domain expert review (M3)
-- Agent planner with empirical strategy selection
+### Roadmap (4 phases — see `autonomous_drug_discovery/plan.md` and `docs/north-star.md` for detail)
+
+1. **Cloud GPU + more validated targets.** Recover the TargetDiff checkpoint, rebuild deep-learning envs on PyTorch 2.4 / CUDA 12 (the pinned 2022 envs don't run on Blackwell), spin up a $5-10 cloud GPU session, run the cascade across 5-10 oncology kinase targets. No agent yet — just the deterministic pipeline at scale.
+2. **Show the professor (M3).** Walk a medicinal chemistry advisor through the dashboard, capture per-candidate annotations, calibrate filter thresholds, get explicit feedback on the proposed adaptive layer.
+3. **Sonnet-in-the-loop + Bayesian recommender + Obsidian.** Wire the four-part adaptive layer: cascade generation, Thompson-sampling strategy selection, Sonnet retrieval/reporting agent, and per-campaign Obsidian knowledge graph.
+4. **Bayesian evaluation; investor / university narrative.** Quantify whether the agent loop produces measurably better candidates than the deterministic baseline. Report posteriors with credible intervals — never point estimates.
 
 ## Dependencies
 

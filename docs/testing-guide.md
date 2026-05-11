@@ -16,7 +16,7 @@ It does all of this computationally — no lab, no chemicals, no test tubes. The
 
 ---
 
-## The Four Stages, Explained
+## The Five Stages, Explained
 
 ### Stage 1: Pocket Detection (P2Rank or fpocket)
 
