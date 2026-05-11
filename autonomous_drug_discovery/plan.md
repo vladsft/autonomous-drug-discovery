@@ -23,6 +23,18 @@ Validated against three cancer targets with crystallographic ground truth:
 
 The immediate priorities are: M3 domain expert review (non-negotiable), empirical comparison of the generation backends (RDKit / Pocket2Mol / TargetDiff) on validated targets, and tightening screening thresholds with expert input.
 
+## Demo Constraint — 20 quality results for the professor (Active)
+
+The professor presentation is the next forcing function. The deliverable is **20 quality candidate molecules** surfaced through the dashboard, end-to-end through the deterministic pipeline. "Quality" here means: passed tightened screening, docked credibly (better than known-drug baseline or comparable, depending on target), and accompanied by a chemist-readable rationale row in the dashboard. Everything in the near-term roadmap is filtered by whether it serves this deliverable.
+
+**Headline math.** 20 quality results = ~5 targets × ~4 surviving top-ranked candidates. With tightened screening at ~50% survival (Step 4) and docking yielding a workable top decile, that requires ~30-40 generated molecules per target. On a rented GPU at ~30-60 s/molecule for TargetDiff, this is 30-60 GPU-minutes per target, ~3-4 GPU-hours total, < $2 on RunPod / Vast.ai. Wallclock end-to-end (including screening + docking + ranking on CPU) is ~half a day.
+
+**Targets for the demo.** Reuse the three already validated (1M17, 2HYY, 6P3D) and add two more from the existing roadmap (KRAS G12C, JAK2). That gives five targets × four quality molecules = the 20-result floor.
+
+**No gold-plating.** The pipeline already works end-to-end (M1) and validates against crystal ground truth (M2). The presentation does *not* need: a new generator, GNINA rescoring (Step 5), AiZynth on every molecule (Step 6), the Bayesian recommender (3b), Sonnet-in-the-loop (3c), or the Obsidian emitter (3a). It needs the existing pipeline run reproducibly on five targets and rendered cleanly in the existing dashboard. The four blockers are reproducibility (Step 11), cloud GPU (Step 12), checkpoint mirror (Step 1), and dashboard polish (Step 10 scope-cut, see below).
+
+**Easy setup for both contributors.** "Both of us cloning fresh and running on a new box" is in scope. "Anyone in the world cloning and running" is out of scope. A `bash scripts/bootstrap.sh` that produces a working pipeline within one coffee break on a clean Ubuntu/macOS box is the bar.
+
 ## Architecture
 
 The system has four layers, listed in order of implementation priority.
@@ -126,16 +138,25 @@ Both should be available as interchangeable modules behind a common interface. T
 
 The roadmap is organised as four phases, in order. Earlier phases are prerequisites for later ones — don't skip ahead. Each phase has concrete success criteria; if they aren't met, stop and diagnose before moving on.
 
-### Phase 1 — Get TargetDiff working on cloud GPU; pull more validated targets
-**Goal:** Reproducible TargetDiff + Pocket2Mol runs on a rented GPU instance, applied across more than the current three kinase targets (e.g. add KRAS G12C, JAK2, CDK4/6, ER-alpha, AR — all well-characterised oncology targets with crystal structures). No agent yet, no Sonnet — just the deterministic cascade running cleanly at scale.
+### Phase 1 — Reproducible cloud-GPU run on 5 targets, 20 quality results for the professor
+
+**Goal:** Five validated targets (1M17, 2HYY, 6P3D + KRAS G12C + JAK2), ~30 TargetDiff molecules each, full pipeline through to the dashboard. Output is the 20-quality-result corpus the professor sees. Pocket2Mol stays optional — TargetDiff alone covers the deliverable; Pocket2Mol's env-rebuild work (Step 9) is deferred until after the demo unless TargetDiff results disappoint.
+
+**Critical path (in order):**
+1. **Step 11 — Codebase unification.** Submodule TargetDiff, mirror the two `.pt` checkpoints to Hugging Face (Drive is gone, see Step 1), write `scripts/bootstrap.sh`. Both contributors can clone-and-run after this.
+2. **Step 12 — Cloud GPU spin-up.** Stand up a RunPod RTX 3090 (~$0.25/hr) with the existing `targetdiff_env` (CUDA 11.7 — no env rebuild needed for the demo). Run `bootstrap.sh` on it.
+3. **Step 4 — Tighten screening thresholds** in `default_scoring_config.json` to bring survival from 73-98% down to ~50% so the dashboard isn't drowning in junk.
+4. **Generate + dock + rank, five targets × 30 molecules.** Single CLI loop over targets, logged to telemetry. Wallclock ~half a day.
+5. **Step 10 (scope-cut, "quality dashboard") — re-render `professor_demo.js`** with the new corpus: per-target tab, top-4 ranked molecule cards (SVG + dock score + QED + SA + key ADMET flags), attrition funnel, an explicit comparison row vs known-drug baseline. Nothing more.
 
 **Success criteria:**
-- TargetDiff `pretrained_diffusion.pt` recovered (paper authors / colleague / mirror search) — see Step 1 below for the blocker
-- `pocket2mol_env_v2` and `targetdiff_env_v2` rebuilt on PyTorch 2.4 / cu121 (Step 9 below) so we get the quoted ~7 sec/mol and ~30 sec/mol on a real GPU
-- 5–10 targets, 100 mols each, full pipeline (P2Rank → cascade gen → ADMET screen → Vina dock → AiZynth on top 10 → Stage 5 rank), all logged to telemetry
-- Cost estimate: $5-10 on RunPod / Vast.ai for an RTX 3090 or A10 (~$0.25-0.40/hr × ~10 hrs total)
+- `bash scripts/bootstrap.sh` produces a working pipeline on a fresh box in < 30 minutes (both of us verify on our own machines)
+- Five targets × ~30 TargetDiff molecules generated, screened, docked, ranked, logged
+- ≥ 20 candidates labelled "quality" (tightened-screen + docking better than median of generation set; ideally within 1 kcal/mol of known-drug baseline on at least three targets)
+- Dashboard loads in a browser, shows the 20 with structures and scores; no manual JSON editing required to rerun
+- Total cloud spend < $5
 
-Why this is Phase 1: without diverse, reproducible per-target results we have nothing to show the professor. Anything more sophisticated downstream is built on this data.
+Why this is Phase 1: the professor presentation is the next milestone, and everything past Phase 1 is built on having a credible, reproducible result set in hand. Anything else (Pocket2Mol, Bayesian recommender, Sonnet agent) is downstream of "do we have 20 results we believe in?"
 
 ### Phase 2 — Show the professor; capture qualitative feedback
 **Goal:** Walk a medicinal chemistry advisor through the dashboard for the targets from Phase 1. Capture which ranked candidates they think are sensible, which look like generative junk, what they'd modify, what's missing. The conversation includes our forward-looking architecture (cascade, Bayesian recommender, Sonnet-in-the-loop, Obsidian knowledge graph) so we can shape Phase 3 with their input.
@@ -179,8 +200,16 @@ Why Bayesian here: deep-learning chemistry is a graveyard of point-estimate hype
 
 The numbered steps below are the lower-level technical tasks that the four phases pull from. Many can be done in parallel within a phase.
 
-### Step 1 — Recover TargetDiff checkpoint (Phase 1 blocker)
-Google Drive folder `1-ftaIrTXjWFhw3-0Twkrs5m0yX6CNarz` returns 404 (confirmed 2026-05-10). Need to source `pretrained_diffusion.pt` from one of: paper authors (open an issue on the GitHub repo), an academic colleague who has a copy, or an alternative mirror. Until this is recovered, Phase 1 cannot ship TargetDiff results — only Pocket2Mol + RDKit.
+### Step 1 — Mirror the TargetDiff and Pocket2Mol checkpoints (Phase 1 blocker)
+Google Drive folder `1-ftaIrTXjWFhw3-0Twkrs5m0yX6CNarz` returns 404 (confirmed 2026-05-10, re-confirmed 2026-05-11 — treat as permanent). The dev machine still has a copy of `pretrained_diffusion.pt` (33 MB, dated Mar 2023) and `egnn_pdbbind_v2016.pt` (30 MB) from before the takedown. `pretrained_Pocket2Mol.pt` (44.9 MB) is **not** on this machine and would need to come from a collaborator or a paper-author request.
+
+Mirror plan, in this order:
+1. **Hugging Face Hub** under our own org (`huggingface-cli upload`). Two model repos: `<org>/targetdiff-pretrained` (holding both `pretrained_diffusion.pt` and `egnn_pdbbind_v2016.pt`) and `<org>/pocket2mol-pretrained` (held empty until Pocket2Mol checkpoint is recovered). HF Hub gives versioned URLs and is free for public repos. ~5 min once `huggingface_hub` is installed.
+2. **Fallback: GitHub Release on a fork.** If HF is for any reason off-limits, attach the two `.pt` files to a GitHub release on our internal fork of the agent-harness repo — also free, supports single files up to 2 GB, fetchable via `gh release download` or a plain URL.
+3. **Update `docs/targetdiff-setup.md` Step 2 and `docs/pocket2mol-setup.md` Step 3** to point at the mirror, and have `scripts/bootstrap.sh` (Step 11) do the fetch automatically.
+4. **For Pocket2Mol weights specifically:** open a polite issue on `pengxingang/Pocket2Mol` asking if they can re-host, and in parallel ask anyone in our academic network who's run Pocket2Mol recently. This is the only checkpoint we cannot mirror from local copies.
+
+Until the mirror exists, every new contributor (and every cloud-GPU rental) is blocked. Until the Pocket2Mol checkpoint is recovered, Pocket2Mol stays out of Phase 1 — it's not on the critical path for the 20-result demo, so this is acceptable.
 
 ### Step 2 — Empirical Backend Comparison (TargetDiff vs Pocket2Mol vs RDKit)
 TargetDiff and Pocket2Mol are wired into the orchestrator (`--mode targetdiff` / `--mode pocket2mol`), but as of 2026-05-10 neither produces output end-to-end on this machine:
@@ -230,6 +259,43 @@ Build a web UI that surfaces the pipeline's work as it happens — campaigns in 
 
 Mockups under `reports/ui_mockups/` capture the intended look and feel. This is downstream of Steps 1-7 — the UI should visualise a system that already produces trustworthy results.
 
+**Demo scope-cut (Phase 1).** For the professor presentation, the existing static dashboard (`dashboard/index.html` + `dashboard/professor_demo.js`) is the deliverable, not a live web app. The work is regenerating `professor_demo.js` from the new five-target corpus, adding a per-target tab, surfacing the top-4 ranked molecules per target as cards (SVG + dock score + QED + SA + key ADMET flags), and showing the attrition funnel and a known-drug-baseline comparison row. The live "agentic workflow" panel is a Phase 3+ deliverable; the static dashboard is enough for the 20-result demo. A one-line `scripts/regenerate_dashboard.py` that reads telemetry and rewrites the JSON is the only new code needed for the demo.
+
+### Step 11 — Codebase unification (Phase 1 critical path)
+"Cloning fresh and running" must be one command. Today it is six commands across three docs, plus two checkpoints from a now-dead Drive folder, plus a TargetDiff repo that `.gitignore` tells you to "add as submodule" but is not in `.gitmodules`. Fix:
+
+1. **Pin TargetDiff as a proper git submodule.** Remove the `autonomous_drug_discovery/modules/02_generation/targetdiff/` line from the top-level `.gitignore`. Add a `[submodule "…/targetdiff"]` block to `.gitmodules` pointing at `https://github.com/guanjq/targetdiff.git` at the commit currently checked out on the dev machine (`git -C autonomous_drug_discovery/modules/02_generation/targetdiff/ rev-parse HEAD` is the pin). Now `git submodule update --init --recursive` brings both TargetDiff and Pocket2Mol in deterministically.
+2. **Mirror the checkpoints (Step 1) and fetch them automatically.** `scripts/bootstrap.sh` calls `huggingface-cli download <org>/targetdiff-pretrained pretrained_diffusion.pt egnn_pdbbind_v2016.pt --local-dir modules/02_generation/targetdiff/pretrained_models/`.
+3. **One bootstrap script does everything.** `scripts/bootstrap.sh` performs, idempotently:
+   - `git submodule update --init --recursive`
+   - `conda env create -f envs/env_orchestrator.yml` (creates / updates the `base`-side env — see point 4 below)
+   - `conda env create -f envs/env_targetdiff.yml`
+   - `conda env create -f envs/env_docking.yml`
+   - `conda env create -f envs/env_pocket2mol.yml` (optional; gated on Pocket2Mol checkpoint availability)
+   - Fetch P2Rank to `~/p2rank_2.5.1/` via `wget + tar` if not already present
+   - Fetch checkpoints from the HF mirror
+   - Run `python orchestrator.py run data/processed/1M17.pdb --mode simulation` as a smoke test
+4. **Consolidate the base-env story.** `docs/installation.md` currently says `conda install -n base -c conda-forge rdkit vina openjdk=17 -y` but `envs/env_orchestrator.yml` exists in the repo and is the proper source of truth. Delete the manual `conda install` from `installation.md` Step 1; have it (and the bootstrap script) call `conda env create -f envs/env_orchestrator.yml` instead. Same for `env_docking.yml` — it exists but isn't mentioned in `installation.md`.
+5. **Sanity-check on a fresh checkout.** After the above, the test is: blow away `~/miniconda3/envs/targetdiff_env`, re-clone the repo into a scratch directory, run `bash scripts/bootstrap.sh`, run `orchestrator.py run … --mode simulation`. Should succeed without manual intervention. Both contributors do this independently on their own machines.
+
+Effort: ~half a day total (the actual diff is small; the work is making sure the bootstrap is genuinely reproducible).
+
+### Step 12 — Cloud GPU workflow (Phase 1 critical path)
+The dev box has no GPU and the targetdiff_env is CPU-only there; one TargetDiff molecule costs ~12 CPU-minutes, so a 30-mol × 5-target campaign on CPU is two days of wallclock — not viable for the demo.
+
+**Provider choice for the demo: RunPod, RTX 3090 or A40, ~$0.25-0.40/hr.** Cheap, persistent network volumes, ssh access, and the `targetdiff_env` (PyTorch 1.13 + CUDA 11.7) runs unmodified on Ampere GPUs — no env rebuild required (Step 9 stays deferred until after the demo). Modal is a stronger long-term answer but requires non-trivial refactor of `run_generation_targetdiff` from `subprocess.check_call` to a `@modal.function`; deferred to Phase 3+.
+
+**Workflow:**
+1. Launch RunPod pod (RTX 3090 or A40, Ubuntu 22.04, ~50 GB disk).
+2. `git clone <our-repo>` + `bash scripts/bootstrap.sh` (Step 11). Wait one coffee.
+3. `python orchestrator.py run data/processed/<target>.pdb --mode targetdiff --num_samples 30` for each of the five targets (or a thin wrapper script that loops). Add a `--num_samples` CLI flag to `run_generation.py` while we're at it — currently the only way to override is to edit `_DEFAULT_PARAMS_BY_MODE`. Single-line change.
+4. `rsync` the resulting `data/campaign_*/` directories back to the dev box for dashboard regeneration.
+5. Tear down the pod. Cost ≈ ($0.30/hr × ~3 hours) ≈ $1.
+
+**Why not Modal yet:** Modal billing-per-second and Python-native env builds would be ideal, but it requires turning the subprocess-based `run_generation_targetdiff` into a Modal function. Worth doing once the pipeline stabilises; not worth doing for one demo.
+
+**Why not pin a specific provider in the script:** the cloud step is the only one a human definitely does interactively (launching a pod, picking a region, generating an SSH key). Encoding it in shell automation is overkill for this scale. A 20-line README section in `docs/installation.md` is sufficient.
+
 ## Principles
 
 **Ship the deterministic pipeline before the adaptive one.** A reliable fixed pipeline that produces good results is more valuable than an adaptive one that produces unreliable results intelligently.
@@ -239,3 +305,21 @@ Mockups under `reports/ui_mockups/` capture the intended look and feel. This is 
 **The tools are not the product. The orchestration and the judgment layer are the product.** Any research group can install fpocket and Vina. What they cannot easily do is wire them into a reproducible, logged, quality-controlled workflow that enforces scientific discipline at every stage.
 
 **Do not automate judgment you do not yet have.** The agent planner is the long-term differentiator, but it must be built on empirical knowledge, not assumed intelligence. Until you have run enough real campaigns to know what good looks like, the system should execute, log, and present — not decide.
+
+---
+
+## Immediate actions (week of 2026-05-11)
+
+Ordered. Each step's output is the next step's input. None depends on a tool we don't already have.
+
+1. **Mirror checkpoints to Hugging Face** (Step 1). Upload `pretrained_diffusion.pt` and `egnn_pdbbind_v2016.pt` from the dev machine to `<org>/targetdiff-pretrained`. Effort: 30 min. Unblocks every fresh clone.
+2. **Pin TargetDiff as a submodule** (Step 11.1). Remove the `.gitignore` line, add to `.gitmodules`, commit. Effort: 15 min.
+3. **Write `scripts/bootstrap.sh`** (Step 11.3). Submodule init, conda env create × 4, P2Rank fetch, checkpoint fetch from HF, smoke-test. Effort: ~3 hours including testing on a clean directory.
+4. **Add a `--num_samples` flag** to `run_generation.py` so we don't have to keep editing `_DEFAULT_PARAMS_BY_MODE` to control campaign size (Step 12.3). Effort: 15 min.
+5. **Both contributors run `bash scripts/bootstrap.sh` on their own machines** and confirm a simulation-mode pipeline run completes. Effort: 15 min each.
+6. **Tighten screening thresholds** in `default_scoring_config.json` (Step 4). Pick conservative defaults (Lipinski-strict, QED ≥ 0.5, SA ≤ 4.5, MW ≤ 450). Effort: 15 min — calibrate against the existing telemetry.
+7. **Spin up a RunPod RTX 3090** (Step 12). Clone, bootstrap, run TargetDiff on the five targets with `num_samples=30` each. Effort: ~3 hours wallclock, mostly waiting; ~$1.
+8. **Regenerate the dashboard** (Step 10 scope-cut). Write `scripts/regenerate_dashboard.py` that reads telemetry + ranking outputs and rewrites `dashboard/professor_demo.js` with per-target tabs and top-4 cards. Effort: half a day.
+9. **Sanity-review the 20 results** — spot-check the SDFs in a chemistry viewer (PyMOL or just RDKit MolToImage) before showing the professor. Effort: ~1 hour.
+
+Total: under one focused working week, ~$3 of cloud spend. Anything not in this list is post-demo work, including the Pocket2Mol env rebuild (Step 9), GNINA rescoring (Step 5), AiZynth on every molecule (Step 6), Bayesian recommender (Phase 3b), Sonnet-in-the-loop (Phase 3c), and the Obsidian emitter (Phase 3a).
