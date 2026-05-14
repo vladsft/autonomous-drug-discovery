@@ -67,12 +67,6 @@ data/.idea/
 data/._*
 
 # =============================================================================
-# TargetDiff (nested git repo — add as submodule separately)
-# See: https://github.com/guanjq/targetdiff.git
-# =============================================================================
-autonomous_drug_discovery/modules/02_generation/targetdiff/
-
-# =============================================================================
 # Model checkpoints / weights (too large for git)
 # =============================================================================
 *.pt

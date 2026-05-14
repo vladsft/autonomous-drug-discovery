@@ -244,9 +244,9 @@ By this point we have real telemetry data, validated benchmarks, and expert-info
 Strict sequence. Each day's output is the next day's input. If anything cracks, stop and stabilise before continuing.
 
 ### Day 1 — Foundations (4-5 hours)
+- [x] **Pin TargetDiff as a proper git submodule.** ✅ Done 2026-05-11 (commit on `main`). Submodule at `guanjq/targetdiff` SHA `142f1eb…`. Local NumPy-deprecation patches stored under `autonomous_drug_discovery/modules/02_generation/targetdiff_patches/` and re-applied by `scripts/apply_targetdiff_patches.sh` (idempotent). Fresh clones need `git submodule update --init --recursive && scripts/apply_targetdiff_patches.sh`.
 - [ ] **Create HF Hub org + upload weights.** `huggingface.co/<you>/agent-harness-weights`. Upload `pretrained_diffusion.pt` and `egnn_pdbbind_v2016.pt` from the dev box. ~30 min.
-- [ ] **Pin TargetDiff as a proper git submodule.** Remove `autonomous_drug_discovery/modules/02_generation/targetdiff/` from `.gitignore`. Add a `[submodule "…/targetdiff"]` block to `.gitmodules` pinning to the dev-box SHA (`git -C autonomous_drug_discovery/modules/02_generation/targetdiff/ rev-parse HEAD`). Commit. ~15 min.
-- [ ] **Skeleton `Dockerfile`** at repo root. Multi-stage from `nvidia/cuda:11.7.1-runtime-ubuntu22.04`. Miniconda, three envs (`env_orchestrator.yml`, `env_targetdiff.yml`, `env_docking.yml`), P2Rank tarball, weights from `huggingface-cli download`. `COPY . /app`, entrypoint. Local `docker build -t agent-harness:dev .` succeeds. ~3 hours.
+- [ ] **Skeleton `Dockerfile`** at repo root. Multi-stage from `nvidia/cuda:11.7.1-runtime-ubuntu22.04`. Miniconda, three envs (`env_orchestrator.yml`, `env_targetdiff.yml`, `env_docking.yml`), P2Rank tarball, weights from `huggingface-cli download`, then `scripts/apply_targetdiff_patches.sh` at the end of the build. `COPY . /app`, entrypoint. Local `docker build -t agent-harness:dev .` succeeds. ~3 hours.
 - [ ] **Smoke test:** `docker run agent-harness:dev orchestrator.py run data/processed/1M17.pdb --mode simulation` completes successfully. ~30 min.
 
 ### Day 2 — CI + GHCR + R2 (5-6 hours)

@@ -1,3 +1,6 @@
 [submodule "autonomous_drug_discovery/modules/02_generation/pocket2mol"]
 	path = autonomous_drug_discovery/modules/02_generation/pocket2mol
 	url = https://github.com/pengxingang/Pocket2Mol.git
+[submodule "autonomous_drug_discovery/modules/02_generation/targetdiff"]
+	path = autonomous_drug_discovery/modules/02_generation/targetdiff
+	url = https://github.com/guanjq/targetdiff.git
