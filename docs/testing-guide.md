@@ -168,9 +168,11 @@ This section documents every validation experiment that has been completed, with
 
 **Verdict:** P2Rank places the docking box closer to the real drug binding site, especially for EGFR where it is 3.4 A closer than fpocket. Residue overlap is consistently higher with P2Rank. Both methods perform well on BCR-ABL and BRAF (large, well-defined pockets).
 
-### Test 4: TargetDiff Diffusion Generation (2026-03-21 to 2026-04-02)
+### Test 4: TargetDiff Diffusion Generation (2026-03-21 to 2026-04-02; subsequent retries failed)
 
 **What:** Generated molecules from noise using the TargetDiff E(3)-equivariant diffusion model, conditioned on the BRAF V600E (6P3D) binding pocket shape. Run standalone (not through the orchestrator pipeline).
+
+**Status (2026-05-11):** This result is *not* currently reproducible through the orchestrator on a clean machine. The upstream Google Drive checkpoint folder is gone; a separate `PYTHONPATH` bug in the wrapper (since fixed) had prevented orchestrator-driven runs from succeeding; and CPU-only inference is too slow to be practical. Phase 1 of [`autonomous_drug_discovery/plan.md`](../autonomous_drug_discovery/plan.md) mirrors the surviving local checkpoint to Hugging Face and moves TargetDiff runs to a RunPod GPU.
 
 **Setup:** TargetDiff checkpoint (pretrained), 1000 denoising steps, CPU inference (~12 min/molecule). Two separate runs producing one molecule each.
 

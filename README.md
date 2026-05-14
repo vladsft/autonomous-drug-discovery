@@ -1,94 +1,81 @@
 # Autonomous Drug Discovery Pipeline
 
-An end-to-end computational drug discovery system that takes a protein structure (PDB file) and produces a ranked list of candidate drug molecules. The pipeline automates pocket detection, molecule generation, drug-likeness screening, and molecular docking — with every step logged to a telemetry database for reproducibility and analysis.
+An end-to-end computational drug discovery system that takes a protein structure (PDB file) and produces a ranked list of candidate drug molecules. The pipeline automates pocket detection, molecule generation, drug-likeness screening, molecular docking, and multi-criteria ranking — with every step logged to a telemetry database for reproducibility and analysis.
 
 ## What it does
 
 Given a protein target, the pipeline:
 
-1. **Detects binding pockets** on the protein surface using P2Rank (ML-based, default) or fpocket (fallback)
-2. **Generates candidate molecules** using one of three backends:
-   - RDKit fragment-based combinatorial chemistry (default, fast, CPU)
-   - Pocket2Mol autoregressive generator (pocket-conditioned, ~7 s/molecule on GPU)
-   - TargetDiff E(3)-equivariant diffusion (pocket-conditioned, slower, highest-fidelity 3D)
-3. **Screens candidates** against drug-likeness filters (Lipinski, QED, SA, PAINS) and annotates with ADMET-AI predictions (104 properties: toxicity, absorption, metabolism, etc.)
-4. **Docks survivors** into the binding pocket using AutoDock Vina to estimate binding affinity
-5. **Ranks** the docked survivors with a multi-criteria composite (docking + ADMET, with an optional AiZynthFinder synthesis-feasibility slot) and writes a final scorecard. All intermediate data is logged to SQLite.
+1. **Detects binding pockets** with P2Rank (ML-based, default) or fpocket (geometry fallback).
+2. **Generates candidate molecules** with one of:
+   - **RDKit** fragment-based combinatorial generation (default, fast, CPU)
+   - **TargetDiff** E(3)-equivariant diffusion (pocket-conditioned, highest-fidelity 3D; needs GPU in practice)
+   - **Pocket2Mol** autoregressive generator (pocket-conditioned, faster than TargetDiff; *currently deferred — pretrained checkpoint not recovered*)
+3. **Screens candidates** against drug-likeness filters (Lipinski, QED, SA, PAINS) and ADMET-AI (104 properties).
+4. **Docks survivors** into the pocket with AutoDock Vina.
+5. **Ranks** via a composite score (docking + ADMET + optional AiZynthFinder synthesis feasibility) and writes a final scorecard.
 
 Validated against three cancer targets with crystallographic ground truth:
 
 | Target | Disease | Best Dock Score | Pocket Accuracy |
-|--------|---------|----------------|-----------------|
-| EGFR (1M17) | Lung cancer | -9.32 kcal/mol | 2.7 A from erlotinib, 82% residue overlap |
-| BCR-ABL (2HYY) | Leukemia | -12.59 kcal/mol | 2.7 A from imatinib, 92% residue overlap |
-| BRAF V600E (6P3D) | Melanoma | -11.20 kcal/mol | 3.1 A from ponatinib, 89% residue overlap |
+|---|---|---|---|
+| EGFR (1M17) | Lung cancer | -9.32 kcal/mol | 2.7 Å from erlotinib, 82% residue overlap |
+| BCR-ABL (2HYY) | Leukemia | -12.59 kcal/mol | 2.7 Å from imatinib, 92% residue overlap |
+| BRAF V600E (6P3D) | Melanoma | -11.20 kcal/mol | 3.1 Å from ponatinib, 89% residue overlap |
 
 ## Quick start
 
+The pipeline ships as a single Docker image with all conda environments, P2Rank, and (mirrored) model checkpoints baked in. Both contributors run the same image; the cloud GPU pod runs the same image.
+
+> **Note on the Docker image:** The Dockerfile and CI workflow are part of the Phase 1 work currently in flight (see [`autonomous_drug_discovery/plan.md`](autonomous_drug_discovery/plan.md)). Until that lands, the image at `ghcr.io/<you>/agent-harness` does not yet exist; the legacy manual conda setup at the bottom of this README is the fallback. The commands below describe the target workflow.
+
 ### Prerequisites
 
-- [Miniconda](https://docs.conda.io/en/latest/miniconda.html) or Anaconda
-- [P2Rank](https://github.com/rdk/p2rank) (default pocket detection) — requires Java 17+
-- [fpocket](https://github.com/Discngine/fpocket) (fallback pocket detection)
+- Docker 24+ (with the `compose` plugin)
+- For local GPU runs: an NVIDIA GPU + the NVIDIA Container Toolkit
+- For cloud GPU runs: a [RunPod](https://www.runpod.io/) account
+- For state syncing: a [Cloudflare R2](https://www.cloudflare.com/products/r2/) bucket
 
-### Install dependencies
+### One-time setup
 
 ```bash
-# Step 1 — conda packages (compiled extensions)
-conda install -n base -c conda-forge rdkit vina openjdk=17 -y
-
-# Step 2 — pip packages
-pip install -r autonomous_drug_discovery/requirements.txt
-```
-
-Download P2Rank:
-```bash
-cd ~
-wget https://github.com/rdk/p2rank/releases/download/2.5.1/p2rank_2.5.1.tar.gz
-tar -xzf p2rank_2.5.1.tar.gz && rm p2rank_2.5.1.tar.gz
+git clone <this-repo> && cd agent-harness
+make bootstrap   # pulls Docker image, configures rclone for R2
 ```
 
 ### Run the full pipeline
 
 ```bash
-cd autonomous_drug_discovery
+# Local CPU run (RDKit, fast)
+make run TARGET=1M17 MODE=production
 
-# Production mode: real generation (RDKit), screening, and docking
-conda run -n base python orchestrator.py run data/processed/1M17.pdb --mode production
+# Local CPU sanity check
+make run TARGET=1M17 MODE=simulation
 
-# Pocket2Mol mode: autoregressive pocket-conditioned generation (requires pocket2mol_env)
-conda run -n base python orchestrator.py run data/processed/6P3D.pdb --mode pocket2mol
-
-# TargetDiff mode: diffusion-based generation (requires targetdiff_env)
-conda run -n base python orchestrator.py run data/processed/6P3D.pdb --mode targetdiff
-
-# Simulation mode: stub data, for testing the pipeline plumbing
-conda run -n base python orchestrator.py run data/processed/1UYD.pdb --mode simulation
+# Cloud GPU run (TargetDiff, ~$0.30, ~30 min on an RTX 3090)
+make cloud-run TARGET=2HYY MODE=targetdiff NUM=30
 ```
 
-### Run individual stages
+Output lands in `data/campaign_<id>/`. Sync to/from the shared R2 bucket with `make push` / `make pull`.
+
+### View the dashboard
+
+The static dashboard auto-deploys to GitHub Pages on every `main` commit. URL: `https://<you>.github.io/agent-harness/`. Locally:
 
 ```bash
-conda run -n base python orchestrator.py ingest data/processed/1M17.pdb
-conda run -n base python orchestrator.py generate data/processed/1M17_manifest.json --mode rdkit
-conda run -n base python orchestrator.py screen data/candidates/generated_molecules.sdf
-conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json --mode production
-conda run -n base python orchestrator.py rank data/results/docking_results.csv --screening_json data/screened/screening_report.json
+make dashboard    # regenerate dashboard JSON from latest telemetry
+open dashboard/index.html
 ```
 
 ## Documentation
 
 | Doc | Question it answers |
-|-----|---------------------|
-| This README | What is this repo? Quick start, structure, dependencies |
-| [docs/north-star.md](docs/north-star.md) | What are we building and why? Vision, market, strategy, roadmap |
-| [docs/testing-guide.md](docs/testing-guide.md) | How do I know the science works? Plain-language explanations, validation experiments, glossary |
-| [docs/pipeline-guide.md](docs/pipeline-guide.md) | How do I use the pipeline? Commands, modes, parameters, output structure |
-| [docs/installation.md](docs/installation.md) | How do I set this up? Prerequisites, install steps, troubleshooting |
-| [docs/telemetry-guide.md](docs/telemetry-guide.md) | How do I query the data? DB schema, SQL queries, Python API |
-| [docs/targetdiff-setup.md](docs/targetdiff-setup.md) | How do I set up TargetDiff? Separate env, standalone testing, performance |
-| [docs/pocket2mol-setup.md](docs/pocket2mol-setup.md) | How do I set up Pocket2Mol? Separate env, checkpoint download, troubleshooting |
-| [autonomous_drug_discovery/plan.md](autonomous_drug_discovery/plan.md) | What is the architectural design? Layer model, agent planner philosophy, future direction |
+|---|---|
+| [`autonomous_drug_discovery/plan.md`](autonomous_drug_discovery/plan.md) | **Canonical architecture + roadmap.** Container architecture, operating principles, 4-phase roadmap, 7-day immediate action plan. Start here. |
+| [`docs/north-star.md`](docs/north-star.md) | Vision and market positioning. Why this project exists, who it serves, what differentiates it. |
+| [`docs/pipeline-guide.md`](docs/pipeline-guide.md) | Operational usage — `make` commands, per-stage commands, parameters, output structure. |
+| [`docs/testing-guide.md`](docs/testing-guide.md) | Plain-language explanation of the science, validation experiments run to date, glossary. |
+| [`docs/telemetry-guide.md`](docs/telemetry-guide.md) | SQLite schema, common queries, Python API. |
 
 ## Repository structure
 
@@ -96,217 +83,55 @@ conda run -n base python orchestrator.py rank data/results/docking_results.csv -
 .
 ├── autonomous_drug_discovery/       # Main application
 │   ├── orchestrator.py              # CLI entrypoint — runs stages individually or as full pipeline
-│   ├── agent_planner.py             # LLM-driven adaptive orchestration (optional, requires API key)
-│   ├── telemetry.py                 # SQLite telemetry database (runs + molecule_scores tables)
+│   ├── agent_planner.py             # LLM-driven adaptive loop (Phase 3 scaffold)
+│   ├── telemetry.py                 # SQLite telemetry database
+│   ├── plan.md                      # CANONICAL architecture + roadmap
 │   │
 │   ├── modules/
-│   │   ├── 01_ingestion/
-│   │   │   └── run_pocket.py        # P2Rank / fpocket — detects binding pockets on a PDB file
-│   │   ├── 02_generation/
-│   │   │   └── run_generation.py    # Molecule generator — fragment-based (RDKit) or TargetDiff
-│   │   ├── 03_screening/
-│   │   │   ├── run_screening.py     # Drug-likeness filters — Lipinski, QED, SA, PAINS, ADMET-AI
-│   │   │   └── default_scoring_config.json  # Filter thresholds (editable)
-│   │   ├── 04_docking/
-│   │   │   └── run_docking.py       # AutoDock Vina docking — simulation, triage, or production mode
-│   │   └── 05_ranking/
-│   │       └── run_ranking.py       # Multi-criteria ranker — combines docking + ADMET (composite score); AiZynthFinder synthesis slot stubbed
+│   │   ├── 01_ingestion/            # P2Rank / fpocket pocket detection
+│   │   ├── 02_generation/           # RDKit / TargetDiff / Pocket2Mol molecule generators
+│   │   ├── 03_screening/            # Lipinski + QED + SA + PAINS + ADMET-AI
+│   │   ├── 04_docking/              # AutoDock Vina
+│   │   └── 05_ranking/              # Multi-criteria composite scoring
 │   │
-│   ├── data/
-│   │   └── processed/               # PDB files and manifests
-│   │
-│   ├── envs/                        # Conda environment specs
+│   ├── data/processed/              # Input PDBs and ingestion manifests
+│   ├── envs/                        # Conda env specs (baked into Docker image at build time)
 │   └── tests/
-│       ├── test_screening.py
-│       └── test_telemetry.py
 │
-├── docs/                            # Documentation (see table above)
-├── reports/                         # Visualizations (TargetDiff molecule comparisons)
-└── data/                            # Reference data (CIF dictionaries, utilities)
+├── dashboard/                       # Static HTML + JSON dashboard
+├── docs/                            # See table above
+└── scripts/                         # bootstrap.sh, cloud_run.sh, regenerate_dashboard.py
 ```
 
-## Pipeline stages in detail
+## Architecture summary
 
-### Stage 1: Pocket detection (`01_ingestion/run_pocket.py`)
+The full architecture lives in [`plan.md`](autonomous_drug_discovery/plan.md). One-paragraph version:
 
-**Tool:** P2Rank (default, ML-based) or fpocket (fallback, geometry-based). Selectable via `--backend p2rank|fpocket`.
+A single Docker image (built by GitHub Actions, pushed to GHCR, weights mirrored to Hugging Face) runs identically on either contributor's laptop and on rented RunPod GPU pods. Campaign outputs and the telemetry SQLite DB live in a Cloudflare R2 bucket as the cross-machine source of truth. The chemist dashboard is a static site deployed to GitHub Pages and regenerated on every commit. A top-level `Makefile` is the user interface. The architecture is deliberately *not* Kubernetes, *not* a VM, *not* Modal — those are evaluated as post-demo work in `plan.md`.
 
-**Input:** A `.pdb` file containing a protein structure.
+## Status
 
-**Output:**
-- `{stem}_manifest.json` — best pocket location, score, probability, and pre-computed center coordinates.
-- `{stem}_p2rank/` for P2Rank — contains `{stem}.pdb_predictions.csv`, `{stem}.pdb_residues.csv`, and one `{stem}_pocket{N}_atm.pdb` per ranked pocket (e.g. `1M17_pocket1_atm.pdb`).
-- `{stem}_out/` for fpocket — contains `pockets/pocket{N}_atm.pdb` plus fpocket's per-pocket info files.
+- M1 (working pipeline) — done.
+- M2 (validation against 3 crystal-structure targets) — done.
+- **Phase 1 (containerise + cloud GPU + 20 quality results for the professor) — in flight; see `plan.md` Immediate Action Plan.**
+- M3 (medicinal chemistry expert review) — Phase 2, post-demo.
+- Adaptive Layer (Sonnet + Bayesian + Obsidian + Cascade) — Phase 3.
+- Bayesian evaluation — Phase 4.
 
-**P2Rank advantages over fpocket:** 10-20 percentage point better recall on standard benchmarks. On EGFR (1M17), P2Rank places the pocket 2.7 A from the known drug (vs fpocket's 6.3 A) with 82% residue overlap (vs 53%).
+## Legacy / fallback: manual conda setup
 
-### Stage 2: Molecule generation (`02_generation/run_generation.py`)
+While the Docker image is in flight, the manual conda workflow still works on machines that have the local checkpoint and environments already configured. It is **not** recommended for fresh setups — the Pocket2Mol Google Drive folder is permanently dead and the TargetDiff one is also gone (the dev box has a pre-takedown copy; see `plan.md`). For full historical install steps see the git history of `docs/installation.md` (deleted 2026-05-11) or the per-stage commands in [`docs/pipeline-guide.md`](docs/pipeline-guide.md).
 
-**Modes:**
-- `simulation` — writes a single stub molecule (benzene) for pipeline testing.
-- `rdkit` — fragment-based combinatorial generation using RDKit. Assembles drug-like scaffolds (indole, quinazoline, piperidine, etc.) with functional group substituents and linkers. Uses BRICS decomposition for additional diversity. Molecules are sized to fit the pocket (estimated from pocket radius). 3D conformers are generated and MMFF-optimized.
-- `pocket2mol` — wraps the [Pocket2Mol](https://github.com/pengxingang/Pocket2Mol) autoregressive generator. Builds molecules atom-by-atom inside the pocket using a graph neural network. ~11× faster than TargetDiff. Requires the `pocket2mol_env` conda environment and a pretrained checkpoint. See [docs/pocket2mol-setup.md](docs/pocket2mol-setup.md).
-- `targetdiff` — wraps the [TargetDiff](https://github.com/guanjq/targetdiff) E(3)-equivariant diffusion model. Denoises from random noise over 1000 steps, conditioned on the pocket shape. Highest-fidelity 3D generation but slowest. Requires the `targetdiff_env` conda environment. See [docs/targetdiff-setup.md](docs/targetdiff-setup.md).
-
-**Input:** `manifest.json` from Stage 1 (specifically the `best_pocket` path).
-
-**Output:** `generated_molecules.sdf` — 100 molecules by default, each with 3D coordinates, SMILES, and a unique `molecule_id`.
-
-**Configuration:** `num_samples` (default 100), `seed` (default 42).
-
-### Stage 3: Screening (`03_screening/run_screening.py`)
-
-**Tool:** MolScore (preferred) or RDKit fallback + ADMET-AI (104-property toxicity/absorption/metabolism prediction)
-
-The screening module uses MolScore as the primary backend for descriptor calculation and PAINS filtering. If MolScore is not installed, it falls back to hand-rolled RDKit filters. ADMET-AI enrichment runs on survivors regardless of backend.
-
-**Input:** An `.sdf` file of candidate molecules.
-
-**Output:**
-- `screened_molecules.sdf` — only molecules that passed all filters.
-- `screening_report.json` — per-molecule properties, pass/fail status, ADMET annotations, and attrition summary.
-- `run_metadata.json` — module execution metadata (backend, counts, status).
-
-**Filters applied (configurable in `default_scoring_config.json`):**
-
-| Filter | Threshold | Rationale |
-|--------|-----------|-----------|
-| Molecular weight | <= 500 | Lipinski Rule of Five |
-| LogP | <= 5 | Lipinski Rule of Five |
-| H-bond donors | <= 5 | Lipinski Rule of Five |
-| H-bond acceptors | <= 10 | Lipinski Rule of Five |
-| SA Score | <= 5.0 | Synthetic accessibility |
-| QED | >= 0.3 | Drug-likeness |
-| PAINS | = 0 | No toxic substructure alerts |
-
-**Adding a new filter:** Edit `default_scoring_config.json`. Each entry in `filter_thresholds` maps a property name (prefixed `desc_` for descriptors, `filter_` for substructure filters) to `{"max": N}`, `{"min": N}`, or `{"equals": N}`. No code change required.
-
-### Stage 4: Docking (`04_docking/run_docking.py`)
-
-**Tool:** AutoDock Vina (Python API) + Meeko (ligand PDBQT preparation)
-
-**Modes:**
-- `simulation` — returns hardcoded dummy scores for pipeline testing.
-- `triage` — fast SMILES-based docking via the TDC Oracle (Vina under the hood). Lower setup overhead than production; requires `pytdc`. Falls back to simulation if unavailable.
-- `production` — full Vina docking pipeline: converts receptor PDB to PDBQT with proper AutoDock atom typing (C, A, N, NA, OA, SA, HD), prepares each ligand via Meeko, computes Vina grid maps centered on the pocket centroid, docks with exhaustiveness=8 and 9 poses per ligand, reports the best binding affinity.
-
-**Input:** `manifest.json` (for receptor PDB and pocket centroid) + candidates directory containing an `.sdf` file.
-
-**Output:**
-- `docking_results.csv` — columns: `ligand_id, smiles, affinity` (kcal/mol, more negative = stronger binding). Sorted best-to-worst.
-- Docked pose files (`docked_mol_XXXX.pdbqt`) for the top pose of each ligand.
-
-**Typical score ranges:** Drug-like molecules against real targets score between -4 and -11 kcal/mol. Scores near 0 indicate a problem with receptor preparation.
-
-## Telemetry database
-
-All pipeline runs are logged to `data/telemetry.db` (SQLite). Two tables:
-
-**`runs`** — one row per module execution:
-- `run_id` (UUID), `campaign_id`, `module_name`, `started_at`, `completed_at`, `status`
-- `input_path`, `output_path`, `parameters` (JSON), `error_trace`, `git_commit`
-
-**`molecule_scores`** — one row per molecule per stage:
-- `molecule_id`, `smiles`, `qed`, `sa_score`, `logp`, `mol_weight`, `docking_score`
-- `passed_triage` (1/0), `stage_eliminated` (reason string)
-
-Query examples:
-```bash
-# All campaigns and their status
-sqlite3 data/telemetry.db "SELECT campaign_id, module_name, status FROM runs ORDER BY started_at;"
-
-# Top molecules across all campaigns
-sqlite3 data/telemetry.db "SELECT smiles, docking_score, qed FROM molecule_scores WHERE docking_score IS NOT NULL ORDER BY docking_score LIMIT 10;"
-
-# Attrition by stage
-sqlite3 data/telemetry.db "SELECT stage_eliminated, COUNT(*) FROM molecule_scores WHERE passed_triage = 0 GROUP BY stage_eliminated;"
-```
-
-## Agent planner
-
-`agent_planner.py` wraps the pipeline in an LLM-driven loop that can inspect outputs between stages and adapt strategy. Currently supports Google Gemini (requires `DISCOVERY_LLM_API_KEY` environment variable). Without an API key, it falls back to the deterministic pipeline.
+The minimal legacy invocation looks like:
 
 ```bash
-# Deterministic mode (no API key needed)
-conda run -n base python agent_planner.py --target data/processed/1M17.pdb --mode production
-
-# With LLM adaptation
-DISCOVERY_LLM_API_KEY=your_key conda run -n base python agent_planner.py --target data/processed/1M17.pdb --mode production --max_iterations 5
+conda env create -f autonomous_drug_discovery/envs/env_orchestrator.yml
+conda run -n base python autonomous_drug_discovery/orchestrator.py run \
+    autonomous_drug_discovery/data/processed/1M17.pdb --mode simulation
 ```
 
-The agent planner is a **recommendation engine**, not an autonomous decision-maker. See `plan.md` Layer 4 for the design philosophy.
-
-## Configuration
-
-### Screening thresholds
-
-Edit `modules/03_screening/default_scoring_config.json`. Example — loosening the QED filter:
-
-```json
-"desc_QED": {"min": 0.2, "reason": "QED Drug-likeness >= 0.2"}
-```
-
-### Docking parameters
-
-In `modules/04_docking/run_docking.py`, `DEFAULT_PARAMS`:
-
-```python
-DEFAULT_PARAMS = {
-    "exhaustiveness": 8,    # higher = more thorough but slower
-    "num_modes": 9,         # number of binding poses to generate
-    "energy_range": 3,      # kcal/mol range for pose clustering
-    "box_size": [20, 20, 20],  # docking grid size in Angstroms
-}
-```
-
-### Generation parameters
-
-In `modules/02_generation/run_generation.py`, `DEFAULT_PARAMS`:
-
-```python
-DEFAULT_PARAMS = {
-    "num_samples": 100,  # number of molecules to generate
-}
-```
-
-The fragment library (scaffolds, substituents, linkers) is defined at the top of the same file and can be extended.
-
-## Current status and roadmap
-
-### Working now (M1 + M2 complete)
-- Pocket detection (P2Rank, default) — ML-based, validated against crystallography
-- Molecule generation (RDKit fragment-based) — pocket-aware sizing
-- Screening (MolScore + ADMET-AI) — Lipinski + QED + SA + PAINS + 104 ADMET properties
-- Docking (AutoDock Vina) — production-grade, uses P2Rank pocket centers
-- Campaign telemetry — full logging of all stages
-- Validated against 3 cancer targets (EGFR, BCR-ABL, BRAF V600E) with crystallographic ground truth
-- Benchmark comparison script (`benchmark.py`)
-
-### Recently added (M2.6)
-- Pocket2Mol autoregressive generation wired into the orchestrator (`--mode pocket2mol`)
-- TargetDiff diffusion generation wired into the orchestrator (`--mode targetdiff`)
-
-### Roadmap (4 phases — see `autonomous_drug_discovery/plan.md` and `docs/north-star.md` for detail)
-
-1. **Cloud GPU + more validated targets.** Recover the TargetDiff checkpoint, rebuild deep-learning envs on PyTorch 2.4 / CUDA 12 (the pinned 2022 envs don't run on Blackwell), spin up a $5-10 cloud GPU session, run the cascade across 5-10 oncology kinase targets. No agent yet — just the deterministic pipeline at scale.
-2. **Show the professor (M3).** Walk a medicinal chemistry advisor through the dashboard, capture per-candidate annotations, calibrate filter thresholds, get explicit feedback on the proposed adaptive layer.
-3. **Sonnet-in-the-loop + Bayesian recommender + Obsidian.** Wire the four-part adaptive layer: cascade generation, Thompson-sampling strategy selection, Sonnet retrieval/reporting agent, and per-campaign Obsidian knowledge graph.
-4. **Bayesian evaluation; investor / university narrative.** Quantify whether the agent loop produces measurably better candidates than the deterministic baseline. Report posteriors with credible intervals — never point estimates.
-
-## Dependencies
-
-| Package | Purpose | Install |
-|---------|---------|---------|
-| P2Rank | ML-based pocket detection (default) | [Download binary](https://github.com/rdk/p2rank/releases) |
-| Java 17+ | Required by P2Rank | `conda install -c conda-forge openjdk=17` |
-| RDKit | Molecular property calculation, fragment generation, PAINS filters | `conda install -c conda-forge rdkit` |
-| MolScore | Primary screening backend — descriptor calculation and PAINS filtering | `pip install molscore` |
-| AutoDock Vina | Molecular docking (binding affinity scoring) | `conda install -c conda-forge vina` |
-| Meeko | Ligand PDBQT preparation for Vina | `pip install meeko` |
-| gemmi | Receptor PDB parsing and atom typing | `pip install gemmi` |
-| ADMET-AI | 104-property ADMET prediction | `pip install admet-ai` |
-| fpocket | Pocket detection (fallback) | [Build from source](https://github.com/Discngine/fpocket) |
+Beyond simulation mode you also need P2Rank installed (`~/p2rank_2.5.1/prank`), and for TargetDiff/Pocket2Mol the relevant conda env *and* the pretrained checkpoint at the expected path.
 
 ## License
 
-See repository license file.
+See `LICENSE`.

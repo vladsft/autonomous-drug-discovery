@@ -10,182 +10,176 @@ PDB file  -->  [1. Pocket Detection]  -->  [2. Molecule Generation]  -->  [3. Sc
 
 Each stage reads the output of the previous stage and writes structured output (JSON manifests, SDF files, CSV results). Everything is logged to a SQLite telemetry database.
 
-## Running the Full Pipeline
+For setup, see the [README](../README.md). For architectural context (why Docker, why RunPod, why R2), see [`autonomous_drug_discovery/plan.md`](../autonomous_drug_discovery/plan.md).
+
+## Running the Pipeline (Docker, recommended)
+
+The repo ships a `Makefile` that wraps Docker. Once `make bootstrap` has run on a machine, everything below works.
+
+### Full pipeline, local CPU
 
 ```bash
-cd autonomous_drug_discovery
+# Production (RDKit fragment-based generation, fast, no GPU needed)
+make run TARGET=1M17 MODE=production
 
-# Production mode: RDKit generation + Vina docking (default full pipeline)
-conda run -n base python orchestrator.py run data/processed/1M17.pdb --mode production
-
-# Pocket2Mol mode: autoregressive pocket-conditioned generation (requires pocket2mol_env)
-conda run -n base python orchestrator.py run data/processed/6P3D.pdb --mode pocket2mol
-
-# TargetDiff mode: diffusion-based generation (requires targetdiff_env)
-conda run -n base python orchestrator.py run data/processed/6P3D.pdb --mode targetdiff
-
-# Simulation mode: stub data, tests pipeline plumbing only
-conda run -n base python orchestrator.py run data/processed/1M17.pdb --mode simulation
+# Simulation (stub data, tests plumbing only)
+make run TARGET=1M17 MODE=simulation
 ```
 
-Each full pipeline run creates a unique campaign ID (e.g. `campaign_fd4fad48`) and writes outputs to `data/<campaign_id>/`.
+`TARGET` is the PDB stem; the file must exist at `data/processed/<TARGET>.pdb`. `MODE` is one of `simulation`, `production` (alias for `rdkit`), `rdkit`, `targetdiff`, or `pocket2mol`. Output lands in `data/campaign_<id>/`.
+
+### Full pipeline, cloud GPU
+
+For diffusion-based generation (TargetDiff), CPU is impractical (~12 min/mol). Use the cloud-run wrapper instead:
+
+```bash
+make cloud-run TARGET=2HYY MODE=targetdiff NUM=30
+```
+
+This provisions a RunPod GPU pod with the same Docker image, runs the full pipeline, syncs results to Cloudflare R2, and tears down the pod. Typical cost: ~$0.30 per run. See [`plan.md`](../autonomous_drug_discovery/plan.md#cloud-gpu-on-runpod-wrapped-in-a-script) for the architecture and `scripts/cloud_run.sh` for the implementation.
+
+### Syncing campaign results across machines
+
+```bash
+make pull       # download data/ from R2
+make push       # upload data/ to R2
+```
+
+R2 is the canonical store. Treat your local `data/` as a cache.
 
 ## Running Individual Stages
 
-You can run each stage independently. This is useful for re-running a single stage with different parameters or debugging.
+Each stage can be run independently against an existing manifest, useful for re-running with different parameters or debugging:
+
+```bash
+# Stage 1 — pocket detection
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+  orchestrator.py ingest data/processed/1M17.pdb
+
+# Stage 2 — generation
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+  orchestrator.py generate data/processed/1M17_manifest.json --mode rdkit
+
+# Stage 3 — screening
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+  orchestrator.py screen data/candidates/generated_molecules.sdf
+
+# Stage 4 — docking
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+  orchestrator.py dock data/processed/1M17_manifest.json --mode production
+
+# Stage 5 — ranking
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+  orchestrator.py rank data/results/docking_results.csv --screening_json data/screened/screening_report.json
+```
+
+These work the same way inside `make cloud-run` — the entrypoint is identical.
+
+## Stage Reference
 
 ### Stage 1: Pocket Detection
 
-Identifies binding pockets on the protein surface.
-
-```bash
-conda run -n base python orchestrator.py ingest data/processed/1M17.pdb
-```
-
 **Input:** `.pdb` file
-
-**Output:** `data/processed/{stem}_manifest.json` containing:
-- Pocket location (center coordinates)
-- Pocket score and probability
-- Path to pocket atom PDB file
-
-**Backend selection:** P2Rank is the default. To use fpocket, edit the `run_ingestion` call or run the module directly:
-
-```bash
-conda run -n base python modules/01_ingestion/run_pocket.py \
-  --pdb data/processed/1M17.pdb \
-  --output_dir data/processed \
-  --backend fpocket
-```
+**Output:** `data/processed/{stem}_manifest.json` with pocket location, score, probability, and pocket atom PDB path.
+**Backend:** P2Rank (ML-based, default). fpocket is a geometry-based fallback selectable via `--backend fpocket`.
 
 ### Stage 2: Molecule Generation
 
-Generates candidate molecules that fit the detected pocket.
-
-```bash
-# RDKit fragment-based (default for production mode)
-conda run -n base python orchestrator.py generate data/processed/1M17_manifest.json --mode rdkit
-
-# Pocket2Mol autoregressive (requires pocket2mol_env; see docs/pocket2mol-setup.md)
-conda run -n base python orchestrator.py generate data/processed/6P3D_manifest.json --mode pocket2mol
-
-# TargetDiff diffusion model (requires targetdiff_env; see docs/targetdiff-setup.md)
-conda run -n base python orchestrator.py generate data/processed/6P3D_manifest.json --mode targetdiff
-
-# Simulation stub
-conda run -n base python orchestrator.py generate data/processed/1M17_manifest.json --mode simulation
-```
-
 **Input:** `manifest.json` from Stage 1
+**Output:** `generated_molecules.sdf` with 3D coordinates
 
-**Output:** `generated_molecules.sdf` containing 100 molecules (default) with 3D coordinates
+**Backends:**
 
-**Parameters** (edit in `modules/02_generation/run_generation.py`, `DEFAULT_PARAMS`):
-- `num_samples`: number of molecules to generate (default: 100)
-- `seed`: random seed for reproducibility (default: 42)
-- `device`: `cpu` or `cuda` (default: `cpu`; used by TargetDiff / Pocket2Mol)
-- `sampling_steps`: denoising steps for TargetDiff (default: 1000)
-
-**Backend comparison:**
-
-| Mode | Paradigm | Speed (per molecule) | Pocket-aware | GPU needed? |
+| Mode | Paradigm | Speed (per mol) | Pocket-aware | GPU needed? |
 |---|---|---|---|---|
 | `rdkit` | Fragment combinatorial | ~10 ms | Size-only | No |
-| `pocket2mol` | Autoregressive GNN | ~7 s GPU / 1–3 min CPU | Yes (3D) | Recommended |
-| `targetdiff` | E(3)-equivariant diffusion | ~1 min GPU / ~12 min CPU | Yes (3D) | Strongly recommended |
+| `targetdiff` | E(3)-equivariant diffusion | ~30 s GPU / ~12 min CPU | Yes (3D) | Yes, in practice |
+| `pocket2mol` | Autoregressive GNN | ~7 s GPU | Yes (3D) | Yes, in practice |
 | `simulation` | Stub (single benzene) | instant | No | No |
+
+**Pocket2Mol is currently deferred.** Its pretrained checkpoint was hosted on a Google Drive folder that has since been deleted, and we never recovered a local copy. The mode is wired into the orchestrator but will fail without the checkpoint. See `plan.md` for the recovery plan.
+
+**Parameters** (edit in `modules/02_generation/run_generation.py`'s `_DEFAULT_PARAMS_BY_MODE`, or pass `--num_samples` to the orchestrator):
+- `num_samples`: number of molecules to generate (default varies per backend)
+- `seed`: random seed for reproducibility
+- `device`: `cpu` or `cuda` (used by TargetDiff / Pocket2Mol)
+- `sampling_steps`: denoising steps for TargetDiff (default 1000)
 
 ### Stage 3: Screening
 
-Filters molecules for drug-likeness, synthetic accessibility, and toxicity.
-
-```bash
-conda run -n base python orchestrator.py screen data/candidates/generated_molecules.sdf
-```
-
 **Input:** `.sdf` file from Stage 2
-
-**Output:**
-- `screened_molecules.sdf` — molecules that passed all filters
-- `screening_report.json` — per-molecule properties, pass/fail status, ADMET annotations
-- `run_metadata.json` — execution metadata
+**Output:** `screened_molecules.sdf` (survivors), `screening_report.json` (per-molecule properties + ADMET annotations + attrition).
 
 **Filters applied** (configurable in `modules/03_screening/default_scoring_config.json`):
 
 | Filter | Threshold | Rationale |
 |---|---|---|
-| Molecular weight | <= 500 | Lipinski Rule of Five |
-| LogP | <= 5 | Lipinski Rule of Five |
-| H-bond donors | <= 5 | Lipinski Rule of Five |
-| H-bond acceptors | <= 10 | Lipinski Rule of Five |
-| SA Score | <= 5.0 | Synthetic accessibility |
-| QED | >= 0.3 | Drug-likeness |
+| Molecular weight | ≤ 500 | Lipinski Rule of Five |
+| LogP | ≤ 5 | Lipinski Rule of Five |
+| H-bond donors | ≤ 5 | Lipinski Rule of Five |
+| H-bond acceptors | ≤ 10 | Lipinski Rule of Five |
+| SA Score | ≤ 5.0 | Synthetic accessibility |
+| QED | ≥ 0.3 | Drug-likeness |
 | PAINS | = 0 | No promiscuous substructures |
 
-ADMET-AI enrichment (104 properties) runs automatically on surviving molecules if installed.
+ADMET-AI enrichment (104 properties) runs automatically on surviving molecules.
 
-**Customizing filters:** edit `default_scoring_config.json`. Each entry in `filter_thresholds` maps a property name to `{"max": N}`, `{"min": N}`, or `{"equals": N}`. No code change required.
+**Note on current thresholds.** Survival rates are currently 73-98%, which is too loose for a useful candidate shortlist. Phase 1 of the plan tightens these to target 40-60% survival; Phase 2 calibrates them against expert input.
 
 ### Stage 4: Docking
 
-Estimates binding affinity of each molecule in the protein pocket.
-
-```bash
-conda run -n base python orchestrator.py dock data/processed/1M17_manifest.json --mode production
-```
-
-**Input:** `manifest.json` (for receptor + pocket center) and the screened SDF directory
-
-**Output:**
-- `docking_results.csv` — columns: `ligand_id, smiles, affinity` sorted by score
-- `docked_*.pdbqt` — best pose for each ligand
+**Input:** `manifest.json` (for receptor + pocket centre) and the screened SDF directory
+**Output:** `docking_results.csv` (sorted by affinity), `docked_*.pdbqt` (best pose per ligand)
 
 **Modes:**
-- `production` — full AutoDock Vina pipeline (PDB to PDBQT conversion, grid maps, exhaustive docking)
-- `triage` — fast SMILES-based docking via TDC Oracle
+- `production` — full AutoDock Vina pipeline (PDB to PDBQT, grid maps, exhaustive docking)
+- `triage` — fast SMILES-based docking via TDC Oracle (requires `pytdc`)
 - `simulation` — dummy scores for testing
 
 **Parameters** (edit in `modules/04_docking/run_docking.py`):
-
 ```python
 DEFAULT_PARAMS = {
     "exhaustiveness": 8,    # higher = more thorough, slower
     "num_modes": 9,         # binding poses to generate
     "energy_range": 3,      # kcal/mol range for pose clustering
-    "box_size": [20, 20, 20],  # docking grid size in Angstroms
+    "box_size": [20, 20, 20],  # docking grid size in Ångstroms
 }
 ```
 
-## Agent Planner (LLM-Driven)
+### Stage 5: Multi-criteria Ranking
 
-The agent planner wraps the pipeline in an LLM loop that can inspect outputs between stages and adapt strategy:
+**Input:** `docking_results.csv` + `screening_report.json`
+**Output:** `ranked_candidates.json`
+
+Combines docking score, ADMET profile, and (optionally) AiZynthFinder retrosynthetic feasibility into a composite score: `0.5 × docking + 0.3 × ADMET + 0.2 × synthesis`. AiZynth is currently a stubbed slot; populated on top-N candidates only.
+
+## Agent Planner (LLM-driven, experimental)
+
+`agent_planner.py` wraps the pipeline in an LLM loop that can inspect outputs between stages and adapt strategy:
 
 ```bash
 # Deterministic mode (no API key needed)
-conda run -n base python agent_planner.py --target data/processed/1M17.pdb --mode production
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+  agent_planner.py --target data/processed/1M17.pdb --mode production
 
-# With LLM adaptation (requires Gemini API key)
-DISCOVERY_LLM_API_KEY=your_key conda run -n base python agent_planner.py \
-  --target data/processed/1M17.pdb \
-  --mode production \
-  --max_iterations 5
+# With LLM adaptation
+docker run --rm -v $(pwd)/data:/app/data -e DISCOVERY_LLM_API_KEY ghcr.io/<you>/agent-harness \
+  agent_planner.py --target data/processed/1M17.pdb --mode production --max_iterations 5
 ```
 
-Without an API key, the agent planner falls back to running the deterministic pipeline in sequence.
+Without an API key the planner falls back to the deterministic pipeline. The full agent design (cascade + Bayesian recommender + Sonnet-in-the-loop + Obsidian) is Phase 3 of the plan.
 
 ## Validation and Benchmarking
 
-Three cancer targets with crystallographic ground truth are included in `data/processed/` (1M17, 2HYY, 6P3D). Run the benchmark comparison across all completed campaigns:
+Three cancer targets with crystallographic ground truth ship in `data/processed/` (1M17, 2HYY, 6P3D). The benchmark script compares all completed campaigns:
 
 ```bash
-conda run -n base python benchmark.py
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness benchmark.py
 ```
 
-For detailed validation results, experimental methodology, and what "good" looks like, see [testing-guide.md](testing-guide.md).
+For detailed validation results, see [testing-guide.md](testing-guide.md).
 
 ## Output Directory Structure
-
-When running the full pipeline (`orchestrator.py run`), outputs are organized per-campaign:
 
 ```
 data/
@@ -207,16 +201,15 @@ data/
   telemetry.db                   # Shared telemetry database
 ```
 
-When running individual stages via `orchestrator.py ingest/generate/screen/dock`, outputs go to the default shared directories (`data/candidates/`, `data/screened/`, `data/results/`).
+Per-stage invocations write to `data/candidates/`, `data/screened/`, `data/results/` instead (no campaign isolation). Use the full `make run` / `make cloud-run` path for proper isolation.
 
 ## Adding a New Target
 
-1. Obtain a PDB file for your protein of interest from the [RCSB PDB](https://www.rcsb.org/)
-2. Place it in `data/processed/`
+1. Obtain a PDB file from <https://www.rcsb.org/>.
+2. Place it in `data/processed/`.
 3. Run the pipeline:
+   ```bash
+   make run TARGET=<stem> MODE=production
+   ```
 
-```bash
-conda run -n base python orchestrator.py run data/processed/YOUR_TARGET.pdb --mode production
-```
-
-For best results, the PDB should contain a well-resolved structure (resolution < 3.0 A) of the protein in a relevant conformation. Co-crystal structures with a known ligand are ideal for validation.
+For best results the PDB should be well-resolved (<3.0 Å) in a relevant conformation. Co-crystal structures with a known ligand are ideal for validation.

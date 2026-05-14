@@ -90,9 +90,9 @@ The pipeline independently finds molecules scoring in the same range as known ap
 
 The roadmap is four phases. Each is a prerequisite for the next; we don't skip ahead. See [`autonomous_drug_discovery/plan.md`](../autonomous_drug_discovery/plan.md) for the detailed technical decomposition under each phase.
 
-### Phase 1 — Cloud GPU + more targets (deterministic pipeline)
+### Phase 1 — Containerise + cloud GPU + 20 quality results
 
-Recover the TargetDiff checkpoint, rebuild both deep-learning envs against PyTorch 2.4 / CUDA 12 (the pinned 2022-era envs don't run on Blackwell GPUs), spin up a $5-10 RunPod / Vast.ai session, and run the cascade across 5-10 oncology kinase targets — well-characterised, with crystal structures and known SAR. Output: a set of campaigns the dashboard can present per target. **No agent yet. No Sonnet. Just the deterministic five-stage pipeline running cleanly at scale.**
+Three intertwined deliverables: (a) ship the whole stack as a Docker image (envs + weights + binaries baked in, pushed to GHCR by CI); (b) wrap RunPod GPU rental in `make cloud-run` so heavy generation runs off-laptop; (c) generate, screen, dock, and rank ~30 TargetDiff molecules across five oncology kinases (1M17, 2HYY, 6P3D, KRAS G12C, JAK2), surfacing the top 20 in a GitHub-Pages-hosted dashboard. **No agent yet. No Sonnet. Just the deterministic five-stage pipeline running cleanly at scale, reproducibly, on either contributor's laptop.** TargetDiff and Pocket2Mol weights are mirrored to Hugging Face Hub since the upstream Google Drive folders are dead. Pocket2Mol stays deferred until its checkpoint is recovered. See [`autonomous_drug_discovery/plan.md`](../autonomous_drug_discovery/plan.md) for the full architecture and 7-day action plan.
 
 ### Phase 2 — Show the professor (M3, non-negotiable)
 
@@ -114,7 +114,7 @@ Quantify whether the Phase 3 agent loop produces measurably better candidates th
 
 If the lift is real and credible: this is the defensible case for non-dilutive grants or seed funding to scale targets, agent quality, and (eventually) wet-lab validation partnerships. If the lift is null: that result is also publishable and tells us where to invest next (better retrieval? better reward signal? more wet-lab grounding?). Reporting credible intervals — not point estimates — is the antidote to the BenevolentAI failure mode of investor-friendly numbers that don't survive peer review.
 
-### Recently completed (today's snapshot)
+### Recently completed (snapshot, 2026-05-11)
 
 - Wired TargetDiff and Pocket2Mol into the orchestrator (`--mode targetdiff` / `--mode pocket2mol`)
 - Per-campaign output directories (prevent file collisions)
@@ -122,13 +122,15 @@ If the lift is real and credible: this is the defensible case for non-dilutive g
 - Stage 5 (multi-criteria ranker) shipped — composite score = 0.5·docking + 0.3·ADMET + 0.2·synthesis
 - Multi-backend chemist dashboard (`dashboard/index.html`) with backend toggle, ADMET badges, and AiZynth route-tree viewer
 - Pocket2Mol patched (`models/maskfill.py`) so CPU mode works end-to-end on Blackwell hardware where the pinned PyTorch can't run on GPU
+- Fixed a long-standing `PYTHONPATH` bug in the TargetDiff wrapper that prevented end-to-end runs from a fresh shell (the `utils.misc` import failed unless `cwd` and `PYTHONPATH` both pointed at the TargetDiff repo)
+- Confirmed the TargetDiff and Pocket2Mol Google Drive checkpoint folders are permanently dead; Phase 1 mirrors them to Hugging Face Hub from the dev-box copy (only TargetDiff weights survived; Pocket2Mol weights need to be sourced from a collaborator)
 
 ### Medium-term (post-Phase 4)
 
 - AlphaFold / ESMFold integration for targets without crystal structures
 - Multi-pocket docking (top 3 pockets, not just best)
 - GNINA CNN-based rescoring alongside Vina
-- Docker / cloud-image distribution for reproducible deployment
+- Modal / Replicate migration so generation runs as a serverless function instead of a subprocess (Docker image stays the artefact; only the launcher changes)
 - Publishable methods paper (Journal of Cheminformatics or JCIM) — most defensible after Phase 4 has Bayesian evaluation data
 
 ## Strategic Positioning

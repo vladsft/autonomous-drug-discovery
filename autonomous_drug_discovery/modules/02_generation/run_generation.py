@@ -64,7 +64,7 @@ _DEFAULT_PARAMS_BY_MODE = {
     "simulation": {"num_samples": 1},
     "rdkit": {"num_samples": 100, "seed": 42},
     "targetdiff": {
-        "num_samples": 100,
+        "num_samples": 3,
         "sampling_steps": 1000,
         "noise_schedule": "polynomial_2",
         "batch_size": 16,
@@ -527,7 +527,17 @@ def run_generation_targetdiff(manifest, out_path, parameters):
         "--batch_size", str(parameters.get("batch_size", 16)),
     ]
 
-    subprocess.check_call(cmd, cwd=str(TARGETDIFF_REPO))
+    # The script does `import utils.misc` relative to the repo root, but
+    # Python sets sys.path[0] to the script's directory (scripts/), not cwd.
+    # Inject PYTHONPATH so the in-repo `utils/`, `models/`, `datasets/` packages
+    # are importable.
+    env = os.environ.copy()
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{TARGETDIFF_REPO}{os.pathsep}{existing_pp}" if existing_pp else str(TARGETDIFF_REPO)
+    )
+
+    subprocess.check_call(cmd, cwd=str(TARGETDIFF_REPO), env=env)
 
     # Consolidate individual SDF files into a single generated_molecules.sdf
     sdf_dir = td_result_path / "sdf"
