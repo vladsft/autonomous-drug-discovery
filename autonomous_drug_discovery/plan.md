@@ -245,7 +245,7 @@ Strict sequence. Each day's output is the next day's input. If anything cracks, 
 
 ### Day 1 — Foundations (4-5 hours)
 - [x] **Pin TargetDiff as a proper git submodule.** ✅ Done 2026-05-11 (commit on `main`). Submodule at `guanjq/targetdiff` SHA `142f1eb…`. Local NumPy-deprecation patches stored under `autonomous_drug_discovery/modules/02_generation/targetdiff_patches/` and re-applied by `scripts/apply_targetdiff_patches.sh` (idempotent). Fresh clones need `git submodule update --init --recursive && scripts/apply_targetdiff_patches.sh`.
-- [ ] **Create HF Hub org + upload weights.** `huggingface.co/<you>/agent-harness-weights`. Upload `pretrained_diffusion.pt` and `egnn_pdbbind_v2016.pt` from the dev box. ~30 min.
+- [x] **HF Hub weights mirror.** ✅ Done 2026-05-11. Public model repo: <https://huggingface.co/vladsft/agent-harness-weights>. Holds `pretrained_diffusion.pt`, `egnn_pdbbind_v2016.pt`, and `data/telemetry.db` (M1/M2 campaign history). Fetch with `hf download vladsft/agent-harness-weights <file> --local-dir <dest>`. This is the canonical weights source now that the upstream Google Drive folders are dead — the Dockerfile and any fresh setup pull from here.
 - [ ] **Skeleton `Dockerfile`** at repo root. Multi-stage from `nvidia/cuda:11.7.1-runtime-ubuntu22.04`. Miniconda, three envs (`env_orchestrator.yml`, `env_targetdiff.yml`, `env_docking.yml`), P2Rank tarball, weights from `huggingface-cli download`, then `scripts/apply_targetdiff_patches.sh` at the end of the build. `COPY . /app`, entrypoint. Local `docker build -t agent-harness:dev .` succeeds. ~3 hours.
 - [ ] **Smoke test:** `docker run agent-harness:dev orchestrator.py run data/processed/1M17.pdb --mode simulation` completes successfully. ~30 min.
 
