@@ -1,0 +1,91 @@
+# Builds the Agent Harness image, tests inside it, and publishes to GHCR.
+#
+# On a pull request: lint + build + test (no publish).
+# On a push to main: the above, then push `:latest` and `:<sha>` to GHCR —
+# so "what's tagged :latest" always equals "what's on main".
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      # Fail only on real errors (syntax, undefined names) — not style — so a
+      # fresh linter on a legacy codebase doesn't wall off the pipeline.
+      # Vendored submodules are third-party code; not ours to lint.
+      - name: ruff check
+        run: |
+          ruff check --select E9,F63,F7,F82 \
+            --exclude autonomous_drug_discovery/modules/02_generation/targetdiff \
+            --exclude autonomous_drug_discovery/modules/02_generation/pocket2mol \
+            --exclude data \
+            .
+
+  build:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load into the runner's daemon)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test inside the image
+        run: |
+          docker run --rm ${{ env.IMAGE }}:ci \
+            bash -lc 'cd /app && conda run --no-capture-output -n base \
+              python -m pytest -q autonomous_drug_discovery/tests'
+
+      # data/ is not baked into the image — mount the checked-out repo's copy,
+      # exactly as `make run` does. simulation mode still runs real P2Rank
+      # pocket detection on 1M17, so this exercises Stage 1 for real.
+      - name: Smoke test — full pipeline in simulation mode
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/autonomous_drug_discovery/data:/app/autonomous_drug_discovery/data \
+            ${{ env.IMAGE }}:ci \
+            orchestrator.py run data/processed/1M17.pdb --mode simulation
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker tag ${{ env.IMAGE }}:ci ${{ env.IMAGE }}:latest
+          docker tag ${{ env.IMAGE }}:ci ${{ env.IMAGE }}:${{ github.sha }}
+          docker push ${{ env.IMAGE }}:latest
+          docker push ${{ env.IMAGE }}:${{ github.sha }}

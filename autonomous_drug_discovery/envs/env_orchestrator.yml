@@ -18,6 +18,7 @@ dependencies:
   - pandas
   - scipy
   - pyyaml
+  - pytest          # test suite (make test / CI)
   - pip
   - pip:
     - molscore>=0.3
