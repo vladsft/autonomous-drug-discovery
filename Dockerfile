@@ -30,12 +30,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://rclone.org/install.sh | bash
 
 # --- Miniforge (conda + mamba, conda-forge as the default channel) -----------
+# Do NOT `conda clean` here: it wipes the package cache that base already
+# references (archspec etc.), and the next layer's mamba solve then fails with
+# "Cannot find a valid extracted directory cache". Cleaning happens once, after
+# the environments are built.
 RUN curl -fsSL -o /tmp/miniforge.sh \
         https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
     && bash /tmp/miniforge.sh -b -p ${CONDA_DIR} \
     && rm /tmp/miniforge.sh \
-    && conda config --set always_yes yes \
-    && conda clean -afy
+    && conda config --set always_yes yes
 
 # --- Conda environments ------------------------------------------------------
 # base           — orchestrator + every CPU stage: ingestion (P2Rank), RDKit
