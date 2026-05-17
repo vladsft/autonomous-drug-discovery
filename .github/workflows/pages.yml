@@ -1,0 +1,40 @@
+# Publishes the static chemist dashboard to GitHub Pages.
+#
+# Runs when dashboard/ changes on main (regenerate_dashboard.py rewrites
+# dashboard/professor_demo.js, you commit it, this deploys it) — so the
+# professor's URL always reflects the latest campaign data.
+#
+# One-time setup: repo Settings -> Pages -> Source = "GitHub Actions".
+
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths: ['dashboard/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race; the newest commit wins.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dashboard
+      - id: deploy
+        uses: actions/deploy-pages@v4
