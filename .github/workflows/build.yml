@@ -43,28 +43,23 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint
     steps:
-      # The CUDA base + two conda envs + weights make a ~7-8 GB image, and
-      # BuildKit needs roughly that again for working state + cache export.
-      # The runner's OS disk (/) is far too small for that; two steps fix it:
-      #   1. Reclaim the preinstalled toolchains we never use (~30 GB).
-      #   2. Relocate Docker's data-root onto /mnt — the large scratch disk
-      #      that ships nearly empty — so the build never touches the tight /.
+      # The image bundles a CUDA base + two conda envs + weights. Current
+      # GitHub runners have a single ~72 GB OS disk — no separate /mnt volume
+      # (an earlier fix moved Docker's data-root to /mnt, which silently put
+      # it right back on /). So instead: reclaim every preinstalled toolchain
+      # the build doesn't use. The image size itself is kept down by the
+      # CPU-only torch pin in env_orchestrator.yml.
       - name: Free up runner disk
         run: |
-          echo "--- disk before ---"; df -h
+          echo "--- disk before ---"; df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
                       /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache \
-                      /usr/local/lib/node_modules /opt/microsoft
+                      /usr/local/lib/node_modules /opt/microsoft /opt/az \
+                      /usr/lib/google-cloud-sdk /usr/share/miniconda \
+                      /usr/local/share/powershell /usr/local/share/chromium
           sudo apt-get clean
+          sudo docker image prune -af
           echo "--- disk after reclaim ---"; df -h /
-
-      - name: Move Docker onto the large /mnt disk
-        run: |
-          sudo systemctl stop docker.service docker.socket
-          sudo mkdir -p /mnt/docker
-          echo '{ "data-root": "/mnt/docker" }' | sudo tee /etc/docker/daemon.json
-          sudo systemctl start docker.service
-          docker info --format 'Docker data-root: {{.DockerRootDir}}'
 
       - uses: actions/checkout@v4
         with:
@@ -78,11 +73,9 @@ jobs:
           context: .
           load: true
           tags: ${{ env.IMAGE }}:ci
-          cache-from: type=gha
-          # mode=min, not max: this is a single-stage build, so there are no
-          # intermediate stages worth caching, and a max-mode export of a
-          # ~7-8 GB image overruns GitHub's 10 GB per-repo cache budget.
-          cache-to: type=gha,mode=min
+          # No GHA cache: exporting a cache copy of a multi-GB image next to
+          # the image itself overran the runner's single disk. Re-add later
+          # via registry cache once there is headroom to spare.
 
       - name: Test inside the image
         run: |

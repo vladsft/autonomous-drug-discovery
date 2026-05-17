@@ -24,6 +24,13 @@ dependencies:
   - pytest          # test suite (make test / CI)
   - pip
   - pip:
+    # CPU-only PyTorch. admet-ai (and molscore) otherwise pull the default
+    # CUDA build of torch, which drags in multi-GB nvidia-cu* runtime wheels
+    # that this env never uses — every stage that runs in `base` is CPU-only.
+    # The +cpu local-version tag outranks PyPI's CUDA wheel, so pip picks it;
+    # this both fixes the CI disk overrun and slims the published image.
+    - --extra-index-url https://download.pytorch.org/whl/cpu
+    - torch
     - molscore>=0.3
     - admet-ai>=1.0
     - meeko>=0.5
