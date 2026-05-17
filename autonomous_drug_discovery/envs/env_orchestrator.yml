@@ -10,7 +10,10 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python>=3.10
+  # Pinned to 3.11, not ">=3.10": the pip deps below (notably pytdc) have no
+  # 3.12/3.13 wheels, and an unpinned base env resolves to the newest Python,
+  # forcing a from-source NumPy build. 3.11 keeps everything on prebuilt wheels.
+  - python=3.11
   - rdkit
   - vina
   - openjdk=17          # Required for P2Rank pocket detection
