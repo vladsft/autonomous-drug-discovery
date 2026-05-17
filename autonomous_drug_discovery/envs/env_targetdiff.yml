@@ -1,4 +1,10 @@
-# TargetDiff Environment
+# TargetDiff Environment — cloud / Ampere variant (PyTorch 1.13 / CUDA 11.7).
+#
+# This is the env baked into the Docker image and used on RunPod's Ampere GPUs.
+# It does NOT run on NVIDIA Blackwell (RTX 50-series, sm_120) — for a local
+# Blackwell GPU use env_targetdiff_blackwell.yml instead. Both install under
+# the same conda env name, `targetdiff_env`; only the file differs, per machine.
+# See docs/pipeline-guide.md -> "Full pipeline, local GPU".
 
 name: targetdiff_env
 channels:

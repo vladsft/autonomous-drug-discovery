@@ -79,7 +79,7 @@ def run_ingestion(pdb_path, db_path, campaign_id, clean_pdb=False, pocket_backen
 
 
 def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
-                   output_dir=None, num_samples=None):
+                   output_dir=None, num_samples=None, device="auto"):
     """Run the generation module.
 
     Dispatches to the appropriate conda env based on `mode`:
@@ -87,6 +87,8 @@ def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
     `pocket2mol` → `pocket2mol_env`.
 
     `num_samples`, when set, overrides the per-mode default campaign size.
+    `device` ("auto"/"cuda"/"cpu") selects the compute device for the
+    GPU-capable backends; "auto" detects a GPU.
     """
     print(f"\n{'='*60}")
     print(f"[Orchestrator] Stage 2: GENERATION — mode={mode}")
@@ -112,6 +114,8 @@ def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
     ]
     if num_samples is not None:
         cmd += ["--num_samples", str(num_samples)]
+    if device:
+        cmd += ["--device", str(device)]
 
     try:
         subprocess.check_call(cmd)
@@ -187,8 +191,14 @@ def run_docking(manifest_path, db_path, campaign_id, mode="simulation",
         return False
 
 
-def run_ranking(docking_csv, screening_json, db_path, campaign_id, output_dir=None):
-    """Run the ranking module (multi-criteria final ranker)."""
+def run_ranking(docking_csv, screening_json, db_path, campaign_id, output_dir=None,
+                aizynth_config=None):
+    """Run the ranking module (multi-criteria final ranker).
+
+    `aizynth_config`, when set, points the ranker at an AiZynthFinder config so
+    the top-N candidates get retrosynthetic feasibility scores; otherwise the
+    synthesis term stays neutral.
+    """
     print(f"\n{'='*60}")
     print(f"[Orchestrator] Stage 5: RANKING")
     print(f"{'='*60}")
@@ -209,6 +219,8 @@ def run_ranking(docking_csv, screening_json, db_path, campaign_id, output_dir=No
     ]
     if screening_json:
         cmd += ["--screening_json", str(screening_json)]
+    if aizynth_config:
+        cmd += ["--aizynth_config", str(aizynth_config)]
 
     try:
         subprocess.check_call(cmd)
@@ -268,6 +280,9 @@ def main():
                             default="simulation", help="Execution mode")
     gen_parser.add_argument("--num_samples", type=int, default=None,
                             help="Number of molecules to generate (overrides the per-mode default)")
+    gen_parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                            help="Compute device for GPU-capable backends "
+                                 "(targetdiff/pocket2mol); 'auto' detects a GPU")
 
     # Screen command
     screen_parser = subparsers.add_parser("screen", help="Screen molecules through fast triage")
@@ -284,6 +299,9 @@ def main():
     rank_parser.add_argument("docking_csv", help="Path to docking_results.csv (Stage 4 output)")
     rank_parser.add_argument("--screening_json", default=None,
                              help="Optional screening_report.json for ADMET enrichment")
+    rank_parser.add_argument("--aizynth_config", default=os.environ.get("AIZYNTH_CONFIG"),
+                             help="AiZynthFinder config.yml — enables retrosynthetic "
+                                  "scoring of the top-N candidates (default: $AIZYNTH_CONFIG)")
 
     # Full Pipeline command
     pipeline_parser = subparsers.add_parser("run", help="Run full pipeline")
@@ -296,6 +314,12 @@ def main():
                                  help="Number of molecules to generate (overrides the per-mode default)")
     pipeline_parser.add_argument("--clean", action="store_true",
                                  help="Drop HETATM/waters/alt locs before detection")
+    pipeline_parser.add_argument("--aizynth_config", default=os.environ.get("AIZYNTH_CONFIG"),
+                                 help="AiZynthFinder config.yml — enables retrosynthetic "
+                                      "scoring in Stage 5 (default: $AIZYNTH_CONFIG)")
+    pipeline_parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                                 help="Compute device for GPU-capable generation "
+                                      "(targetdiff/pocket2mol); 'auto' detects a GPU")
 
     args = parser.parse_args()
 
@@ -316,7 +340,7 @@ def main():
     elif args.command == "generate":
         mode = getattr(args, "mode", "simulation")
         ok = run_generation(args.manifest, db_path, campaign_id, mode,
-                            num_samples=args.num_samples)
+                            num_samples=args.num_samples, device=args.device)
 
     elif args.command == "screen":
         ok = run_screening(args.input_sdf, db_path, campaign_id)
@@ -327,7 +351,8 @@ def main():
 
     elif args.command == "rank":
         ok = run_ranking(args.docking_csv, args.screening_json,
-                         db_path, campaign_id)
+                         db_path, campaign_id,
+                         aizynth_config=args.aizynth_config)
 
     elif args.command == "run":
         mode = getattr(args, "mode", "simulation")
@@ -358,7 +383,8 @@ def main():
         if ok:
             manifest_path = DATA_DIR / "processed" / f"{pdb_path.stem}_manifest.json"
             ok = run_generation(manifest_path, db_path, campaign_id, gen_mode,
-                                output_dir=gen_dir, num_samples=args.num_samples)
+                                output_dir=gen_dir, num_samples=args.num_samples,
+                                device=args.device)
         if ok:
             sdf_path = Path(gen_dir) / "generated_molecules.sdf"
             ok = run_screening(sdf_path, db_path, campaign_id,
@@ -371,7 +397,8 @@ def main():
             screening_json = Path(screen_dir) / "screening_report.json"
             ok = run_ranking(docking_csv,
                              screening_json if screening_json.exists() else None,
-                             db_path, campaign_id, output_dir=rank_dir)
+                             db_path, campaign_id, output_dir=rank_dir,
+                             aizynth_config=args.aizynth_config)
 
         print_campaign_summary(db_path, campaign_id)
     else:

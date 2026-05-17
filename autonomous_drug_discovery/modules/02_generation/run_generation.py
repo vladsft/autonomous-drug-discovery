@@ -90,6 +90,21 @@ def _default_params(mode: str) -> dict:
     return dict(_DEFAULT_PARAMS_BY_MODE.get(mode, _DEFAULT_PARAMS_BY_MODE["rdkit"]))
 
 
+def _resolve_device(requested):
+    """Resolve a device request to a concrete 'cuda' or 'cpu'.
+
+    'auto' (or None) picks 'cuda' when a usable GPU is visible, else 'cpu'.
+    An explicit 'cuda'/'cpu' is returned unchanged.
+    """
+    if requested not in (None, "auto"):
+        return requested
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
 # ---------------------------------------------------------------------------
 # Fragment library for RDKit-based generation
 # ---------------------------------------------------------------------------
@@ -729,7 +744,7 @@ def run_generation_pocket2mol(manifest, out_path, parameters):
 
 
 def run_generation(manifest_path, output_dir, mode="simulation",
-                   db_path=None, campaign_id=None, num_samples=None):
+                   db_path=None, campaign_id=None, num_samples=None, device="auto"):
     """Run molecule generation with full telemetry.
 
     Args:
@@ -739,6 +754,8 @@ def run_generation(manifest_path, output_dir, mode="simulation",
         db_path: Optional telemetry database path.
         campaign_id: Optional campaign identifier.
         num_samples: Optional override for the per-mode default campaign size.
+        device: Compute device for GPU-capable backends — "auto" (detect a
+            GPU), "cuda", or "cpu". Ignored by the CPU-only backends.
     """
     manifest_path = Path(manifest_path).resolve()
     out_path = Path(output_dir).resolve()
@@ -754,6 +771,14 @@ def run_generation(manifest_path, output_dir, mode="simulation",
     parameters = {**_default_params(mode), "mode": mode}
     if num_samples is not None:
         parameters["num_samples"] = num_samples
+    # Device selection. Only the pocket-conditioned backends carry a "device"
+    # default. An explicit --device always wins; a bare "auto" upgrades
+    # TargetDiff's legacy cpu default to the detected GPU, while Pocket2Mol
+    # keeps its intentional cpu default (its cu113 env predates Blackwell).
+    if device not in (None, "auto"):
+        parameters["device"] = device
+    elif mode == "targetdiff":
+        parameters["device"] = _resolve_device("auto")
     git_commit = _get_git_commit(TARGETDIFF_REPO) if TARGETDIFF_REPO.exists() else None
 
     db = None
@@ -841,10 +866,13 @@ def main():
     parser.add_argument("--campaign_id", default=None, help="Campaign ID for telemetry")
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Number of molecules to generate (overrides the per-mode default)")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                        help="Compute device for GPU-capable backends "
+                             "(targetdiff/pocket2mol); 'auto' detects a GPU")
     args = parser.parse_args()
 
     run_generation(args.manifest, args.output_dir, args.mode, args.db_path,
-                   args.campaign_id, num_samples=args.num_samples)
+                   args.campaign_id, num_samples=args.num_samples, device=args.device)
 
 
 if __name__ == "__main__":

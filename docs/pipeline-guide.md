@@ -38,6 +38,33 @@ make cloud-run TARGET=2HYY MODE=targetdiff NUM=30
 
 This provisions a RunPod GPU pod with the same Docker image, runs the full pipeline, syncs results to Cloudflare R2, and tears down the pod. Typical cost: ~$0.30 per run. See [`plan.md`](../autonomous_drug_discovery/plan.md#cloud-gpu-on-runpod-wrapped-in-a-script) for the architecture and `scripts/cloud_run.sh` for the implementation.
 
+The cloud image's `targetdiff_env` is PyTorch 1.13 / CUDA 11.7, which runs on RunPod's Ampere GPUs (RTX 3090 / A40) unchanged.
+
+### Full pipeline, local GPU (no Docker)
+
+TargetDiff diffusion can also run on a local NVIDIA GPU without Docker or RunPod — the orchestrator dispatches each stage straight into conda environments. This is the path to use when the cu117 Docker image cannot target your GPU, notably **NVIDIA Blackwell (RTX 50-series, `sm_120`)**.
+
+Pick the TargetDiff environment by GPU generation — both install under the conda env name `targetdiff_env`, only the file differs:
+
+| Local GPU | Env spec | PyTorch / CUDA |
+|---|---|---|
+| Ampere / Ada / Turing (RTX 20/30/40, A-series) | `envs/env_targetdiff.yml` | 1.13 / cu117 |
+| Blackwell (RTX 50-series, `sm_120`) | `envs/env_targetdiff_blackwell.yml` | 2.8 / cu128 |
+
+```bash
+# One-time setup
+conda env create -f autonomous_drug_discovery/envs/env_orchestrator.yml          # base
+conda env create -f autonomous_drug_discovery/envs/env_targetdiff_blackwell.yml  # or env_targetdiff.yml
+scripts/apply_targetdiff_patches.sh        # PyTorch 2.x + NumPy submodule patches
+
+# Run the full pipeline on the local GPU
+conda run -n base python autonomous_drug_discovery/orchestrator.py run \
+    autonomous_drug_discovery/data/processed/<TARGET>.pdb \
+    --mode targetdiff --device cuda --num_samples 30
+```
+
+`--device` accepts `auto` (default — detects a GPU), `cuda`, or `cpu`. P2Rank must also be installed locally (see Stage 1). The Docker image is unaffected; it keeps its cu117 environment for the cloud path.
+
 ### Syncing campaign results across machines
 
 ```bash
@@ -53,23 +80,23 @@ Each stage can be run independently against an existing manifest, useful for re-
 
 ```bash
 # Stage 1 — pocket detection
-docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discovery \
   orchestrator.py ingest data/processed/1M17.pdb
 
 # Stage 2 — generation
-docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discovery \
   orchestrator.py generate data/processed/1M17_manifest.json --mode rdkit
 
 # Stage 3 — screening
-docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discovery \
   orchestrator.py screen data/candidates/generated_molecules.sdf
 
 # Stage 4 — docking
-docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discovery \
   orchestrator.py dock data/processed/1M17_manifest.json --mode production
 
 # Stage 5 — ranking
-docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discovery \
   orchestrator.py rank data/results/docking_results.csv --screening_json data/screened/screening_report.json
 ```
 
@@ -100,9 +127,9 @@ These work the same way inside `make cloud-run` — the entrypoint is identical.
 **Pocket2Mol is currently deferred.** Its pretrained checkpoint was hosted on a Google Drive folder that has since been deleted, and we never recovered a local copy. The mode is wired into the orchestrator but will fail without the checkpoint. See `plan.md` for the recovery plan.
 
 **Parameters** (edit in `modules/02_generation/run_generation.py`'s `_DEFAULT_PARAMS_BY_MODE`, or pass `--num_samples` to the orchestrator):
-- `num_samples`: number of molecules to generate (default varies per backend)
+- `num_samples`: number of molecules to generate — pass `--num_samples` to the orchestrator
+- `device`: compute device for TargetDiff / Pocket2Mol — pass `--device auto|cpu|cuda` (`auto` detects a GPU)
 - `seed`: random seed for reproducibility
-- `device`: `cpu` or `cuda` (used by TargetDiff / Pocket2Mol)
 - `sampling_steps`: denoising steps for TargetDiff (default 1000)
 
 ### Stage 3: Screening
@@ -151,7 +178,7 @@ DEFAULT_PARAMS = {
 **Input:** `docking_results.csv` + `screening_report.json`
 **Output:** `ranked_candidates.json`
 
-Combines docking score, ADMET profile, and (optionally) AiZynthFinder retrosynthetic feasibility into a composite score: `0.5 × docking + 0.3 × ADMET + 0.2 × synthesis`. AiZynth is currently a stubbed slot; populated on top-N candidates only.
+Combines docking score, ADMET profile, and (optionally) AiZynthFinder retrosynthetic feasibility into a composite score: `0.5 × docking + 0.3 × ADMET + 0.2 × synthesis`. Pass `--aizynth_config <config.yml>` to score the top-N candidates with AiZynthFinder, which runs in the separate `aizynth_env` (`envs/env_aizynth.yml`); without it the synthesis term stays neutral and contributes a constant.
 
 ## Agent Planner (LLM-driven, experimental)
 
@@ -159,11 +186,11 @@ Combines docking score, ADMET profile, and (optionally) AiZynthFinder retrosynth
 
 ```bash
 # Deterministic mode (no API key needed)
-docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness \
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discovery \
   agent_planner.py --target data/processed/1M17.pdb --mode production
 
 # With LLM adaptation
-docker run --rm -v $(pwd)/data:/app/data -e DISCOVERY_LLM_API_KEY ghcr.io/<you>/agent-harness \
+docker run --rm -v $(pwd)/data:/app/data -e DISCOVERY_LLM_API_KEY ghcr.io/vladsft/autonomous-drug-discovery \
   agent_planner.py --target data/processed/1M17.pdb --mode production --max_iterations 5
 ```
 
@@ -174,7 +201,7 @@ Without an API key the planner falls back to the deterministic pipeline. The ful
 Three cancer targets with crystallographic ground truth ship in `data/processed/` (1M17, 2HYY, 6P3D). The benchmark script compares all completed campaigns:
 
 ```bash
-docker run --rm -v $(pwd)/data:/app/data ghcr.io/<you>/agent-harness benchmark.py
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discovery benchmark.py
 ```
 
 For detailed validation results, see [testing-guide.md](testing-guide.md).

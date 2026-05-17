@@ -1,0 +1,26 @@
+PyTorch 2.x compatibility for the pinned TargetDiff submodule.
+
+torch.load() defaults to weights_only=True from PyTorch 2.6 onward, which
+rejects TargetDiff's checkpoint: it pickles an EasyDict training-config object
+alongside the tensors, not a bare state dict. sample_for_pocket.py is the
+entrypoint the orchestrator's TargetDiff backend calls, so it must opt back
+into the full unpickler. The checkpoint is our own mirrored, trusted file
+(huggingface.co/vladsft/agent-harness-weights), so weights_only=False is safe.
+
+This patch is only needed by the Blackwell / cu128 local env (PyTorch 2.8);
+it is harmless on the cu117 Docker env (PyTorch 1.13 ignores the kwarg's
+modern default, and accepts it as an explicit argument).
+
+Applied by scripts/apply_targetdiff_patches.sh (idempotent).
+
+--- a/scripts/sample_for_pocket.py
++++ b/scripts/sample_for_pocket.py
+@@ -49,7 +49,7 @@
+     misc.seed_all(config.sample.seed)
+
+     # Load checkpoint
+-    ckpt = torch.load(config.model.checkpoint, map_location=args.device)
++    ckpt = torch.load(config.model.checkpoint, map_location=args.device, weights_only=False)
+     logger.info(f"Training Config: {ckpt['config']}")
+
+     # Transforms

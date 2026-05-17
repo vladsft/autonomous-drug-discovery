@@ -227,8 +227,12 @@ Current survival rates are 73-98% (target: 40-60%). The generator is over-produc
 ### Pocket2Mol checkpoint recovery (Phase 3 prep)
 The checkpoint is the one piece of state we cannot self-mirror — we never had a local copy. Path: open a polite issue on `pengxingang/Pocket2Mol` asking for a re-host; in parallel, ask anyone in our academic network who's run Pocket2Mol recently. Until recovered, Pocket2Mol stays out of the build.
 
-### Pocket2Mol + TargetDiff env rebuild for Blackwell (Phase 3+)
-Both envs (Pocket2Mol: pytorch 1.10 / cu113, TargetDiff: pytorch 1.13 / cu117) target pre-Blackwell architectures. If we want to run on an RTX 5060 (sm_120) or newer locally, we rebuild both on pytorch 2.4 / cu121 with matching PyG wheels from <https://data.pyg.org/whl/>. Trivial diagnostic: `python -c "import torch; x=torch.randn(2000,2000).cuda(); [x@x.T for _ in range(10)]; torch.cuda.synchronize(); print('ok')"` should return in <1 sec. Estimated 30-60 min per env, mostly conda babysitting. Not needed for Phase 1 (RunPod 3090 supports the existing CUDA 11.7 fine).
+### Pocket2Mol + TargetDiff env rebuild for Blackwell
+Both upstream envs (Pocket2Mol: pytorch 1.10 / cu113, TargetDiff: pytorch 1.13 / cu117) target pre-Blackwell architectures and cannot execute on an RTX 50-series GPU (sm_120) — CUDA 11.x ships no kernels for it.
+
+**TargetDiff — done.** `envs/env_targetdiff_blackwell.yml` rebuilds `targetdiff_env` on PyTorch 2.8 / CUDA 12.8 with prebuilt PyG wheels (`torch-scatter/cluster/sparse`) from <https://data.pyg.org/whl/> — no source compile needed. The submodule's PyTorch 2.x break (`torch.load` now defaults to `weights_only=True`) is handled by `targetdiff_patches/02-torch2-compat.patch`, and `run_generation.py` / `orchestrator.py` now take a `--device` flag that auto-detects the GPU. This is the **local-GPU** counterpart to the cloud path: the Docker image and RunPod keep the cu117 env (it runs fine on RunPod's Ampere GPUs); the cu128 env is the no-Docker path for a local Blackwell box. See `docs/pipeline-guide.md` → "Full pipeline, local GPU".
+
+**Pocket2Mol — still pending.** Its cu113 env has not been rebuilt; deferred with the rest of the Pocket2Mol work. Diagnostic that a rebuilt env works: `python -c "import torch; x=torch.randn(2000,2000).cuda(); [x@x.T for _ in range(10)]; torch.cuda.synchronize(); print('ok')"` should return in <1 s.
 
 ### GNINA rescoring (post-Phase 2)
 Add GNINA CNN-based rescoring alongside Vina. Needs GPU; download binary from <https://github.com/gnina/gnina/releases>. Only worthwhile after screening is properly calibrated and we have evidence Vina's r=0.4-0.6 correlation is the limiting factor.
