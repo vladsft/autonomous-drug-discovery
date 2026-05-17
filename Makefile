@@ -52,11 +52,13 @@ bootstrap: ## One-time setup: pull the image, check rclone + credentials
 build: ## Build the Docker image locally (CI builds the canonical one)
 	docker build -t $(IMAGE) $(REPO_ROOT)
 
+# pull/push source .env so host rclone picks up the RCLONE_CONFIG_R2_* vars —
+# one credentials file drives both `make` and the cloud pod.
 pull: ## Download campaign data + telemetry from Cloudflare R2
-	rclone copy --progress $(R2_REMOTE) $(DATA_DIR)
+	set -a; . $(REPO_ROOT)/.env; set +a; rclone copy --progress $(R2_REMOTE) $(DATA_DIR)
 
 push: ## Upload local campaign data + telemetry to Cloudflare R2
-	rclone copy --progress $(DATA_DIR) $(R2_REMOTE)
+	set -a; . $(REPO_ROOT)/.env; set +a; rclone copy --progress $(DATA_DIR) $(R2_REMOTE)
 
 run: ## Run the full pipeline locally (TARGET=, MODE=, NUM=, GPU=1)
 	$(DOCKER_RUN) $(IMAGE) \
@@ -79,7 +81,7 @@ deploy: dashboard ## Regenerate the dashboard, then hand off to CI for Pages
 
 logs: ## Tail a campaign's logs from R2 (make logs CAMPAIGN=campaign_xxxx)
 	@test -n "$(CAMPAIGN)" || { echo "Set CAMPAIGN=campaign_xxxx"; exit 1; }
-	rclone cat $(R2_REMOTE)/$(CAMPAIGN)/run.log
+	set -a; . $(REPO_ROOT)/.env; set +a; rclone cat $(R2_REMOTE)/$(CAMPAIGN)/run.log
 
 clean: ## Remove local campaign outputs and Python cruft
 	rm -rf $(DATA_DIR)/campaign_* $(DATA_DIR)/candidates $(DATA_DIR)/screened $(DATA_DIR)/results
