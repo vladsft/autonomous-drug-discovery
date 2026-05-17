@@ -43,15 +43,28 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint
     steps:
-      # GitHub runners ship ~14 GB free; two CUDA/PyTorch conda envs need more.
-      # Reclaim ~25 GB of preinstalled toolchains we don't use.
+      # The CUDA base + two conda envs + weights make a ~7-8 GB image, and
+      # BuildKit needs roughly that again for working state + cache export.
+      # The runner's OS disk (/) is far too small for that; two steps fix it:
+      #   1. Reclaim the preinstalled toolchains we never use (~30 GB).
+      #   2. Relocate Docker's data-root onto /mnt — the large scratch disk
+      #      that ships nearly empty — so the build never touches the tight /.
       - name: Free up runner disk
         run: |
+          echo "--- disk before ---"; df -h
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-                      /usr/local/.ghcup /usr/share/swift \
-                      /opt/hostedtoolcache/CodeQL
-          sudo docker image prune -af
-          df -h /
+                      /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache \
+                      /usr/local/lib/node_modules /opt/microsoft
+          sudo apt-get clean
+          echo "--- disk after reclaim ---"; df -h /
+
+      - name: Move Docker onto the large /mnt disk
+        run: |
+          sudo systemctl stop docker.service docker.socket
+          sudo mkdir -p /mnt/docker
+          echo '{ "data-root": "/mnt/docker" }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker.service
+          docker info --format 'Docker data-root: {{.DockerRootDir}}'
 
       - uses: actions/checkout@v4
         with:
@@ -66,7 +79,10 @@ jobs:
           load: true
           tags: ${{ env.IMAGE }}:ci
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # mode=min, not max: this is a single-stage build, so there are no
+          # intermediate stages worth caching, and a max-mode export of a
+          # ~7-8 GB image overruns GitHub's 10 GB per-repo cache budget.
+          cache-to: type=gha,mode=min
 
       - name: Test inside the image
         run: |
