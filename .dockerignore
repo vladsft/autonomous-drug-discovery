@@ -1,0 +1,30 @@
+# Build-context exclusions. Keeps the image lean and reproducible: code +
+# env specs go in, mutable state and large binaries stay out.
+
+# Top-level git metadata (the TargetDiff submodule's own .git file is kept —
+# apply_targetdiff_patches.sh needs it).
+.git
+.gitattributes
+
+# Mutable state — provided at run time via the mounted data/ volume / R2.
+autonomous_drug_discovery/data/
+data/
+
+# Model weights — re-fetched from the HF Hub inside the Dockerfile.
+*.pt
+*.ckpt
+
+# Pocket2Mol is excluded from Phase 1 (TargetDiff only).
+autonomous_drug_discovery/modules/02_generation/pocket2mol/
+
+# Python / tooling cruft.
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.ipynb_checkpoints/
+.ruff_cache/
+
+# Local-only artefacts.
+reports/
+*.log
+.env
