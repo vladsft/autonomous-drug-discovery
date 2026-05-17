@@ -79,12 +79,14 @@ def run_ingestion(pdb_path, db_path, campaign_id, clean_pdb=False, pocket_backen
 
 
 def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
-                   output_dir=None):
+                   output_dir=None, num_samples=None):
     """Run the generation module.
 
     Dispatches to the appropriate conda env based on `mode`:
     RDKit/simulation stay in `base`, `targetdiff` → `targetdiff_env`,
     `pocket2mol` → `pocket2mol_env`.
+
+    `num_samples`, when set, overrides the per-mode default campaign size.
     """
     print(f"\n{'='*60}")
     print(f"[Orchestrator] Stage 2: GENERATION — mode={mode}")
@@ -108,6 +110,8 @@ def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
         "--campaign_id", campaign_id,
         "--mode", mode,
     ]
+    if num_samples is not None:
+        cmd += ["--num_samples", str(num_samples)]
 
     try:
         subprocess.check_call(cmd)
@@ -262,6 +266,8 @@ def main():
     gen_parser.add_argument("manifest", help="Path to ingestion manifest.json")
     gen_parser.add_argument("--mode", choices=["simulation", "rdkit", "targetdiff", "pocket2mol", "production"],
                             default="simulation", help="Execution mode")
+    gen_parser.add_argument("--num_samples", type=int, default=None,
+                            help="Number of molecules to generate (overrides the per-mode default)")
 
     # Screen command
     screen_parser = subparsers.add_parser("screen", help="Screen molecules through fast triage")
@@ -286,6 +292,8 @@ def main():
                                  default="simulation", help="Execution mode")
     pipeline_parser.add_argument("--backend", choices=["p2rank", "fpocket"], default="p2rank",
                                  help="Pocket detection backend (default: p2rank)")
+    pipeline_parser.add_argument("--num_samples", type=int, default=None,
+                                 help="Number of molecules to generate (overrides the per-mode default)")
     pipeline_parser.add_argument("--clean", action="store_true",
                                  help="Drop HETATM/waters/alt locs before detection")
 
@@ -307,7 +315,8 @@ def main():
 
     elif args.command == "generate":
         mode = getattr(args, "mode", "simulation")
-        ok = run_generation(args.manifest, db_path, campaign_id, mode)
+        ok = run_generation(args.manifest, db_path, campaign_id, mode,
+                            num_samples=args.num_samples)
 
     elif args.command == "screen":
         ok = run_screening(args.input_sdf, db_path, campaign_id)
@@ -349,7 +358,7 @@ def main():
         if ok:
             manifest_path = DATA_DIR / "processed" / f"{pdb_path.stem}_manifest.json"
             ok = run_generation(manifest_path, db_path, campaign_id, gen_mode,
-                                output_dir=gen_dir)
+                                output_dir=gen_dir, num_samples=args.num_samples)
         if ok:
             sdf_path = Path(gen_dir) / "generated_molecules.sdf"
             ok = run_screening(sdf_path, db_path, campaign_id,

@@ -20,12 +20,12 @@
     }
   ],
   "filter_thresholds": {
-    "desc_MolWt": {"max": 500, "reason": "Lipinski Rule of Five: MW <= 500"},
+    "desc_MolWt": {"max": 450, "reason": "Lead-like MW <= 450 (tightened from Lipinski's 500 to leave headroom for lead-optimisation growth)"},
     "desc_MolLogP": {"max": 5, "reason": "Lipinski Rule of Five: LogP <= 5"},
     "desc_NumHBD": {"max": 5, "reason": "Lipinski Rule of Five: HBD <= 5"},
     "desc_NumHBA": {"max": 10, "reason": "Lipinski Rule of Five: HBA <= 10"},
-    "desc_SAScore": {"max": 5.0, "reason": "Synthetic Accessibility <= 5.0"},
-    "desc_QED": {"min": 0.3, "reason": "QED Drug-likeness >= 0.3"},
+    "desc_SAScore": {"max": 4.5, "reason": "Synthetic Accessibility <= 4.5 (tightened from 5.0 to discard hard-to-synthesise scaffolds)"},
+    "desc_QED": {"min": 0.5, "reason": "QED Drug-likeness >= 0.5 (tightened from 0.3; first-pass Phase 1 guess, re-calibrated against expert input in Phase 2)"},
     "filter_PAINS": {"equals": 0, "reason": "No PAINS structural alerts"}
   }
 }

@@ -729,7 +729,7 @@ def run_generation_pocket2mol(manifest, out_path, parameters):
 
 
 def run_generation(manifest_path, output_dir, mode="simulation",
-                   db_path=None, campaign_id=None):
+                   db_path=None, campaign_id=None, num_samples=None):
     """Run molecule generation with full telemetry.
 
     Args:
@@ -738,6 +738,7 @@ def run_generation(manifest_path, output_dir, mode="simulation",
         mode: "simulation", "rdkit", or "targetdiff".
         db_path: Optional telemetry database path.
         campaign_id: Optional campaign identifier.
+        num_samples: Optional override for the per-mode default campaign size.
     """
     manifest_path = Path(manifest_path).resolve()
     out_path = Path(output_dir).resolve()
@@ -751,6 +752,8 @@ def run_generation(manifest_path, output_dir, mode="simulation",
         manifest = json.load(f)
 
     parameters = {**_default_params(mode), "mode": mode}
+    if num_samples is not None:
+        parameters["num_samples"] = num_samples
     git_commit = _get_git_commit(TARGETDIFF_REPO) if TARGETDIFF_REPO.exists() else None
 
     db = None
@@ -836,9 +839,12 @@ def main():
                         default="simulation", help="Execution mode")
     parser.add_argument("--db_path", default=None, help="Path to telemetry database")
     parser.add_argument("--campaign_id", default=None, help="Campaign ID for telemetry")
+    parser.add_argument("--num_samples", type=int, default=None,
+                        help="Number of molecules to generate (overrides the per-mode default)")
     args = parser.parse_args()
 
-    run_generation(args.manifest, args.output_dir, args.mode, args.db_path, args.campaign_id)
+    run_generation(args.manifest, args.output_dir, args.mode, args.db_path,
+                   args.campaign_id, num_samples=args.num_samples)
 
 
 if __name__ == "__main__":
