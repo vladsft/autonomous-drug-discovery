@@ -23,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # --- OS packages -------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl wget ca-certificates bzip2 procps unzip build-essential \
+        git curl wget ca-certificates bzip2 procps unzip build-essential patch \
     && rm -rf /var/lib/apt/lists/*
 
 # rclone — used by cloud runs to sync campaign outputs to Cloudflare R2.
