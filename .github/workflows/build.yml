@@ -43,6 +43,16 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint
     steps:
+      # GitHub runners ship ~14 GB free; two CUDA/PyTorch conda envs need more.
+      # Reclaim ~25 GB of preinstalled toolchains we don't use.
+      - name: Free up runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /usr/share/swift \
+                      /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h /
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
