@@ -171,38 +171,45 @@ LINKERS = [
 
 
 def run_generation_simulation(manifest, out_path, parameters):
-    """Simulation mode: generate a stub SDF for pipeline testing."""
+    """Simulation mode: emit a few lead-like stub molecules for pipeline testing.
+
+    The stubs are deliberately lead-sized and chemically sane (approved drugs)
+    so they survive the Stage-3 lead-like screening floor and let the smoke
+    test exercise docking + ranking too. A bare benzene stub would be filtered
+    out at screening, leaving the rest of the pipeline untested.
+    """
     print("[Generation] (SIMULATION MODE) Generating stub molecules...")
 
     simulated_mol = out_path / "generated_molecules.sdf"
     out_path.mkdir(parents=True, exist_ok=True)
 
-    sdf_content = """
-     RDKit          3D
+    if not HAS_RDKIT:
+        raise ImportError("RDKit is required for simulation-mode stub generation.")
 
-  6  6  0  0  0  0  0  0  0  0999 V2000
-    1.2124    0.7000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-    1.2124   -0.7000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-    0.0000   -1.4000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-   -1.2124   -0.7000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-   -1.2124    0.7000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-    0.0000    1.4000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-  1  2  2  0
-  2  3  1  0
-  3  4  2  0
-  4  5  1  0
-  5  6  2  0
-  6  1  1  0
-M  END
->  <molecule_id>
-mol_0000
+    # Lead-sized, chemically sane reference molecules (approved drugs): each
+    # clears the default screening thresholds (MW 250-450, 18-35 heavy atoms).
+    stub_smiles = [
+        "CN1C(=O)CN=C(c2ccccc2)c2cc(Cl)ccc21",    # diazepam
+        "CC(=O)CC(c1ccccc1)c1c(O)c2ccccc2oc1=O",  # warfarin
+        "CC(C)NCC(O)COc1cccc2ccccc12",            # propranolol
+    ]
+    writer = Chem.SDWriter(str(simulated_mol))
+    written = 0
+    for i, smi in enumerate(stub_smiles):
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        mol = Chem.AddHs(mol)
+        if AllChem.EmbedMolecule(mol, randomSeed=42) != 0:
+            continue
+        mol = Chem.RemoveHs(mol)
+        mol.SetProp("molecule_id", f"mol_{i:04d}")
+        mol.SetProp("_Name", f"mol_{i:04d}")
+        writer.write(mol)
+        written += 1
+    writer.close()
 
-$$$$
-"""
-    with open(simulated_mol, "w") as f:
-        f.write(sdf_content)
-
-    print(f"[Generation] Stub SDF written to {simulated_mol}")
+    print(f"[Generation] Stub SDF ({written} molecules) written to {simulated_mol}")
     return str(simulated_mol)
 
 
