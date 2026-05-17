@@ -20,12 +20,23 @@
     }
   ],
   "filter_thresholds": {
-    "desc_MolWt": {"max": 450, "reason": "Lead-like MW <= 450 (tightened from Lipinski's 500 to leave headroom for lead-optimisation growth)"},
+    "desc_MolWt": {"min": 250, "max": 450, "reason": "Lead-like MW window 250-450. Lower bound rejects fragments that dock well per-atom but are not leads; upper bound (tightened from Lipinski's 500) leaves headroom for lead-optimisation growth."},
+    "desc_NumHeavyAtoms": {"min": 18, "max": 35, "reason": "Lead-like heavy-atom window 18-35. The lower bound is the key fragment filter: rigid small aromatics (biphenyl ~12, naphthalene ~10) score deceptively well in Vina because affinity scales with size. A generator that under-produces size will mostly fail this — that is the intended signal, not a bug."},
     "desc_MolLogP": {"max": 5, "reason": "Lipinski Rule of Five: LogP <= 5"},
     "desc_NumHBD": {"max": 5, "reason": "Lipinski Rule of Five: HBD <= 5"},
     "desc_NumHBA": {"max": 10, "reason": "Lipinski Rule of Five: HBA <= 10"},
     "desc_SAScore": {"max": 4.5, "reason": "Synthetic Accessibility <= 4.5 (tightened from 5.0 to discard hard-to-synthesise scaffolds)"},
     "desc_QED": {"min": 0.5, "reason": "QED Drug-likeness >= 0.5 (tightened from 0.3; first-pass Phase 1 guess, re-calibrated against expert input in Phase 2)"},
-    "filter_PAINS": {"equals": 0, "reason": "No PAINS structural alerts"}
-  }
+    "filter_PAINS": {"equals": 0, "reason": "No PAINS structural alerts"},
+    "filter_ChemicalSanity": {"equals": 0, "reason": "No non-physical / unstable substructures. Catches the chemically dubious graphs (allenes, ketenes, strained heteroatom rings) that generative models emit and that RDKit sanitisation alone lets through."}
+  },
+  "chemical_sanity_smarts": [
+    {"name": "cumulated_double_bonds", "smarts": "*=*=*", "reason": "Allene / cumulene — almost never a viable drug substructure when emitted by a generator."},
+    {"name": "ketene", "smarts": "[CX2]=[CX1]=[OX1]", "reason": "Ketene — highly reactive, not isolable."},
+    {"name": "carbon_dioxide_like", "smarts": "[OX1]=[CX2]=[OX1]", "reason": "CO2-like cumulated carbonyl."},
+    {"name": "triple_bond_in_ring", "smarts": "[R]#[R]", "reason": "Triple bond inside a ring — non-physical for ordinary ring sizes."},
+    {"name": "all_heteroatom_three_ring", "smarts": "[#7,#8,#16]1[#7,#8,#16][#7,#8,#16]1", "reason": "Three-membered ring of all heteroatoms — unstable."},
+    {"name": "geminal_polyol", "smarts": "[CX4]([OX2H])([OX2H])[OX2H]", "reason": "Orthoester-like / unstable geminal polyol."},
+    {"name": "nitrogen_double_to_halogen", "smarts": "[#7]=[F,Cl,Br,I]", "reason": "Non-physical N=halogen double bond."}
+  ]
 }

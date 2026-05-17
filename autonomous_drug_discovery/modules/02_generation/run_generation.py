@@ -64,12 +64,19 @@ _DEFAULT_PARAMS_BY_MODE = {
     "simulation": {"num_samples": 1},
     "rdkit": {"num_samples": 100, "seed": 42},
     "targetdiff": {
-        "num_samples": 3,
+        # Diffusion validity is low and the new lead-like screening floor
+        # (heavy-atom / MW minimums) rejects undersized output, so generate a
+        # real batch — a default of 3 leaves nothing to be selective with.
+        "num_samples": 20,
         "sampling_steps": 1000,
         "noise_schedule": "polynomial_2",
         "batch_size": 16,
         "device": "cpu",
         "seed": 2021,
+        # How TargetDiff picks each ligand's atom count. "prior" samples from a
+        # learned size prior conditioned on the pocket; "range" sweeps sizes
+        # across a batch; "ref" copies a reference ligand's count (needs one).
+        "sample_num_atoms": "prior",
     },
     "pocket2mol": {
         "num_samples": 1,
@@ -506,6 +513,14 @@ def run_generation_targetdiff(manifest, out_path, parameters):
 
     # Generate a sampling config YAML for this run
     num_samples = parameters.get("num_samples", 100)
+    # sample_num_atoms must be one TargetDiff understands; an unknown value
+    # would be silently mishandled upstream, so validate and fall back here.
+    _VALID_NUM_ATOMS = {"prior", "range", "ref"}
+    sample_num_atoms = parameters.get("sample_num_atoms", "prior")
+    if sample_num_atoms not in _VALID_NUM_ATOMS:
+        print(f"[Generation] Unknown sample_num_atoms='{sample_num_atoms}'; "
+              f"falling back to 'prior'. Valid: {sorted(_VALID_NUM_ATOMS)}")
+        sample_num_atoms = "prior"
     sampling_config = out_path / "sampling_config.yml"
     import yaml
     config_data = {
@@ -518,7 +533,7 @@ def run_generation_targetdiff(manifest, out_path, parameters):
             "num_steps": parameters.get("sampling_steps", 1000),
             "pos_only": False,
             "center_pos_mode": "protein",
-            "sample_num_atoms": "prior",
+            "sample_num_atoms": sample_num_atoms,
         },
     }
     with open(sampling_config, "w") as f:
@@ -584,6 +599,15 @@ def run_generation_targetdiff(manifest, out_path, parameters):
                 writer.write(mol)
                 mol_count += 1
     writer.close()
+
+    # Guard: TargetDiff can write SDF files that contain no RDKit-parsable
+    # molecules (every record failed sanitisation). An empty consolidated SDF
+    # would let screening/docking "succeed" on nothing — fail loudly instead.
+    if mol_count == 0:
+        raise RuntimeError(
+            f"TargetDiff produced {len(individual_sdfs)} SDF file(s) but none "
+            f"contained a valid molecule. Generation yielded nothing usable."
+        )
 
     print(f"[Generation] {mol_count} molecules consolidated from {len(individual_sdfs)} TargetDiff outputs")
     print(f"[Generation] Output: {output_sdf}")

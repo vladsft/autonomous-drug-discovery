@@ -64,6 +64,31 @@ DEFAULT_PARAMS = {
     "box_size": [20, 20, 20],
 }
 
+# Metal ions worth keeping in the receptor: for metalloenzymes (e.g. the
+# cap-snatching endonuclease) the catalytic metals ARE the pharmacophore, and
+# stripping them as "ligands" guts the binding site. Keyed by element symbol;
+# value is the AutoDock atom type.
+_RECEPTOR_METALS = {
+    "MG": "Mg", "MN": "Mn", "ZN": "Zn", "CA": "Ca", "FE": "Fe",
+    "NA": "Na", "K": "K", "CO": "Co", "NI": "Ni", "CU": "Cu",
+}
+
+
+def _receptor_pdb_from_manifest(manifest: dict) -> Path:
+    """Resolve the receptor PDB to dock against.
+
+    Prefers the dedicated `receptor_pdb` key (set by ingestion — this is the
+    cleaned structure when --clean was used), falling back to `input_pdb` for
+    manifests written before that field existed.
+    """
+    receptor = manifest.get("receptor_pdb") or manifest.get("input_pdb")
+    if not receptor:
+        raise ValueError("Manifest has neither 'receptor_pdb' nor 'input_pdb'.")
+    path = Path(receptor)
+    if not path.exists():
+        raise FileNotFoundError(f"Receptor PDB {path} not found.")
+    return path
+
 
 # ---------------------------------------------------------------------------
 # Mode: Simulation
@@ -122,9 +147,7 @@ def run_docking_triage(manifest, candidates_dir, out_path, parameters, db=None, 
               "use --mode production for real docking without PyTDC.")
         return run_docking_simulation(manifest, candidates_dir, out_path, parameters, db, run_id)
 
-    receptor_pdb = Path(manifest.get("input_pdb"))
-    if not receptor_pdb.exists():
-        raise FileNotFoundError(f"Receptor PDB {receptor_pdb} not found.")
+    receptor_pdb = _receptor_pdb_from_manifest(manifest)
 
     # Find candidate SDF
     sdf_file = _find_candidates_sdf(candidates_dir)
@@ -204,9 +227,7 @@ def run_docking_production(manifest, candidates_dir, out_path, parameters, db=No
             missing.append("rdkit")
         raise ImportError(f"Production docking requires: {', '.join(missing)}")
 
-    receptor_pdb = Path(manifest.get("input_pdb"))
-    if not receptor_pdb.exists():
-        raise FileNotFoundError(f"Receptor PDB {receptor_pdb} not found.")
+    receptor_pdb = _receptor_pdb_from_manifest(manifest)
 
     sdf_file = _find_candidates_sdf(candidates_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -216,7 +237,8 @@ def run_docking_production(manifest, candidates_dir, out_path, parameters, db=No
     # 1. Prepare receptor ONCE.
     receptor_pdbqt = out_path / f"{receptor_pdb.stem}_receptor.pdbqt"
     print(f"[Docking] Preparing receptor PDBQT for {receptor_pdb.name}...")
-    _prepare_receptor_pdbqt(receptor_pdb, receptor_pdbqt)
+    n_receptor_atoms = _prepare_receptor_pdbqt(receptor_pdb, receptor_pdbqt)
+    print(f"[Docking] Receptor PDBQT: {n_receptor_atoms} atoms.")
 
     # 2. Box center: prefer ingestion's pre-computed centroid.
     if manifest.get("best_pocket_center"):
@@ -225,7 +247,12 @@ def run_docking_production(manifest, candidates_dir, out_path, parameters, db=No
         box_center = _compute_pocket_centroid(manifest["best_pocket"])
     else:
         raise ValueError("Manifest has neither best_pocket_center nor best_pocket.")
-    box_size = parameters.get("box_size", [20, 20, 20])
+    # Box size: scale to the actual pocket extent rather than a fixed cube, so a
+    # small pocket isn't given room for ligands to drift and a large one isn't
+    # truncated. Falls back to the configured default if the pocket PDB is absent.
+    box_size = _pocket_box_size(manifest.get("best_pocket"),
+                                parameters.get("box_size", [20, 20, 20]))
+    parameters["box_size"] = box_size
     print(f"[Docking] Box center: {box_center}, size: {box_size}")
 
     # 3. Create Vina instance and load receptor + maps ONCE.
@@ -275,6 +302,19 @@ def run_docking_production(manifest, candidates_dir, out_path, parameters, db=No
     # Sort by affinity (most negative = best)
     scored = [r for r in results if r["affinity"] is not None]
     scored.sort(key=lambda r: r["affinity"])
+
+    # Guard: real docking always produces a spread of affinities. If every
+    # ligand scored identically (classically all 0.0 — an empty/garbage
+    # receptor), the run is invalid; fail loudly instead of writing a CSV of
+    # noise that downstream ranking would treat as real.
+    if len(scored) >= 2:
+        spread = max(r["affinity"] for r in scored) - min(r["affinity"] for r in scored)
+        if spread < 1e-6:
+            raise RuntimeError(
+                f"All {len(scored)} ligands docked to an identical affinity "
+                f"({scored[0]['affinity']}). This indicates a broken receptor "
+                f"or grid setup, not a real result — refusing to report it."
+            )
 
     results_file = out_path / "docking_results.csv"
     with open(results_file, "w", newline="") as f:
@@ -389,16 +429,51 @@ def _autodock_type(atom_name: str, residue_name: str, element: str) -> str:
     return el
 
 
-def _prepare_receptor_pdbqt(receptor_pdb, output_pdbqt):
+def _pdbqt_atom_line(serial, name, resname, chain, resnum, x, y, z, charge, ad_type):
+    """Format one PDBQT ATOM record."""
+    return (
+        f"ATOM  {serial:5d} {name:<4s} {resname:>3s} "
+        f"{chain:1s}{resnum:4d}    "
+        f"{x:8.3f}{y:8.3f}{z:8.3f}{1.00:6.2f}{0.00:6.2f}    "
+        f"{charge:+6.3f} {ad_type:<2s}"
+    )
+
+
+def _prepare_receptor_pdbqt(receptor_pdb, output_pdbqt) -> int:
     """Convert receptor PDB to PDBQT with AutoDock atom typing + basic charges.
 
-    Waters, ligands, and non-standard residues are stripped. Alt-loc atoms
-    other than A/blank are skipped. Charges are zero for uncharged atoms and
-    integer-valued on classic charged side chains (ASP/GLU/LYS/ARG).
+    Waters and organic ligands are stripped, but catalytic metal ions are
+    deliberately KEPT — for a metalloenzyme the metals are part of the binding
+    site, and discarding them silently changes the docking problem. Alt-loc
+    atoms other than A/blank are skipped. Charges are zero for uncharged atoms
+    and integer-valued on classic charged side chains (ASP/GLU/LYS/ARG).
+
+    Returns the number of ATOM records written, and raises RuntimeError if that
+    is zero — an empty receptor produces meaningless (typically all-0.0)
+    docking scores, so it must fail loudly here rather than downstream.
+
+    Note: this does not add hydrogens or compute Gasteiger charges. For
+    publication-grade work, pre-protonate the structure (pdb2pqr / reduce);
+    this routine is a dependency-light approximation, not a substitute.
     """
     import gemmi
 
     structure = gemmi.read_structure(str(receptor_pdb))
+
+    # Collect catalytic metal ions BEFORE remove_ligands_and_waters() drops them.
+    metals = []
+    if len(structure) > 0:
+        for chain in structure[0]:
+            for residue in chain:
+                resname = residue.name.strip().upper()
+                if resname not in _RECEPTOR_METALS:
+                    continue
+                for atom in residue:
+                    metals.append((chain.name, residue.seqid.num, resname, atom))
+    if metals:
+        print(f"[Docking] Keeping {len(metals)} metal ion(s) in the receptor: "
+              f"{sorted({m[2] for m in metals})}")
+
     structure.remove_ligands_and_waters()
 
     lines = [
@@ -406,31 +481,77 @@ def _prepare_receptor_pdbqt(receptor_pdb, output_pdbqt):
         "REMARK                            x       y       z     vdW  Elec       q    Type",
         "REMARK                         _______ _______ _______ _____ _____    ______ ____",
     ]
+    n_atoms = 0
 
-    for model in structure:
-        for chain in model:
+    if len(structure) > 0:
+        for chain in structure[0]:  # first model only (NMR ensembles)
             for residue in chain:
                 for atom in residue:
                     # Skip alt-loc atoms that aren't the primary one.
-                    alt = (atom.altloc or "").strip()
+                    # gemmi >=0.7 reports "no altloc" as a NUL byte ("\x00"),
+                    # which str.strip() does not remove — drop it explicitly so
+                    # ordinary atoms aren't mistaken for secondary alt-locs.
+                    alt = (atom.altloc or "").replace("\x00", "").strip()
                     if alt and alt.upper() != "A":
                         continue
-                    x, y, z = atom.pos.x, atom.pos.y, atom.pos.z
                     element = atom.element.name.strip()
                     ad_type = _autodock_type(atom.name, residue.name, element)
-                    charge = _CHARGED_ATOMS.get((residue.name, atom.name.strip().upper()), 0.0)
-                    line = (
-                        f"ATOM  {atom.serial:5d} {atom.name:<4s} {residue.name:>3s} "
-                        f"{chain.name:1s}{residue.seqid.num:4d}    "
-                        f"{x:8.3f}{y:8.3f}{z:8.3f}{1.00:6.2f}{0.00:6.2f}    "
-                        f"{charge:+6.3f} {ad_type:<2s}"
-                    )
-                    lines.append(line)
-        break  # only the first model (NMR ensembles)
+                    charge = _CHARGED_ATOMS.get(
+                        (residue.name, atom.name.strip().upper()), 0.0)
+                    lines.append(_pdbqt_atom_line(
+                        atom.serial, atom.name, residue.name, chain.name,
+                        residue.seqid.num, atom.pos.x, atom.pos.y, atom.pos.z,
+                        charge, ad_type))
+                    n_atoms += 1
+
+    # Re-append the metal ions with their formal charge and element AD type.
+    for chain_name, resnum, resname, atom in metals:
+        ad_type = _RECEPTOR_METALS[resname]
+        lines.append(_pdbqt_atom_line(
+            atom.serial, atom.name, resname, chain_name, resnum,
+            atom.pos.x, atom.pos.y, atom.pos.z, 2.0, ad_type))
+        n_atoms += 1
+
     lines.append("END")
+
+    if n_atoms == 0:
+        raise RuntimeError(
+            f"Receptor preparation produced 0 atoms from {receptor_pdb}. "
+            "The PDBQT would be empty and every ligand would score 0.0 — "
+            "check the input structure and gemmi parsing."
+        )
 
     with open(output_pdbqt, "w") as f:
         f.write("\n".join(lines) + "\n")
+    return n_atoms
+
+
+def _pocket_box_size(pocket_pdb, default, padding=8.0, lo=16.0, hi=30.0):
+    """Vina box dimensions scaled to the pocket's atomic extent.
+
+    Returns [x, y, z] = per-axis span of the pocket atoms + `padding`, each
+    clamped to [lo, hi]. Falls back to `default` when the pocket PDB is missing
+    or unreadable so docking never breaks on box sizing.
+    """
+    if not pocket_pdb or not Path(pocket_pdb).exists():
+        return list(default)
+    xs, ys, zs = [], [], []
+    try:
+        with open(pocket_pdb) as f:
+            for line in f:
+                if line.startswith(("ATOM", "HETATM")):
+                    xs.append(float(line[30:38]))
+                    ys.append(float(line[38:46]))
+                    zs.append(float(line[46:54]))
+    except (ValueError, OSError):
+        return list(default)
+    if not xs:
+        return list(default)
+    box = []
+    for axis in (xs, ys, zs):
+        span = (max(axis) - min(axis)) + padding
+        box.append(round(min(hi, max(lo, span)), 1))
+    return box
 
 
 def _prepare_ligand_pdbqt(mol):

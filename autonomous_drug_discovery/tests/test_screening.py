@@ -59,14 +59,22 @@ def _smiles_to_sdf(smiles_list, output_path):
 # Known test molecules
 # ---------------------------------------------------------------------------
 
-# Aspirin (should pass all filters)
+# Aspirin — a small approved drug (MW 180). Note: it is intentionally *below*
+# the lead-like MW/heavy-atom floor in the default config, so it no longer
+# passes the default triage (the floor exists to reject fragment-sized output).
 ASPIRIN = "CC(=O)Oc1ccccc1C(=O)O"
 
-# Caffeine (should pass)
+# Caffeine (small, MW 194)
 CAFFEINE = "Cn1c(=O)c2c(ncn2C)n(C)c1=O"
 
-# Ibuprofen (should pass)
+# Ibuprofen (small, MW 206)
 IBUPROFEN = "CC(C)Cc1ccc(cc1)C(C)C(=O)O"
+
+# Lead-like approved drugs — sized within the default config's 250-450 MW /
+# 18-35 heavy-atom window, so they should survive the default triage.
+WARFARIN = "CC(=O)CC(c1ccccc1)c1c(O)c2ccccc2oc1=O"
+DIAZEPAM = "CN1C(=O)CN=C(c2ccccc2)c2cc(Cl)ccc21"
+PROPRANOLOL = "CC(C)NCC(O)COc1cccc2ccccc12"
 
 # Very large molecule (should fail Lipinski MW > 500)
 LARGE_MOL = "CC(=O)Oc1ccc(cc1)C(=O)NCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
@@ -84,7 +92,7 @@ class TestScreeningBackend:
     """Test that a screening backend is available and selected."""
 
     def test_backend_selected(self):
-        assert screening_module.BACKEND in ("molscore", "rdkit_fallback")
+        assert screening_module.BACKEND in ("molscore", "rdkit")
 
 
 class TestMolScoreScreening:
@@ -97,10 +105,8 @@ class TestMolScoreScreening:
         smiles_list = [ASPIRIN]
         config = {"filter_thresholds": {}}
 
-        if screening_module.BACKEND == "molscore":
-            results = screening_module._screen_with_molscore(mols, smiles_list, config)
-        else:
-            results = screening_module._screen_with_rdkit_fallback(mols, smiles_list, config)
+        results = screening_module._screen_molecules(
+            mols, smiles_list, config, screening_module.BACKEND)
 
         assert len(results) == 1
         r = results[0]
@@ -118,10 +124,8 @@ class TestMolScoreScreening:
         smiles_list = [None]
         config = {"filter_thresholds": {}}
 
-        if screening_module.BACKEND == "molscore":
-            results = screening_module._screen_with_molscore(mols, smiles_list, config)
-        else:
-            results = screening_module._screen_with_rdkit_fallback(mols, smiles_list, config)
+        results = screening_module._screen_molecules(
+            mols, smiles_list, config, screening_module.BACKEND)
 
         assert len(results) == 1
         assert results[0]["passed"] is False
@@ -140,10 +144,8 @@ class TestMolScoreScreening:
         smiles_list = [LARGE_MOL]
         config = {"filter_thresholds": {"desc_MolWt": {"max": 500}}}
 
-        if screening_module.BACKEND == "molscore":
-            results = screening_module._screen_with_molscore(mols, smiles_list, config)
-        else:
-            results = screening_module._screen_with_rdkit_fallback(mols, smiles_list, config)
+        results = screening_module._screen_molecules(
+            mols, smiles_list, config, screening_module.BACKEND)
 
         assert results[0]["passed"] is False
         assert "desc_MolWt" in results[0]["eliminated_by"]
@@ -158,39 +160,50 @@ class TestMolScoreScreening:
         smiles_list = [LIPOPHILIC]
         config = {"filter_thresholds": {"desc_MolLogP": {"max": 5}}}
 
-        if screening_module.BACKEND == "molscore":
-            results = screening_module._screen_with_molscore(mols, smiles_list, config)
-        else:
-            results = screening_module._screen_with_rdkit_fallback(mols, smiles_list, config)
+        results = screening_module._screen_molecules(
+            mols, smiles_list, config, screening_module.BACKEND)
 
         assert results[0]["passed"] is False
         assert "desc_MolLogP" in results[0]["eliminated_by"]
 
-    def test_aspirin_passes_default_config(self):
-        """Aspirin should pass the default scoring config."""
-        mol = Chem.MolFromSmiles(ASPIRIN)
+    def test_lead_like_drug_passes_default_config(self):
+        """A lead-sized approved drug should pass the default scoring config."""
+        mol = Chem.MolFromSmiles(DIAZEPAM)
         mols = [mol]
-        smiles_list = [ASPIRIN]
+        smiles_list = [DIAZEPAM]
 
         cfg_path = screening_module.DEFAULT_CONFIG
         with open(cfg_path) as f:
             config = json.load(f)
 
-        if screening_module.BACKEND == "molscore":
-            results = screening_module._screen_with_molscore(mols, smiles_list, config)
-        else:
-            results = screening_module._screen_with_rdkit_fallback(mols, smiles_list, config)
+        results = screening_module._screen_molecules(
+            mols, smiles_list, config, screening_module.BACKEND)
 
         assert results[0]["passed"] is True
+
+    def test_fragment_rejected_by_size_floor(self):
+        """A fragment-sized drug (aspirin) is rejected by the lead-like floor."""
+        mol = Chem.MolFromSmiles(ASPIRIN)
+        cfg_path = screening_module.DEFAULT_CONFIG
+        with open(cfg_path) as f:
+            config = json.load(f)
+
+        results = screening_module._screen_molecules(
+            [mol], [ASPIRIN], config, screening_module.BACKEND)
+
+        assert results[0]["passed"] is False
+        # The lower MW / heavy-atom bound is what should fire.
+        assert any("MolWt" in v or "NumHeavyAtoms" in v
+                   for v in results[0]["violations"])
 
 
 class TestFullScreeningPipeline:
     """Integration tests for the full screening pipeline."""
 
     def test_known_drugs_pass(self, work_dir):
-        """Known drug molecules should survive all filters."""
+        """Lead-sized known drugs should survive all default filters."""
         sdf_path = work_dir / "input.sdf"
-        _smiles_to_sdf([ASPIRIN, CAFFEINE, IBUPROFEN], sdf_path)
+        _smiles_to_sdf([WARFARIN, DIAZEPAM, PROPRANOLOL], sdf_path)
 
         output_dir = work_dir / "output"
         total_in, total_passed, report_path = screening_module.run_screening(
@@ -198,7 +211,7 @@ class TestFullScreeningPipeline:
         )
 
         assert total_in == 3
-        assert total_passed >= 2  # At least 2 of 3 known drugs should pass
+        assert total_passed >= 2  # At least 2 of 3 lead-like drugs should pass
 
         # Verify report
         with open(report_path) as f:

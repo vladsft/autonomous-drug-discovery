@@ -42,6 +42,20 @@ PROJECT_ROOT = MODULE_DIR.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 from telemetry import TelemetryDB
 
+try:
+    from rdkit import Chem
+    HAS_RDKIT = True
+except ImportError:
+    HAS_RDKIT = False
+
+# Lead-like heavy-atom window for the size-desirability factor. Vina affinity
+# scales with molecule size, so a raw docking score rewards fragments. The
+# docking sub-score is multiplied by a trapezoidal factor that is 1.0 inside
+# [SIZE_PLATEAU_LO, SIZE_PLATEAU_HI] and ramps to 0 outside [SIZE_MIN, SIZE_MAX]
+# — a 12-heavy-atom biphenyl that slipped past screening earns almost no
+# docking credit even if its raw affinity looks strong.
+SIZE_MIN, SIZE_PLATEAU_LO, SIZE_PLATEAU_HI, SIZE_MAX = 12.0, 20.0, 35.0, 50.0
+
 
 DEFAULT_WEIGHTS = {
     "docking": 0.5,      # binding affinity (kcal/mol, more negative = better)
@@ -63,13 +77,19 @@ def _load_docking_results(csv_path: Path) -> list[dict]:
 
 
 def _load_screening_report(json_path: Path) -> dict[str, dict]:
-    """Return SMILES → screening record (incl. ADMET annotations)."""
+    """Return SMILES → screening record (incl. ADMET annotations).
+
+    Stage 3 writes survivors under the `survivors` key (each a flat dict of
+    `smiles` + `desc_*` / `admet_*` properties). Older drafts used `molecules`;
+    both are accepted so a stale report doesn't silently drop ADMET data.
+    """
     if not json_path.exists():
         return {}
     with open(json_path) as f:
         report = json.load(f)
+    entries = report.get("survivors") or report.get("molecules") or []
     by_smiles = {}
-    for entry in report.get("molecules", []):
+    for entry in entries:
         smi = entry.get("smiles")
         if smi:
             by_smiles[smi] = entry
@@ -79,19 +99,46 @@ def _load_screening_report(json_path: Path) -> dict[str, dict]:
 def _admet_score(screening_record: dict) -> float:
     """Composite ADMET score in [0, 1]; higher = safer.
 
-    Uses ADMET-AI flags when present. Returns 0.5 (neutral) when ADMET data
-    is missing — i.e. unscreened molecules don't get penalised, but they
-    also don't earn safety credit they haven't proven.
+    Reads the flat `admet_hERG` / `admet_AMES` / `admet_DILI` toxicity
+    probabilities that Stage 3 stamps onto each survivor (higher prob = more
+    toxic, so safety = 1 - prob). Returns 0.5 (neutral) when ADMET data is
+    missing — unscreened molecules aren't penalised, but they don't earn
+    safety credit they haven't proven either.
     """
-    admet = screening_record.get("admet") if screening_record else None
-    if not admet:
+    if not screening_record:
         return 0.5
     risks = []
-    for key in ("hERG", "AMES", "DILI"):
-        v = admet.get(key)
+    for key in ("admet_hERG", "admet_AMES", "admet_DILI"):
+        v = screening_record.get(key)
         if isinstance(v, (int, float)):
             risks.append(1.0 - float(v))
     return sum(risks) / len(risks) if risks else 0.5
+
+
+def _heavy_atom_count(smiles: str) -> int | None:
+    """Heavy-atom count from SMILES, or None if RDKit is unavailable / parse fails."""
+    if not HAS_RDKIT or not smiles:
+        return None
+    mol = Chem.MolFromSmiles(smiles)
+    return mol.GetNumHeavyAtoms() if mol is not None else None
+
+
+def _size_desirability(heavy_atoms: int | None) -> float:
+    """Trapezoidal lead-like size factor in [0, 1].
+
+    1.0 inside the plateau, linearly ramping to 0 at SIZE_MIN / SIZE_MAX.
+    Unknown size (RDKit unavailable) returns 1.0 — no penalty without evidence.
+    """
+    if heavy_atoms is None:
+        return 1.0
+    ha = float(heavy_atoms)
+    if ha <= SIZE_MIN or ha >= SIZE_MAX:
+        return 0.0
+    if ha < SIZE_PLATEAU_LO:
+        return (ha - SIZE_MIN) / (SIZE_PLATEAU_LO - SIZE_MIN)
+    if ha > SIZE_PLATEAU_HI:
+        return (SIZE_MAX - ha) / (SIZE_MAX - SIZE_PLATEAU_HI)
+    return 1.0
 
 
 def _run_aizynth(candidates: list[dict], aizynth_config: str,
@@ -171,15 +218,26 @@ def rank_candidates(
     best, worst = min(affinities), max(affinities)
 
     # Pass 1 — docking + ADMET for every candidate.
+    # The docking sub-score is the raw-affinity normalisation scaled by a
+    # lead-like size factor, so a fragment that docks well per-atom cannot
+    # out-rank a properly sized lead with comparable affinity.
     partials = []
     for r in rows:
         smiles = r.get("smiles", "")
         affinity = float(r["affinity"])
+        heavy_atoms = _heavy_atom_count(smiles)
+        size_factor = _size_desirability(heavy_atoms)
+        dock_raw = _normalise_docking(affinity, best, worst)
+        ligand_eff = (round(-affinity / heavy_atoms, 4)
+                      if heavy_atoms else None)
         partials.append({
             "ligand_id": r.get("ligand_id"),
             "smiles": smiles,
             "affinity": affinity,
-            "dock": _normalise_docking(affinity, best, worst),
+            "heavy_atoms": heavy_atoms,
+            "ligand_efficiency": ligand_eff,
+            "size_factor": round(size_factor, 4),
+            "dock": dock_raw * size_factor,
             "admet": _admet_score(screening.get(smiles, {})),
         })
 
@@ -232,6 +290,9 @@ def rank_candidates(
             "ligand_id": p["ligand_id"],
             "smiles": p["smiles"],
             "docking_affinity": p["affinity"],
+            "heavy_atoms": p["heavy_atoms"],
+            "ligand_efficiency": p["ligand_efficiency"],
+            "size_factor": p["size_factor"],
             "scores": {"docking": p["dock"], "admet": p["admet"], "synthesis": synth},
             "combined_score": combined,
             "synthesis_status": status,

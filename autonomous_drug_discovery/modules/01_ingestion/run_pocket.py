@@ -253,6 +253,10 @@ def run_p2rank(pdb_file, output_dir, db_path=None, campaign_id=None, clean=False
         manifest = {
             "input_pdb": str(pdb_path),
             "run_pdb": str(run_pdb),
+            # receptor_pdb is what downstream docking should use: the cleaned
+            # structure when --clean was applied, else the original. Keeping it
+            # distinct from input_pdb means cleaning actually reaches docking.
+            "receptor_pdb": str(run_pdb),
             "pocket_backend": "p2rank",
             "p2rank_out_dir": str(p2rank_out),
             "pockets_found": len(pockets),
@@ -427,6 +431,9 @@ def run_fpocket(pdb_file, output_dir, db_path=None, campaign_id=None, clean=Fals
         manifest = {
             "input_pdb": str(pdb_path),
             "run_pdb": str(target_pdb_path),
+            # receptor_pdb: the structure downstream docking should use (cleaned
+            # when --clean was applied, else the staged copy).
+            "receptor_pdb": str(target_pdb_path),
             "pocket_backend": "fpocket",
             "fpocket_out_dir": str(out_folder_path),
             "pockets_found": len(pockets),

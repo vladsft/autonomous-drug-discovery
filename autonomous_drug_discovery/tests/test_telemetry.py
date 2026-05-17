@@ -103,7 +103,12 @@ class TestRunLifecycle:
         run_id = db.start_run("campaign_1", "02_generation", "/in.json", params)
         runs = db.query_runs()
         stored_params = json.loads(runs[0]["parameters"])
-        assert stored_params == params
+        # start_run also stamps an "_env" provenance block; the caller's own
+        # parameters must round-trip unchanged alongside it.
+        assert "_env" in stored_params
+        assert stored_params["_env"].get("python")
+        caller_params = {k: v for k, v in stored_params.items() if k != "_env"}
+        assert caller_params == params
 
     def test_git_commit_stored(self, db):
         run_id = db.start_run(
