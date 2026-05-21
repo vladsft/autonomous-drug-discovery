@@ -23,9 +23,11 @@ without synthesis annotations — the dashboard still loads.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -74,16 +76,18 @@ def latest_successful_campaign(
         return None
     conn = sqlite3.connect(str(db_path))
     try:
-        # Match the manifest by stem-prefix so both `<TARGET>_manifest.json`
-        # and per-pocket variants like `<TARGET>_pocket2_manifest.json` count.
+        # Match the manifest by stem so both `<TARGET>_manifest.json` and
+        # per-pocket variants like `<TARGET>_pocket2_manifest.json` count.
+        # Two LIKE patterns instead of one with a wildcard in the middle —
+        # otherwise `target="1M1"` would false-match `1M17_manifest.json`.
         rows = conn.execute(
             """SELECT campaign_id, parameters
                FROM runs
                WHERE module_name = '02_generation'
                  AND status = 'success'
-                 AND input_path LIKE ?
+                 AND (input_path LIKE ? OR input_path LIKE ?)
                ORDER BY started_at DESC""",
-            (f"%/{target}%_manifest.json",),
+            (f"%/{target}_manifest.json", f"%/{target}_pocket%_manifest.json"),
         ).fetchall()
     finally:
         conn.close()
@@ -129,10 +133,21 @@ def discover_aizynth(data_dir: Path, backend: str, campaign_id: str) -> Path | N
     return None
 
 
-def _build_empty_aizynth(tmp_path: Path) -> Path:
-    """Write a sentinel empty AiZynth file so build_demo_dataset can be reused."""
-    tmp_path.write_text("[]")
-    return tmp_path
+@contextlib.contextmanager
+def _campaign_base(data_dir: Path):
+    """Temporarily repoint build_demo_dataset.CAMPAIGN_BASE.
+
+    `bdd` is hard-coded to read campaigns under autonomous_drug_discovery/data;
+    we point it at whichever data dir the caller asked for, then restore. The
+    restore-on-exit is what makes this safe to call repeatedly inside tests
+    that use distinct tmp directories.
+    """
+    previous = bdd.CAMPAIGN_BASE
+    bdd.CAMPAIGN_BASE = data_dir
+    try:
+        yield
+    finally:
+        bdd.CAMPAIGN_BASE = previous
 
 
 def assemble(
@@ -147,37 +162,31 @@ def assemble(
         print(f"[regen] telemetry.db not found at {db_path}", file=sys.stderr)
         return 1
 
-    # The campaign data lives under data/, but bdd is hard-coded to look
-    # under autonomous_drug_discovery/data — repoint it at the actual dir.
-    bdd.CAMPAIGN_BASE = data_dir
-
     backends_data: dict[str, dict] = {}
     insertion_order: list[str] = []
-    empty_path = data_dir / ".empty_aizynth.json"
-    empty_built = False
 
-    for backend in backends_requested:
-        cid = latest_successful_campaign(db_path, target, backend)
-        if cid is None:
-            print(f"[regen] no successful {backend} campaign for {target}; skipping")
-            continue
-        az_path = discover_aizynth(data_dir, backend, cid)
-        if az_path is None:
-            if not empty_built:
-                _build_empty_aizynth(empty_path)
-                empty_built = True
-            az_path = empty_path
-        print(f"[regen] {backend}: campaign={cid} aizynth={az_path.name}")
-        try:
-            backends_data[backend] = bdd.build_backend_dataset(
-                backend, cid, az_path, max_molecules=max_per_backend
-            )
-            insertion_order.append(backend)
-        except FileNotFoundError as e:
-            print(f"[regen] {backend}: skipped — {e}", file=sys.stderr)
+    with _campaign_base(data_dir):
+        # Sentinel empty-aizynth file lives in a private tempdir, not under
+        # data_dir, so it can never collide with a real campaign file.
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="regen_dash_") as tmp:
+            empty_path = Path(tmp) / "empty_aizynth.json"
+            empty_path.write_text("[]")
 
-    if empty_built:
-        empty_path.unlink(missing_ok=True)
+            for backend in backends_requested:
+                cid = latest_successful_campaign(db_path, target, backend)
+                if cid is None:
+                    print(f"[regen] no successful {backend} campaign for {target}; skipping")
+                    continue
+                az_path = discover_aizynth(data_dir, backend, cid) or empty_path
+                print(f"[regen] {backend}: campaign={cid} aizynth={az_path.name}")
+                try:
+                    backends_data[backend] = bdd.build_backend_dataset(
+                        backend, cid, az_path, max_molecules=max_per_backend
+                    )
+                    insertion_order.append(backend)
+                except FileNotFoundError as e:
+                    print(f"[regen] {backend}: skipped — {e}", file=sys.stderr)
 
     if not backends_data:
         print(f"[regen] no usable campaigns for target {target}", file=sys.stderr)
@@ -188,9 +197,7 @@ def assemble(
     })
     doc = {
         "target": {"pdb": target, **meta},
-        "generated_at": __import__("datetime").datetime.now(
-            __import__("datetime").timezone.utc
-        ).isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "pipeline": {
             "screening_backend": "MolScore + ADMET-AI (104 properties)",
             "docking_backend": "AutoDock Vina (production)",

@@ -16,9 +16,11 @@
 set -euo pipefail
 
 # Allow `bash`/`sh` as a first arg to drop into a shell without --entrypoint.
+# We shift the shell name off so it isn't doubled as an arg to itself.
 case "${1:-}" in
     bash|sh)
-        exec conda run --no-capture-output -n base "$@"
+        shell="$1"; shift
+        exec conda run --no-capture-output -n base "${shell}" "$@"
         ;;
 esac
 

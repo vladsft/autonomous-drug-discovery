@@ -27,6 +27,7 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,6 +48,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: lint
+    # Image build is ~24 min on a cold runner; 60 min leaves headroom for a
+    # slow mamba solve without burning the free-tier 6h job ceiling on a hang.
+    timeout-minutes: 60
     steps:
       # The image bundles a CUDA base + two conda envs + weights. Current
       # GitHub runners have a single ~72 GB OS disk — no separate /mnt volume
@@ -81,6 +85,14 @@ jobs:
           # No GHA cache: exporting a cache copy of a multi-GB image next to
           # the image itself overran the runner's single disk. Re-add later
           # via registry cache once there is headroom to spare.
+
+      - name: Entrypoint smoke — bash branch
+        # The entrypoint's `bash|sh` case is easy to break and silently regresses
+        # interactive shells (`docker run --rm <image> bash -lc '…'`). One-line
+        # check that the branch still routes through `conda run -n base`.
+        run: |
+          out="$(docker run --rm ${{ env.IMAGE }}:ci bash -lc 'echo entrypoint-ok')"
+          test "${out}" = "entrypoint-ok" || { echo "entrypoint regression: got '${out}'"; exit 1; }
 
       - name: Test inside the image
         run: |

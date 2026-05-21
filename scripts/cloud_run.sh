@@ -35,6 +35,10 @@ MODE="${MODE:-targetdiff}"
 NUM="${NUM:-}"
 IMAGE="${IMAGE:?IMAGE not set}"
 GPU_TYPE="${RUNPOD_GPU_TYPE:-NVIDIA GeForce RTX 3090}"
+# Polling ceiling. Configurable via .env so a long batch run can bump it
+# without editing this script. Defaults to 6h; the polling loop ticks every
+# 20s, so total iterations = TIMEOUT_MIN × 3.
+TIMEOUT_MIN="${RUNPOD_TIMEOUT_MIN:-360}"
 
 # --- Preflight ----------------------------------------------------------------
 for tool in curl jq rclone; do
@@ -71,6 +75,7 @@ POD_NAME="agent-harness-${TARGET}-$(date +%s)"
 ENV_JSON="$(jq -n \
     --arg bucket "${R2_BUCKET}" --arg target "${TARGET}" \
     --arg mode "${MODE}" --arg num "${NUM}" \
+    --arg timeout "${TIMEOUT_MIN}" \
     --arg t "${RCLONE_CONFIG_R2_TYPE:-s3}" \
     --arg prov "${RCLONE_CONFIG_R2_PROVIDER:-Cloudflare}" \
     --arg ak "${RCLONE_CONFIG_R2_ACCESS_KEY_ID}" \
@@ -78,6 +83,7 @@ ENV_JSON="$(jq -n \
     --arg ep "${RCLONE_CONFIG_R2_ENDPOINT:-}" \
     '[ {key:"R2_BUCKET",value:$bucket}, {key:"TARGET",value:$target},
        {key:"MODE",value:$mode}, {key:"NUM",value:$num},
+       {key:"RUNPOD_TIMEOUT_MIN",value:$timeout},
        {key:"RCLONE_CONFIG_R2_TYPE",value:$t},
        {key:"RCLONE_CONFIG_R2_PROVIDER",value:$prov},
        {key:"RCLONE_CONFIG_R2_ACCESS_KEY_ID",value:$ak},
@@ -118,12 +124,15 @@ trap terminate EXIT
 
 # --- 3. Wait for the pod's command to finish ---------------------------------
 # The pod's runtime is null before the container starts and again after its
-# command exits. Wait for it to start, then wait for it to stop.
-echo "==> Waiting for the campaign to finish (polling every 20s, 1h ceiling) ..."
+# command exits. Wait for it to start, then wait for it to stop. The ceiling
+# is configured via RUNPOD_TIMEOUT_MIN in .env (default 6h).
+echo "==> Waiting for the campaign to finish (polling every 20s, ${TIMEOUT_MIN}m ceiling) ..."
 STATUS='query Status($input: PodFilter!) { pod(input: $input) { runtime { uptimeInSeconds } } }'
 STATUS_VARS="$(jq -n --arg p "${POD_ID}" '{input: {podId: $p}}')"
 started=0
-for _ in $(seq 1 180); do   # 180 * 20s = 1h
+ticks=$((TIMEOUT_MIN * 3))   # 3 ticks/min × TIMEOUT_MIN
+timed_out=1
+for _ in $(seq 1 "${ticks}"); do
     sleep 20
     UPTIME="$(gql "${STATUS}" "${STATUS_VARS}" | jq -r '.data.pod.runtime.uptimeInSeconds // empty')"
     if [ -n "${UPTIME}" ]; then
@@ -131,9 +140,14 @@ for _ in $(seq 1 180); do   # 180 * 20s = 1h
         printf '\r    running — uptime %ss      ' "${UPTIME}"
     elif [ "${started}" -eq 1 ]; then
         echo; echo "==> Pod command exited."
+        timed_out=0
         break
     fi
 done
+if [ "${started}" -eq 1 ] && [ "${timed_out}" -eq 1 ]; then
+    echo; echo "WARNING: pod still running after ${TIMEOUT_MIN} minutes — tearing it down."
+    echo "         Inspect runpod.io for partial output; bump RUNPOD_TIMEOUT_MIN if this was premature."
+fi
 
 # --- 4. Pull results back -----------------------------------------------------
 echo "==> Syncing results from r2:${R2_BUCKET} into ${DATA_DIR} ..."

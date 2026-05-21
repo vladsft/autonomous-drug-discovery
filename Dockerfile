@@ -27,7 +27,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # rclone — used by cloud runs to sync campaign outputs to Cloudflare R2.
-RUN curl -fsSL https://rclone.org/install.sh | bash
+# Pinned to a specific release rather than `curl … | bash` so the image SHA
+# is stable across builds and the supply-chain surface is one named binary,
+# not whatever today's install.sh says. Bump when there's a reason to.
+ARG RCLONE_VERSION=v1.74.1
+RUN curl -fsSL -o /tmp/rclone.zip \
+        "https://github.com/rclone/rclone/releases/download/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip" \
+    && unzip -j /tmp/rclone.zip '*/rclone' -d /usr/local/bin/ \
+    && chmod +x /usr/local/bin/rclone \
+    && rm /tmp/rclone.zip \
+    && rclone --version
 
 # --- Miniforge (conda + mamba, conda-forge as the default channel) -----------
 # Do NOT `conda clean` here: it wipes the package cache that base already
@@ -65,10 +74,13 @@ RUN curl -fsSL -o /tmp/p2rank.tar.gz \
 
 # --- TargetDiff weights ------------------------------------------------------
 # Mirrored on the Hugging Face Hub (the upstream Google Drive folders are dead).
-# Fetched here, above the code COPY, so a source edit does not re-download them.
-# The weights are excluded from the build context by .dockerignore — this layer
-# is their only path into the image.
-ARG HF_WEIGHTS=https://huggingface.co/vladsft/agent-harness-weights/resolve/main
+# Pinned to a specific commit on the HF repo so a weight bump cannot silently
+# change the image's behaviour at a fixed code SHA — two builds of the same
+# Dockerfile produce byte-identical weight layers. Bump HF_WEIGHTS_REVISION
+# deliberately when there's a reason to.
+# Fetched here, above the code COPY, so a source edit does not re-download.
+ARG HF_WEIGHTS_REVISION=52405cee89105151e385e0e93d0bf5a422286a69
+ARG HF_WEIGHTS=https://huggingface.co/vladsft/agent-harness-weights/resolve/${HF_WEIGHTS_REVISION}
 ARG TD_WEIGHTS_DIR=/app/autonomous_drug_discovery/modules/02_generation/targetdiff/pretrained_models
 RUN mkdir -p ${TD_WEIGHTS_DIR} \
     && curl -fsSL -o ${TD_WEIGHTS_DIR}/pretrained_diffusion.pt  ${HF_WEIGHTS}/pretrained_diffusion.pt \

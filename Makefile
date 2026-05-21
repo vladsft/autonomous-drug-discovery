@@ -83,6 +83,12 @@ logs: ## Tail a campaign's logs from R2 (make logs CAMPAIGN=campaign_xxxx)
 	@test -n "$(CAMPAIGN)" || { echo "Set CAMPAIGN=campaign_xxxx"; exit 1; }
 	set -a; . $(REPO_ROOT)/.env; set +a; rclone cat $(R2_REMOTE)/$(CAMPAIGN)/run.log
 
-clean: ## Remove local campaign outputs and Python cruft
-	rm -rf $(DATA_DIR)/campaign_* $(DATA_DIR)/candidates $(DATA_DIR)/screened $(DATA_DIR)/results
+clean: ## Remove local campaign outputs and Python cruft (mirrors .gitignore)
+	rm -rf $(DATA_DIR)/campaign_* \
+	       $(DATA_DIR)/candidates $(DATA_DIR)/screened $(DATA_DIR)/results \
+	       $(DATA_DIR)/logs $(DATA_DIR)/outputs
+	find $(DATA_DIR)/processed -maxdepth 1 -name '*_p2rank' -type d -exec rm -rf {} + 2>/dev/null || true
+	find $(DATA_DIR)/processed -maxdepth 1 -name '*_manifest.json' -delete 2>/dev/null || true
 	find $(REPO_ROOT) -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
+	find $(REPO_ROOT) -name '.pytest_cache' -type d -exec rm -rf {} + 2>/dev/null || true
+	find $(REPO_ROOT) -name '.ruff_cache' -type d -exec rm -rf {} + 2>/dev/null || true
