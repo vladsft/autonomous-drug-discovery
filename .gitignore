@@ -58,6 +58,15 @@ autonomous_drug_discovery/data/test_*/
 # when they're ready, not by sweep-committing the directory.
 reports/
 
+# professor_demo.json is regenerated from telemetry every time; only the JS
+# bridge (loaded by the dashboard) needs to be tracked. The JSON would
+# double the dashboard-commit size for free.
+dashboard/professor_demo.json
+
+# batch_cloud_run.py drops a per-run summary in data/; ignored because every
+# new batch invalidates the previous one.
+data/batch_summary.json
+
 # Molecular structure files (large, binary, regenerated)
 *.pdbqt
 *.sdf

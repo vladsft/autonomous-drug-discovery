@@ -148,10 +148,16 @@ def test_emits_parseable_dashboard(regen, tmp_path):
     assert json_path.exists() and js_path.exists()
 
     doc = json.loads(json_path.read_text())
-    assert doc["target"]["pdb"] == "1M17"
-    assert doc["default_backend"] == "rdkit"
-    assert "rdkit" in doc["backends"]
-    assert doc["backends"]["rdkit"]["summary"]["total_generated"] == 1
+    # Multi-target schema: even single-target assemble() writes through the
+    # targets map so the dashboard JS has one consistent shape to read.
+    assert doc["default_target"] == "1M17"
+    assert doc["target_order"] == ["1M17"]
+    assert "1M17" in doc["targets"]
+    t = doc["targets"]["1M17"]
+    assert t["pdb"] == "1M17"
+    assert t["default_backend"] == "rdkit"
+    assert "rdkit" in t["backends"]
+    assert t["backends"]["rdkit"]["summary"]["total_generated"] == 1
 
     # The JS bridge must be a single `window.PROFESSOR_DEMO_DATA = …;` assignment.
     js_text = js_path.read_text()
@@ -168,3 +174,41 @@ def test_missing_telemetry_is_diagnosed(regen, tmp_path):
         backends_requested=["rdkit"],
     )
     assert rc == 1
+
+
+def test_discover_targets_enumerates_distinct(regen, tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _seed_campaign(data_dir, "campaign_a", "1M17", "rdkit")
+    _seed_campaign(data_dir, "campaign_b", "2HYY", "rdkit")
+    _seed_campaign(data_dir, "campaign_c", "1M17", "targetdiff")  # dupes 1M17
+    _seed_telemetry(data_dir / "telemetry.db", "campaign_a", "1M17", "rdkit")
+    _seed_telemetry(data_dir / "telemetry.db", "campaign_b", "2HYY", "rdkit")
+    _seed_telemetry(data_dir / "telemetry.db", "campaign_c", "1M17", "targetdiff")
+
+    targets = regen.discover_targets(data_dir / "telemetry.db")
+    assert set(targets) == {"1M17", "2HYY"}
+
+
+def test_assemble_all_writes_multi_target_dashboard(regen, tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    out_dir = tmp_path / "dashboard"
+    _seed_campaign(data_dir, "campaign_a", "1M17", "rdkit")
+    _seed_campaign(data_dir, "campaign_b", "2HYY", "rdkit")
+    _seed_telemetry(data_dir / "telemetry.db", "campaign_a", "1M17", "rdkit")
+    _seed_telemetry(data_dir / "telemetry.db", "campaign_b", "2HYY", "rdkit")
+
+    rc = regen.assemble_all(
+        data_dir=data_dir,
+        out_dir=out_dir,
+        max_per_backend=30,
+        backends_requested=["rdkit"],
+    )
+    assert rc == 0
+    doc = json.loads((out_dir / "professor_demo.json").read_text())
+    assert set(doc["targets"]) == {"1M17", "2HYY"}
+    assert doc["default_target"] in doc["target_order"]
+    for t in ("1M17", "2HYY"):
+        assert doc["targets"][t]["pdb"] == t
+        assert "rdkit" in doc["targets"][t]["backends"]

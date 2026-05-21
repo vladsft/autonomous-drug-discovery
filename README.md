@@ -57,6 +57,8 @@ make run TARGET=1M17 MODE=simulation
 make cloud-run TARGET=2HYY MODE=targetdiff NUM=30
 ```
 
+For 30-50 targets fire-and-forget: open the repo's **Actions** tab → **batch_cloud_run** → **Run workflow** → paste a list of PDB codes → submit. The action provisions concurrent RunPod pods, waits for all of them, regenerates the multi-target dashboard, and redeploys Pages — no laptop involvement after kickoff. See [`docs/pipeline-guide.md`](docs/pipeline-guide.md#batch-runs-cloud-hands-free--phase-15).
+
 Output lands in `data/campaign_<id>/`. Sync to/from the shared R2 bucket with `make push` / `make pull`.
 
 To run TargetDiff diffusion on a **local** GPU — the only option for NVIDIA Blackwell (RTX 50-series), which the cloud image's CUDA 11.7 stack cannot target — see [Running locally without Docker](#running-locally-without-docker).

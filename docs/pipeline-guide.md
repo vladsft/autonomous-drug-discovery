@@ -40,6 +40,41 @@ This provisions a RunPod GPU pod with the same Docker image, runs the full pipel
 
 The cloud image's `targetdiff_env` is PyTorch 1.13 / CUDA 11.7, which runs on RunPod's Ampere GPUs (RTX 3090 / A40) unchanged.
 
+### Batch runs (cloud, hands-free) — Phase 1.5
+
+To run 30-50 targets in one go without local-machine involvement, use the GitHub Actions workflow `batch_cloud_run`. From the repository's **Actions** tab → select **batch_cloud_run** → **Run workflow** → fill the form → submit. The action provisions N concurrent RunPod pods (default 5), waits for all of them via R2 sentinels, merges telemetry, regenerates the multi-target dashboard, and redeploys GitHub Pages — all in one job.
+
+Inputs:
+
+| Field | Default | Notes |
+|---|---|---|
+| `targets` | (required) | Whitespace- or comma-separated PDB codes, e.g. `1M17 2HYY 6P3D 8P1L KRAS_G12C`. The action calls `scripts/fetch_pdb.py` to download anything not already in R2. |
+| `mode` | `targetdiff` | `targetdiff` / `rdkit` / `pocket2mol` / `simulation`. |
+| `num_samples` | `30` | Molecules per target. |
+| `parallelism` | `5` | Concurrent RunPod pods. 5-10 is the sweet spot; higher needs more RunPod credit. |
+| `force` | `false` | When `true`, ignores the 24-hour idempotency skip-list and re-runs every target. |
+
+Required one-time setup in repo Settings → **Secrets and variables → Actions**:
+
+| Secret | Source |
+|---|---|
+| `RUNPOD_API_KEY` | RunPod console → Settings → API Keys (needs read/write) |
+| `RUNPOD_NETWORK_VOLUME_ID` | RunPod console → Storage → Network Volume (the same one `cloud_run.sh` uses) |
+| `R2_BUCKET` | Cloudflare R2 bucket name |
+| `R2_ACCESS_KEY_ID` | Cloudflare → R2 → Manage R2 API Tokens |
+| `R2_SECRET_ACCESS_KEY` | same |
+| `R2_ENDPOINT` | `https://<account-id>.r2.cloudflarestorage.com` |
+
+Optional repo variables (Settings → Variables): `IMAGE` (override the GHCR tag), `RUNPOD_GPU_TYPE` (default `NVIDIA GeForce RTX 3090`).
+
+Idempotency: the dispatcher skips any target whose generation stage succeeded in the requested `mode` within the past 24 hours. This is so re-firing the workflow during a long session doesn't re-pay for work you already have. Override with `force: true`.
+
+Cost guard: before any pod is provisioned, the dispatcher queries the RunPod balance and refuses to start if the worst-case spend exceeds the available credit. Worst-case is calculated as `parallelism × waves × 1.5 h × $0.50 × 1.5`; actual spend is usually 3-4× lower because pods finish well before the 90-minute fuse.
+
+Failure handling: each target gets up to 3 retries. A pod that loses to RunPod preemption is re-provisioned automatically. A pod whose pipeline genuinely fails writes a `.failed` sentinel to `r2:<bucket>/sentinels/`, the dispatcher records it, and the batch continues — one bad target never poisons the rest. The action's job summary at the end lists each target's outcome.
+
+Output: when the workflow finishes, the multi-target dashboard at `https://vladsft.github.io/autonomous-drug-discovery/` reflects the new campaigns, with a target dropdown in the header. The committed `data/batch_summary.json` (downloadable as an action artifact) carries the machine-readable outcome list.
+
 ### Full pipeline, local GPU (no Docker)
 
 TargetDiff diffusion can also run on a local NVIDIA GPU without Docker or RunPod — the orchestrator dispatches each stage straight into conda environments. This is the path to use when the cu117 Docker image cannot target your GPU, notably **NVIDIA Blackwell (RTX 50-series, `sm_120`)**.

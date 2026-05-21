@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """Regenerate the static chemist dashboard from local telemetry.
 
-This is what `make dashboard` calls. Auto-discovers, per target and per
-generator backend, the latest successful campaign in telemetry.db and assembles
-a multi-backend `professor_demo.js` so the dashboard can toggle between
-generators. The heavy lifting (RDKit drawing, ADMET flags, composite score)
-lives in `build_demo_dataset.py`; this script is the glue that finds the
-inputs and calls into it.
+This is what `make dashboard` calls and what `batch_cloud_run.py` invokes at
+the end of a batch. Auto-discovers, per target and per generator backend, the
+latest successful campaign in telemetry.db and assembles a multi-target,
+multi-backend `professor_demo.js`. The heavy lifting (RDKit drawing, ADMET
+flags, composite score) lives in `build_demo_dataset.py`; this script is the
+glue that finds the inputs and calls into it.
 
 Usage:
-    python scripts/regenerate_dashboard.py                       # target=1M17, all backends found
-    python scripts/regenerate_dashboard.py --target 2HYY         # different target
-    python scripts/regenerate_dashboard.py --data-dir data       # explicit data dir
-    python scripts/regenerate_dashboard.py --out dashboard       # explicit dashboard dir
+    # Single target (default 1M17)
+    python scripts/regenerate_dashboard.py
+    python scripts/regenerate_dashboard.py --target 2HYY
+
+    # All targets present in telemetry (the Phase-1.5 path)
+    python scripts/regenerate_dashboard.py --all-targets
+
+Output schema (multi-target):
+    { "targets": { "1M17": { … single-target shape … },
+                   "2HYY": { … }, … },
+      "default_target": "1M17",
+      "generated_at": "...",
+      ... shared metadata ... }
 
 For each backend, the script looks for an AiZynthFinder output at
 `<data_dir>/outputs/aizynth_<backend>.json` (the convention this repo already
@@ -150,24 +159,57 @@ def _campaign_base(data_dir: Path):
         bdd.CAMPAIGN_BASE = previous
 
 
-def assemble(
+def discover_targets(db_path: Path) -> list[str]:
+    """Return the distinct target codes present in telemetry, newest-first.
+
+    Mirrors the LIKE-pattern matching used by `latest_successful_campaign`.
+    Used by --all-targets to enumerate the dashboard's target list.
+    """
+    if not db_path.exists():
+        return []
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            """SELECT input_path FROM runs
+               WHERE module_name = '02_generation'
+                 AND status = 'success'
+                 AND input_path LIKE '%_manifest.json'
+               ORDER BY started_at DESC"""
+        ).fetchall()
+    finally:
+        conn.close()
+
+    seen: list[str] = []
+    for (path,) in rows:
+        if not path:
+            continue
+        stem = Path(path).stem
+        if stem.endswith("_manifest"):
+            stem = stem[: -len("_manifest")]
+        # Strip per-pocket suffix (e.g. "8P1L_pocket2" → "8P1L").
+        target = stem.split("_")[0]
+        if target and target not in seen:
+            seen.append(target)
+    return seen
+
+
+def build_target_dataset(
     target: str,
     data_dir: Path,
-    out_dir: Path,
     max_per_backend: int,
     backends_requested: list[str],
-) -> int:
+) -> dict | None:
+    """Assemble one target's per-backend dataset. Returns None if the target
+    has no usable campaigns. Pure: writes no files."""
     db_path = data_dir / "telemetry.db"
     if not db_path.exists():
         print(f"[regen] telemetry.db not found at {db_path}", file=sys.stderr)
-        return 1
+        return None
 
     backends_data: dict[str, dict] = {}
     insertion_order: list[str] = []
 
     with _campaign_base(data_dir):
-        # Sentinel empty-aizynth file lives in a private tempdir, not under
-        # data_dir, so it can never collide with a real campaign file.
         import tempfile
         with tempfile.TemporaryDirectory(prefix="regen_dash_") as tmp:
             empty_path = Path(tmp) / "empty_aizynth.json"
@@ -176,39 +218,49 @@ def assemble(
             for backend in backends_requested:
                 cid = latest_successful_campaign(db_path, target, backend)
                 if cid is None:
-                    print(f"[regen] no successful {backend} campaign for {target}; skipping")
+                    print(f"[regen] {target}: no successful {backend} campaign; skipping")
                     continue
                 az_path = discover_aizynth(data_dir, backend, cid) or empty_path
-                print(f"[regen] {backend}: campaign={cid} aizynth={az_path.name}")
+                print(f"[regen] {target}: {backend} campaign={cid} aizynth={az_path.name}")
                 try:
                     backends_data[backend] = bdd.build_backend_dataset(
                         backend, cid, az_path, max_molecules=max_per_backend
                     )
                     insertion_order.append(backend)
                 except FileNotFoundError as e:
-                    print(f"[regen] {backend}: skipped — {e}", file=sys.stderr)
+                    print(f"[regen] {target}: {backend} skipped — {e}", file=sys.stderr)
 
     if not backends_data:
-        print(f"[regen] no usable campaigns for target {target}", file=sys.stderr)
-        return 1
+        return None
 
     meta = TARGET_METADATA.get(target, {
         "name": target, "disease": "—", "known_drug": None,
     })
+    return {
+        "pdb": target, **meta,
+        "backends": backends_data,
+        "backend_order": insertion_order,
+        "default_backend": insertion_order[0],
+    }
+
+
+def write_dashboard(out_dir: Path, targets_data: dict[str, dict],
+                    target_order: list[str]) -> int:
+    """Write the multi-target dashboard JSON + JS bridge. Returns 0 / 1."""
+    if not targets_data:
+        print("[regen] no targets to write", file=sys.stderr)
+        return 1
     doc = {
-        "target": {"pdb": target, **meta},
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "default_target": target_order[0],
+        "target_order": target_order,
+        "targets": targets_data,
         "pipeline": {
             "screening_backend": "MolScore + ADMET-AI (104 properties)",
             "docking_backend": "AutoDock Vina (production)",
             "synthesis_backend": "AiZynthFinder (USPTO + ZINC)",
         },
-        "backends": backends_data,
-        "backend_order": insertion_order,
-        "default_backend": insertion_order[0],
-        "generator_descriptions": {
-            name: bdd.GENERATOR_DESCRIPTIONS.get(name, "") for name in insertion_order
-        },
+        "generator_descriptions": dict(bdd.GENERATOR_DESCRIPTIONS),
         "admet_pass_rules": {
             k: {"kind": v[0], "threshold": v[1]}
             for k, v in bdd.ADMET_PASS_RULES.items()
@@ -226,14 +278,66 @@ def assemble(
 
     print(f"[regen] wrote {json_path}")
     print(f"[regen] wrote {js_path}")
-    print(f"[regen] backends: {', '.join(insertion_order)}")
+    print(f"[regen] targets: {', '.join(target_order)}")
     return 0
+
+
+def assemble(
+    target: str,
+    data_dir: Path,
+    out_dir: Path,
+    max_per_backend: int,
+    backends_requested: list[str],
+) -> int:
+    """Single-target convenience wrapper. Always writes the multi-target
+    schema with a single key (so the dashboard JS has one consistent shape)."""
+    payload = build_target_dataset(target, data_dir, max_per_backend, backends_requested)
+    if payload is None:
+        print(f"[regen] no usable campaigns for {target}", file=sys.stderr)
+        return 1
+    return write_dashboard(out_dir, {target: payload}, [target])
+
+
+def assemble_all(
+    data_dir: Path,
+    out_dir: Path,
+    max_per_backend: int,
+    backends_requested: list[str],
+    targets_override: list[str] | None = None,
+) -> int:
+    """Enumerate every target in telemetry and assemble each. Targets without
+    any successful campaign in the requested backends are silently dropped."""
+    db_path = data_dir / "telemetry.db"
+    if not db_path.exists():
+        print(f"[regen] telemetry.db not found at {db_path}", file=sys.stderr)
+        return 1
+
+    targets = targets_override or discover_targets(db_path)
+    if not targets:
+        print("[regen] no targets found in telemetry", file=sys.stderr)
+        return 1
+
+    targets_data: dict[str, dict] = {}
+    order: list[str] = []
+    for t in targets:
+        payload = build_target_dataset(t, data_dir, max_per_backend, backends_requested)
+        if payload is not None:
+            targets_data[t] = payload
+            order.append(t)
+
+    if not order:
+        print("[regen] none of the discovered targets had usable campaigns",
+              file=sys.stderr)
+        return 1
+    return write_dashboard(out_dir, targets_data, order)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--target", default="1M17",
-                    help="PDB stem (default: 1M17 — the EGFR demo target)")
+                    help="PDB stem (default: 1M17 — ignored when --all-targets is set)")
+    ap.add_argument("--all-targets", action="store_true",
+                    help="Discover every target in telemetry; the Phase-1.5 batch path")
     ap.add_argument("--data-dir", default=str(PKG_ROOT / "data"), type=Path,
                     help="Root data directory (must contain telemetry.db)")
     ap.add_argument("--out", default=str(REPO_ROOT / "dashboard"), type=Path,
@@ -243,6 +347,13 @@ def main() -> int:
     ap.add_argument("--backends", nargs="+", default=BACKEND_ORDER,
                     help=f"Backends to include (default: {' '.join(BACKEND_ORDER)})")
     args = ap.parse_args()
+    if args.all_targets:
+        return assemble_all(
+            data_dir=Path(args.data_dir),
+            out_dir=Path(args.out),
+            max_per_backend=args.max_per_backend,
+            backends_requested=list(args.backends),
+        )
     return assemble(
         target=args.target,
         data_dir=Path(args.data_dir),
