@@ -42,38 +42,203 @@ The cloud image's `targetdiff_env` is PyTorch 1.13 / CUDA 11.7, which runs on Ru
 
 ### Batch runs (cloud, hands-free) — Phase 1.5
 
-To run 30-50 targets in one go without local-machine involvement, use the GitHub Actions workflow `batch_cloud_run`. From the repository's **Actions** tab → select **batch_cloud_run** → **Run workflow** → fill the form → submit. The action provisions N concurrent RunPod pods (default 5), waits for all of them via R2 sentinels, merges telemetry, regenerates the multi-target dashboard, and redeploys GitHub Pages — all in one job.
+A `workflow_dispatch` from the GitHub Actions UI runs the full pipeline against a target list, no laptop involvement after kickoff. This section is the operator's manual.
 
-Inputs:
+#### One-time setup
 
-| Field | Default | Notes |
-|---|---|---|
-| `targets` | (required) | Whitespace- or comma-separated PDB codes, e.g. `1M17 2HYY 6P3D 8P1L KRAS_G12C`. The action calls `scripts/fetch_pdb.py` to download anything not already in R2. |
-| `mode` | `targetdiff` | `targetdiff` / `rdkit` / `pocket2mol` / `simulation`. |
-| `num_samples` | `30` | Molecules per target. |
-| `parallelism` | `5` | Concurrent RunPod pods. 5-10 is the sweet spot; higher needs more RunPod credit. |
-| `force` | `false` | When `true`, ignores the 24-hour idempotency skip-list and re-runs every target. |
+Six repo secrets and one Pages toggle. Do these once, never again.
 
-Required one-time setup in repo Settings → **Secrets and variables → Actions**:
+**Repo Settings → Secrets and variables → Actions → New repository secret:**
 
-| Secret | Source |
+| Secret | Where to get it |
 |---|---|
-| `RUNPOD_API_KEY` | RunPod console → Settings → API Keys (needs read/write) |
-| `RUNPOD_NETWORK_VOLUME_ID` | RunPod console → Storage → Network Volume (the same one `cloud_run.sh` uses) |
-| `R2_BUCKET` | Cloudflare R2 bucket name |
-| `R2_ACCESS_KEY_ID` | Cloudflare → R2 → Manage R2 API Tokens |
-| `R2_SECRET_ACCESS_KEY` | same |
-| `R2_ENDPOINT` | `https://<account-id>.r2.cloudflarestorage.com` |
+| `RUNPOD_API_KEY` | runpod.io → Settings → API Keys → "Create API Key" (Read + Write) |
+| `RUNPOD_NETWORK_VOLUME_ID` | runpod.io → Storage → your Network Volume → ID field (the same one `make cloud-run` uses) |
+| `R2_BUCKET` | The Cloudflare R2 bucket name, e.g. `agent-harness` |
+| `R2_ACCESS_KEY_ID` | Cloudflare dashboard → R2 → Manage R2 API Tokens → Create API token |
+| `R2_SECRET_ACCESS_KEY` | (shown once at token creation — save it) |
+| `R2_ENDPOINT` | `https://<account-id>.r2.cloudflarestorage.com` (account ID is on the R2 overview page) |
 
-Optional repo variables (Settings → Variables): `IMAGE` (override the GHCR tag), `RUNPOD_GPU_TYPE` (default `NVIDIA GeForce RTX 3090`).
+**Repo Settings → Pages → Source = "GitHub Actions"** (one toggle, no further config).
 
-Idempotency: the dispatcher skips any target whose generation stage succeeded in the requested `mode` within the past 24 hours. This is so re-firing the workflow during a long session doesn't re-pay for work you already have. Override with `force: true`.
+Optional variables (Settings → Variables): `IMAGE` to override the GHCR tag, `RUNPOD_GPU_TYPE` to switch from the default 3090 (e.g. `NVIDIA RTX A6000`).
 
-Cost guard: before any pod is provisioned, the dispatcher queries the RunPod balance and refuses to start if the worst-case spend exceeds the available credit. Worst-case is calculated as `parallelism × waves × 1.5 h × $0.50 × 1.5`; actual spend is usually 3-4× lower because pods finish well before the 90-minute fuse.
+#### Firing a run
 
-Failure handling: each target gets up to 3 retries. A pod that loses to RunPod preemption is re-provisioned automatically. A pod whose pipeline genuinely fails writes a `.failed` sentinel to `r2:<bucket>/sentinels/`, the dispatcher records it, and the batch continues — one bad target never poisons the rest. The action's job summary at the end lists each target's outcome.
+1. Open the repo on github.com → **Actions** tab → pick **batch_cloud_run** in the left sidebar.
+2. Click the green **"Run workflow"** button on the right.
+3. Fill the form (see field reference below), click the bottom green **"Run workflow"**.
+4. The page refreshes; a new run appears at the top. Click into it to watch live logs.
+5. Walk away. When the run finishes, you'll get the standard GitHub email notification ("workflow batch_cloud_run completed").
 
-Output: when the workflow finishes, the multi-target dashboard at `https://vladsft.github.io/autonomous-drug-discovery/` reflects the new campaigns, with a target dropdown in the header. The committed `data/batch_summary.json` (downloadable as an action artifact) carries the machine-readable outcome list.
+#### Field reference
+
+| Field | Default | What to put |
+|---|---|---|
+| **targets** | (required) | Whitespace- or comma-separated PDB codes — e.g. `1M17 2HYY 6P3D 8P1L`. 4–8 alphanumeric characters each. `scripts/fetch_pdb.py` downloads any code not already cached. |
+| **mode** | `targetdiff` | Which generator: `targetdiff` (diffusion, GPU-bound, ~30 min/target, best 3D fidelity), `rdkit` (fragment-based, CPU, ~2 min/target, broad chemical diversity), `pocket2mol` (pocket-aware GNN, GPU, ~7 s/mol — checkpoint not yet rehosted, so currently fails fast), `simulation` (stub, instant, plumbing-test only). |
+| **num_samples** | `30` | Molecules generated per target. 30 is the validated default. Going to 100+ multiplies wallclock and cost roughly linearly. |
+| **parallelism** | `5` | Concurrent RunPod pods. 5 is the sweet spot for the free tier. Bump to 10 if you have ample credit; >10 risks RunPod balance starvation mid-batch. |
+| **force** | `false` | If `true`, ignores the 24-hour idempotency skip-list and re-runs every target. Use this when you change pipeline params; otherwise leave at `false` to avoid paying for work you already have. |
+
+##### Recommended first-time run
+
+Before running 30-50 targets, do a small live shake-out: `targets="1M17 2HYY"`, `mode=rdkit`, `num_samples=5`, `parallelism=2`. Costs cents, finishes in ~5 minutes, validates that all six secrets are wired correctly. The dashboard at `https://vladsft.github.io/autonomous-drug-discovery/` updates with the two targets when it lands.
+
+#### Timeline of a real run (parallelism=5, 30 targets, targetdiff)
+
+| T+      | What happens |
+|---------|--------------|
+| 0 s     | You click Run workflow. Action runner spins up (~30 s GitHub-side). |
+| 30 s    | Python + rclone install; secrets exported to env. |
+| 1 min   | `batch_cloud_run.py` starts. Pulls `telemetry.db` from R2; builds skip-list. Fetches any missing PDBs from RCSB. Queries RunPod balance. |
+| 2 min   | First 5 RunPod pods provisioned. Each pulls its input PDB from R2, runs orchestrator end-to-end. |
+| ~30 min | First wave of pods finishes (one wave at a time on `parallelism=5`). `.done` sentinels appear in R2. Dispatcher cycles in the next 5. |
+| ~3 h    | Last sentinel lands. Dispatcher syncs all campaign output from R2, writes `data/batch_summary.json`. |
+| ~3 h 2 m | `regenerate_dashboard.py --all-targets` runs, writes `dashboard/professor_demo.{js,json}`. |
+| ~3 h 3 m | Commits `dashboard/` back to `main` with a "batch: refresh dashboard" message; pushes. |
+| ~3 h 4 m | Inline Pages deploy. URL goes live. |
+| ~3 h 5 m | GitHub emails you. |
+
+If any pod fails its first attempt, the dispatcher retries it up to 3 times. Pods that fail all 3 attempts get a `.failed` sentinel in R2 and are reported in `batch_summary.json` as `outcome: failed`. The rest of the batch is unaffected.
+
+#### Where the results live
+
+Three places, each with a different audience:
+
+1. **The chemist dashboard** — `https://vladsft.github.io/autonomous-drug-discovery/`
+    The fastest path. Multi-target dropdown in the header; each target carries a per-backend tab (RDKit / TargetDiff / Pocket2Mol), a sortable molecule table, and a detail panel with SVG structure + drug-likeness + ADMET + synthesis route. This is what you'd show a medicinal chemist.
+
+2. **Cloudflare R2 bucket** — `r2:<R2_BUCKET>/`
+    The raw artefacts. For every campaign the pipeline produced, you can pull down:
+    - `r2:<bucket>/campaign_<id>/candidates/generated_molecules.sdf` — raw 3D coordinates from the generator (open in PyMOL: `pymol generated_molecules.sdf`)
+    - `r2:<bucket>/campaign_<id>/screened/screened_molecules.sdf` — survivors after drug-likeness filters
+    - `r2:<bucket>/campaign_<id>/screened/screening_report.json` — per-molecule properties + ADMET + attrition counts
+    - `r2:<bucket>/campaign_<id>/results/docking_results.csv` — sorted by Vina affinity
+    - `r2:<bucket>/campaign_<id>/results/docked_mol_*.pdbqt` — the best binding pose per ligand (also openable in PyMOL)
+    - `r2:<bucket>/campaign_<id>/ranked/ranked_candidates.json` — the final scorecard with composite score
+    - `r2:<bucket>/telemetry.db` — SQLite DB of every run
+
+    Sync locally with `make pull` (or directly: `rclone copy r2:<bucket>/campaign_<id> ./local-dir`).
+
+3. **GitHub Action artifact** — `batch-summary` (attached to the workflow run)
+    Machine-readable per-target outcome list. Download from the run summary page → "Artifacts" section. Schema:
+    ```jsonc
+    {
+      "generated_at": "2026-05-21T20:00:00Z",
+      "mode": "targetdiff", "num_samples": 30, "parallelism": 5,
+      "results": [
+        { "target": "1M17", "outcome": "done",   "sentinel_key": "1M17-targetdiff-abc1",
+          "pod_id": "pod_xyz", "tail": "[pod] === done (rc=0) ===" },
+        { "target": "2HYY", "outcome": "failed", "sentinel_key": "2HYY-targetdiff-def2",
+          "pod_id": "pod_uvw", "tail": "[pod] FATAL: pipeline exceeded 85-minute fuse." },
+        ...
+      ]
+    }
+    ```
+
+#### What the results actually look like
+
+You get **per-molecule structured data plus aggregate per-backend statistics, with rendered 2D structures, for every target × generator combination that produced output.**
+
+##### Per-molecule record (one entry per generated molecule)
+
+```jsonc
+{
+  "molecule_id": "mol_0012",
+  "smiles": "COc1nc2c(C(N)=O)cccc2nc1O",            // canonical SMILES
+  "svg": "<svg …>",                                  // pre-rendered 2D structure
+  "screening_passed": true,
+  "rejected_reason": null,                           // populated when screening_passed=false
+
+  // Drug-likeness, from RDKit. All filters in screening config feed this.
+  "properties": {
+    "mol_weight": 219.2,            // Da
+    "logp": 0.44,                    // Crippen logP
+    "qed": 0.7632,                   // 0-1, higher = more drug-like
+    "sa_score": 2.0,                 // 1-10, lower = easier to synthesise
+    "tpsa": 98.33,                   // topological polar surface area, Å²
+    "hbd": 2,                        // H-bond donors
+    "hba": 5,                        // H-bond acceptors
+    "rotatable_bonds": 2,
+    "heavy_atoms": 16,
+    "pains_alerts": 0                // PAINS substructure count (0 = clean)
+  },
+
+  // ADMET-AI, 11 endpoints exposed (104 total available via the raw screening_report).
+  "admet": {
+    "hERG": 0.061,            // hERG channel block probability (lower = safer)
+    "AMES": 0.2616,           // mutagenicity probability
+    "DILI": 0.9419,           // drug-induced liver injury risk
+    "CYP2D6": 0.0057,         // metabolism interference (lower better)
+    "CYP3A4": 0.003,
+    "Caco2": -4.9759,         // permeability (Caco-2)
+    "HIA": 0.9969,            // human intestinal absorption
+    "BBB": 0.8098,            // blood-brain barrier
+    "Clearance": 43.6822,
+    "Bioavailability": 0.9339,
+    "LD50": 1.6498
+  },
+  "admet_flags": {              // simple pass/fail for the dashboard's red/green badges
+    "hERG": true, "AMES": true, "DILI": false
+  },
+
+  // AutoDock Vina, kcal/mol, more negative = stronger binding.
+  "docking_score": -1.815,
+
+  // AiZynthFinder retrosynthesis, only run for top-N by docking + ADMET.
+  "synthesis": {
+    "evaluated": true,
+    "route_found": true,
+    "n_steps": 1,                 // synthesis steps
+    "n_routes": 110,              // total alternative routes found
+    "precursors": [               // SMILES of the building blocks
+      "COC(=O)C(=O)O",
+      "NC(=O)c1cccc(N)c1N"
+    ],
+    "route_tree": { … }           // full retrosynthetic tree, renderable in the dashboard
+  },
+
+  // Multi-criteria final score: 0.5·dock + 0.3·ADMET + 0.2·synthesis, normalised.
+  "composite_score": 0.8421,
+  "final_rank": 1
+}
+```
+
+##### Per-backend summary (one entry per target × backend)
+
+```jsonc
+{
+  "total_generated": 30,           // molecules out of generator
+  "passed_screening": 28,          // survived all Lipinski/QED/SA/PAINS filters
+  "synthesis_evaluated": 15,       // top-N that AiZynth saw
+  "synthesis_routes_found": 8,     // of those, how many had at least one route
+  "best_docking_score": -9.47,     // most negative Vina score
+  "median_docking_score": -6.82,
+  "mean_qed": 0.62,
+  "mean_sa": 2.91
+}
+```
+
+So per target you get **N molecules × {SMILES + 2D structure + 10 drug-likeness properties + 11 ADMET predictions + Vina docking + synthesis routes for the top survivors + composite ranking}**, plus **aggregate statistics on the cohort**. Multiply by however many generator backends ran on that target (up to 3: RDKit + TargetDiff + Pocket2Mol).
+
+A 50-target batch with `mode=targetdiff num_samples=30` produces ~1,500 ranked molecules in the dashboard, each with the schema above.
+
+#### Idempotency, cost, and failure handling
+
+**Idempotency.** Any target whose generation stage in the requested `mode` succeeded in the past 24 h is silently skipped — repeated workflow invocations during one work session don't re-pay for finished work. Override with `force: true`.
+
+**Cost guard.** Before any pod is provisioned, the dispatcher queries the RunPod balance and refuses to start if it's less than the worst-case spend (`parallelism × waves × 1.5 h × $0.50 × 1.5`). Worst-case assumes every pod runs to its 90-min ceiling; actual cost is usually 3-4× lower because pods finish well before the fuse. A 30-target batch on 5 pods historically lands at ~$3-4 of RunPod credit.
+
+**Failure handling.** Three retries per target. A pod reclaimed by RunPod's preemption logic is re-provisioned automatically. A pod whose pipeline truly fails (bad PDB, no detectable pocket, OOM, etc.) writes a `.failed` sentinel — the dispatcher records it and the batch continues. The summary in the Action's job log lists every target's outcome at the end, and the same data lives in the `batch-summary` artifact.
+
+#### Debugging a run that didn't produce a dashboard update
+
+1. Open the failed Action run. Check the "Run the batch" step's tail for the per-target outcome summary.
+2. Look for `.failed` sentinels in R2: `rclone cat r2:<bucket>/sentinels/<sentinel-key>.failed` — they carry the exit code and the last 50 log lines of the pod's pipeline.
+3. If a target consistently fails the first stage (P2Rank), the PDB likely has no detectable pocket — try a co-crystal structure instead of an apo form.
+4. If a target consistently times out, your `mode` is probably wrong for the GPU (TargetDiff on a non-CUDA-11.7 GPU will fall back to CPU and exceed the fuse) — pick a different RunPod GPU type via the `RUNPOD_GPU_TYPE` repo variable, or switch the target to `mode=rdkit`.
+5. If the workflow itself errors out before pods even provision, the most common cause is a missing or mis-named secret — re-check the six values listed in [One-time setup](#one-time-setup).
 
 ### Full pipeline, local GPU (no Docker)
 
