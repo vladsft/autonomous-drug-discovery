@@ -454,23 +454,23 @@ If we keep a GPU pod running ~8 hours/week post-demo for iteration: + ~$8/month.
 Sequenced so each day's output is the next day's input. Roughly 2 working days end-to-end if there are no RunPod-side surprises.
 
 ### Day 1 — Pod-side sentinels + PDB fetch + Python orchestrator skeleton (~5-6 hours)
-- [ ] **Append sentinel writes to `scripts/pod_campaign.sh`.** Three lines: on success, `rclone touch r2:${R2_BUCKET}/sentinels/${CAMPAIGN_ID}.done`. On non-zero exit, `rclone copy <(echo "$ERR_TAIL") r2:.../${CAMPAIGN_ID}.failed`. ~30 min.
-- [ ] **`scripts/fetch_pdb.py`.** `argparse --targets`, `requests.get(https://files.rcsb.org/download/<T>.pdb)`, write to a temp dir, `rclone copy` to `r2:bucket/processed/`. Skips PDBs already in R2. Unit-tested against `https://files.rcsb.org/download/1M17.pdb` over the wire (cheap, public). ~45 min.
-- [ ] **`scripts/batch_cloud_run.py` — first cut.** Stub the orchestrator: parse args, load targets, call `fetch_pdb.py`, print a work-list, exit. No RunPod calls yet. ~1 hour.
-- [ ] **`scripts/batch_cloud_run.py` — RunPod pool.** Port the GraphQL mutations from `cloud_run.sh` to Python with `requests`. Implement the `asyncio.Semaphore(parallelism)` pool. ~3 hours.
-- [ ] **Local dry-run.** `python scripts/batch_cloud_run.py --targets 1M17 2HYY --parallelism 2 --dry-run` prints exactly the GraphQL bodies it *would* submit, without sending. Sanity-check by comparing to a known-good `cloud_run.sh` invocation. ~30 min.
+- [x] **Append sentinel writes to `scripts/pod_campaign.sh`.** Three lines: on success, `rclone touch r2:${R2_BUCKET}/sentinels/${CAMPAIGN_ID}.done`. On non-zero exit, `rclone copy <(echo "$ERR_TAIL") r2:.../${CAMPAIGN_ID}.failed`. ~30 min.
+- [x] **`scripts/fetch_pdb.py`.** `argparse --targets`, `requests.get(https://files.rcsb.org/download/<T>.pdb)`, write to a temp dir, `rclone copy` to `r2:bucket/processed/`. Skips PDBs already in R2. Unit-tested against `https://files.rcsb.org/download/1M17.pdb` over the wire (cheap, public). ~45 min.
+- [x] **`scripts/batch_cloud_run.py` — first cut.** Stub the orchestrator: parse args, load targets, call `fetch_pdb.py`, print a work-list, exit. No RunPod calls yet. ~1 hour.
+- [x] **`scripts/batch_cloud_run.py` — RunPod pool.** Ported the GraphQL mutations to Python with `requests`. Implemented as `ThreadPoolExecutor(max_workers=parallelism)` instead of `asyncio.Semaphore` — same parallelism shape, no asyncio surface area, no new deps. ~3 hours.
+- [x] **Local dry-run.** `python scripts/batch_cloud_run.py --targets 1M17 2HYY --parallelism 2 --dry-run` prints the dispatch plan without provisioning pods. ~30 min.
 
 ### Day 2 — Polling loop + workflow + smoke test (~5-7 hours)
-- [ ] **Sentinel-polling loop.** Once every 60 s, list `r2:bucket/sentinels/`, mark targets `done` or `failed`, cycle a new pod from the work-list, enforce retry budget. Time-out hung pods at 75 min. ~2 hours.
-- [ ] **Cost guard.** `myself { credits }` query, refuse to start if balance < `1.5 × estimated_spend`. ~30 min.
-- [ ] **Telemetry merge + dashboard regen at the end.** Wire `merge_telemetry.py` and `regenerate_dashboard.py --all-targets` into the orchestrator's tail. ~1 hour (after multi-target support lands — see Day 3).
-- [ ] **`.github/workflows/batch.yml`.** `workflow_dispatch` with inputs, single ubuntu-latest job, env vars wired from repo Secrets, runs `python scripts/batch_cloud_run.py`. ~1 hour.
-- [ ] **First real batch.** Run from the Actions UI with `targets="1M17 2HYY"`, `parallelism=2`, `num_samples=10` (small, ~10 min total). Verify R2 sentinels, R2 telemetry merge, no orphaned pods on the RunPod console. ~2 hours including bug-fix loops.
+- [x] **Sentinel-polling loop.** Every 60 s, list `r2:bucket/sentinels/`, mark targets `done` or `failed`, cycle a new pod from the work-list, enforce retry budget (3 retries per target). Outer pod timeout enforces a 90-min ceiling per attempt.
+- [x] **Cost guard.** `myself { clientBalance }` query, refuse to start if balance < worst-case estimate. Best-effort: if the field schema shifts, we log and proceed rather than block the batch.
+- [x] **Telemetry merge + dashboard regen at the end.** `regenerate_dashboard.py --all-targets` is invoked by the workflow's tail. `merge_telemetry.py` is wired in as the integration point — today's pods write directly to the canonical DB so it's a no-op, marked for activation when per-campaign DBs land.
+- [x] **`.github/workflows/batch.yml`.** `workflow_dispatch` with inputs, single ubuntu-latest job (350-min ceiling), env vars wired from repo Secrets, runs `python scripts/batch_cloud_run.py`. Concurrency-grouped so two batches can't race.
+- [ ] **First real batch — pending user.** Add repo secrets (RUNPOD_API_KEY, RUNPOD_NETWORK_VOLUME_ID, R2_*), then click Run workflow with `targets="1M17 2HYY"`, `parallelism=2`, `num_samples=10`. Verify R2 sentinels appear and no orphaned pods remain.
 
 ### Day 3 — Multi-target dashboard + production batch (~4-5 hours)
-- [ ] **Multi-target schema in `regenerate_dashboard.py`.** Add `--all-targets`; new top-level `targets` map; unit test. ~2 hours.
-- [ ] **Multi-target dashboard JS.** `<select>` in the header + `setActiveTarget` plumbing; render the existing single-target view per selection. Manual browser test on the committed data. ~2 hours.
-- [ ] **Production batch.** Curate the 30-50 target list (kinases + selected non-kinases from the screening literature; biased toward proteins with a known crystal-bound ligand for sanity-check baselines). Run the workflow. Walk away. Come back to the Pages URL. ~1 hour active + ~3 hours wallclock.
+- [x] **Multi-target schema in `regenerate_dashboard.py`.** `--all-targets` enumerates distinct targets; new top-level `targets` map; single-target path uses the same schema for consistency. 6 unit tests pass.
+- [x] **Multi-target dashboard JS.** `<select id="target-select">` in the header + `setActiveTarget(pdb)` plumbing. Backend pills, summary stats, molecule table, detail panel all re-render on target change. Dock-slider min is the union over all targets × backends so the range is stable.
+- [ ] **Production batch — pending user.** Curate the 30-50 target list. Click Run workflow. Walk away. Come back to the Pages URL.
 
 ### What I'm explicitly *not* doing in this batch (defer to Phase 3+)
 
