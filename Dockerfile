@@ -30,13 +30,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Pinned to a specific release rather than `curl … | bash` so the image SHA
 # is stable across builds and the supply-chain surface is one named binary,
 # not whatever today's install.sh says. Bump when there's a reason to.
-ARG RCLONE_VERSION=v1.74.1
+#
+# IMPORTANT: do NOT name this ARG `RCLONE_VERSION`. rclone honours an env var
+# called `RCLONE_VERSION` as the boolean `--version` flag, so the verification
+# step would parse the tag as a bool and crash the build with
+# `strconv.ParseBool: parsing "v1.74.1": invalid syntax`.
+ARG RCLONE_RELEASE=v1.74.1
 RUN curl -fsSL -o /tmp/rclone.zip \
-        "https://github.com/rclone/rclone/releases/download/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip" \
+        "https://github.com/rclone/rclone/releases/download/${RCLONE_RELEASE}/rclone-${RCLONE_RELEASE}-linux-amd64.zip" \
     && unzip -j /tmp/rclone.zip '*/rclone' -d /usr/local/bin/ \
     && chmod +x /usr/local/bin/rclone \
     && rm /tmp/rclone.zip \
-    && rclone --version
+    && rclone version
 
 # --- Miniforge (conda + mamba, conda-forge as the default channel) -----------
 # Do NOT `conda clean` here: it wipes the package cache that base already
