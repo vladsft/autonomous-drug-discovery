@@ -35,6 +35,10 @@ conda-bld/
 
 # Telemetry database (local, regenerated on each run)
 *.db
+*.db.*-bak
+
+# Per-run logs (the orchestrator's per-stage stdout/stderr drops here)
+autonomous_drug_discovery/data/logs/
 
 # Generated / intermediate molecular data
 autonomous_drug_discovery/data/campaign_*/
@@ -48,6 +52,20 @@ autonomous_drug_discovery/data/processed/run_metadata.json
 
 # Test run artifacts
 autonomous_drug_discovery/data/test_*/
+
+# Ad-hoc rendered figures and per-target write-ups outside the main pipeline.
+# These belong to in-progress research (not yet in PR #1); tracked individually
+# when they're ready, not by sweep-committing the directory.
+reports/
+
+# professor_demo.json is regenerated from telemetry every time; only the JS
+# bridge (loaded by the dashboard) needs to be tracked. The JSON would
+# double the dashboard-commit size for free.
+dashboard/professor_demo.json
+
+# batch_cloud_run.py drops a per-run summary in data/; ignored because every
+# new batch invalidates the previous one.
+data/batch_summary.json
 
 # Molecular structure files (large, binary, regenerated)
 *.pdbqt

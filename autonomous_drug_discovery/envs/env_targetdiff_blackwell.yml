@@ -1,0 +1,47 @@
+# TargetDiff Environment — Blackwell / local-GPU variant.
+#
+# The original env_targetdiff.yml pins PyTorch 1.13 / CUDA 11.7, which has no
+# compute kernels for NVIDIA Blackwell GPUs (sm_120 — the RTX 50-series). This
+# variant rebuilds the same environment on PyTorch 2.8 / CUDA 12.8, which does.
+#
+# This is the LOCAL-GPU counterpart to the cloud path. The Docker image and the
+# RunPod pods keep using env_targetdiff.yml (cu117) on Ampere GPUs, where it
+# runs unchanged. Both files install under the SAME conda env name —
+# `targetdiff_env` — because the orchestrator dispatches TargetDiff generation
+# to that name; only the file differs, picked per machine.
+#
+# Install on a local Blackwell box:
+#   conda env create -f env_targetdiff_blackwell.yml
+#
+# The PyTorch + PyG wheels are pip-only and deliberately pinned:
+#   - torch: the `+cu128` local-version tag forces the CUDA-12.8 build from the
+#     PyTorch index; PyPI's plain 2.8.0 wheel can never satisfy `==2.8.0+cu128`.
+#   - torch-scatter/cluster/sparse: prebuilt against pt28+cu128 and pulled from
+#     data.pyg.org via --find-links — no source compile, no local nvcc needed.
+#
+# See also: scripts/apply_targetdiff_patches.sh (PyTorch 2.x / NumPy patches
+# the pinned TargetDiff submodule needs) and docs/pipeline-guide.md.
+
+name: targetdiff_env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - openbabel
+  - rdkit
+  - biopython
+  - scipy
+  - pandas
+  - pyyaml
+  - tqdm
+  - pip
+  - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu128
+    - --find-links https://data.pyg.org/whl/torch-2.8.0+cu128.html
+    - torch==2.8.0+cu128
+    - torch-scatter==2.1.2+pt28cu128
+    - torch-cluster==1.6.3+pt28cu128
+    - torch-sparse==0.6.18+pt28cu128
+    - torch-geometric
+    - lmdb
+    - easydict

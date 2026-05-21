@@ -25,9 +25,9 @@ Validated against three cancer targets with crystallographic ground truth:
 
 ## Quick start
 
-The pipeline ships as a single Docker image with all conda environments, P2Rank, and (mirrored) model checkpoints baked in. Both contributors run the same image; the cloud GPU pod runs the same image.
+The pipeline ships as a single Docker image with all conda environments, P2Rank, and (mirrored) model checkpoints baked in. Both contributors run the same image; the cloud GPU pod runs the same image. CI builds the image on every `main` push and publishes it to `ghcr.io/vladsft/autonomous-drug-discovery:latest`.
 
-> **Note on the Docker image:** The Dockerfile and CI workflow are part of the Phase 1 work currently in flight (see [`autonomous_drug_discovery/plan.md`](autonomous_drug_discovery/plan.md)). Until that lands, the image at `ghcr.io/<you>/agent-harness` does not yet exist; the legacy manual conda setup at the bottom of this README is the fallback. The commands below describe the target workflow.
+> **Note on the Docker image:** The image is published by the `build` workflow on every `main` push (`:latest` and `:<sha>`). If `docker pull` fails immediately after a fresh clone, the most likely reason is that no commit has hit `main` yet on this fork — fall back to the [no-Docker path](#running-locally-without-docker) below until CI has run once.
 
 ### Prerequisites
 
@@ -39,7 +39,8 @@ The pipeline ships as a single Docker image with all conda environments, P2Rank,
 ### One-time setup
 
 ```bash
-git clone <this-repo> && cd agent-harness
+git clone https://github.com/vladsft/autonomous-drug-discovery.git
+cd autonomous-drug-discovery
 make bootstrap   # pulls Docker image, configures rclone for R2
 ```
 
@@ -56,11 +57,15 @@ make run TARGET=1M17 MODE=simulation
 make cloud-run TARGET=2HYY MODE=targetdiff NUM=30
 ```
 
+For 30-50 targets fire-and-forget: open the repo's **Actions** tab → **batch_cloud_run** → **Run workflow** → paste a list of PDB codes → submit. The action provisions concurrent RunPod pods, waits for all of them, regenerates the multi-target dashboard, and redeploys Pages — no laptop involvement after kickoff. See [`docs/pipeline-guide.md`](docs/pipeline-guide.md#batch-runs-cloud-hands-free--phase-15).
+
 Output lands in `data/campaign_<id>/`. Sync to/from the shared R2 bucket with `make push` / `make pull`.
+
+To run TargetDiff diffusion on a **local** GPU — the only option for NVIDIA Blackwell (RTX 50-series), which the cloud image's CUDA 11.7 stack cannot target — see [Running locally without Docker](#running-locally-without-docker).
 
 ### View the dashboard
 
-The static dashboard auto-deploys to GitHub Pages on every `main` commit. URL: `https://<you>.github.io/agent-harness/`. Locally:
+The static dashboard auto-deploys to GitHub Pages on every `main` commit. URL: `https://vladsft.github.io/autonomous-drug-discovery/`. Locally:
 
 ```bash
 make dashboard    # regenerate dashboard JSON from latest telemetry
@@ -100,7 +105,7 @@ open dashboard/index.html
 │
 ├── dashboard/                       # Static HTML + JSON dashboard
 ├── docs/                            # See table above
-└── scripts/                         # bootstrap.sh, cloud_run.sh, regenerate_dashboard.py
+└── scripts/                         # cloud_run.sh, pod_campaign.sh, telemetry + build helpers
 ```
 
 ## Architecture summary
@@ -118,19 +123,43 @@ A single Docker image (built by GitHub Actions, pushed to GHCR, weights mirrored
 - Adaptive Layer (Sonnet + Bayesian + Obsidian + Cascade) — Phase 3.
 - Bayesian evaluation — Phase 4.
 
-## Legacy / fallback: manual conda setup
+## Running locally without Docker
 
-While the Docker image is in flight, the manual conda workflow still works on machines that have the local checkpoint and environments already configured. It is **not** recommended for fresh setups — the Pocket2Mol Google Drive folder is permanently dead and the TargetDiff one is also gone (the dev box has a pre-takedown copy; see `plan.md`). For full historical install steps see the git history of `docs/installation.md` (deleted 2026-05-11) or the per-stage commands in [`docs/pipeline-guide.md`](docs/pipeline-guide.md).
+Docker is the *portable* path, not the only one. The orchestrator runs each stage in a conda environment directly, so a machine with the environments installed can run the full pipeline — including TargetDiff diffusion on a local GPU — without building or pulling an image.
 
-The minimal legacy invocation looks like:
+This is also the **only** way to use a GPU the cloud image's CUDA 11.7 stack cannot target — notably NVIDIA Blackwell (RTX 50-series, `sm_120`), whose architecture post-dates that image's PyTorch 1.13 / CUDA 11.7 environment.
+
+### One-time setup
 
 ```bash
+# Orchestrator + CPU stages (ingestion, RDKit, screening, docking, ranking)
 conda env create -f autonomous_drug_discovery/envs/env_orchestrator.yml
-conda run -n base python autonomous_drug_discovery/orchestrator.py run \
-    autonomous_drug_discovery/data/processed/1M17.pdb --mode simulation
+
+# TargetDiff generation — pick the env spec by local GPU generation:
+#   Ampere / Ada / Turing  ->  env_targetdiff.yml            (PyTorch 1.13 / cu117)
+#   Blackwell (RTX 50xx)   ->  env_targetdiff_blackwell.yml  (PyTorch 2.8  / cu128)
+conda env create -f autonomous_drug_discovery/envs/env_targetdiff_blackwell.yml
+
+# Re-apply the pinned-submodule patches (NumPy + PyTorch 2.x compatibility)
+scripts/apply_targetdiff_patches.sh
 ```
 
-Beyond simulation mode you also need P2Rank installed (`~/p2rank_2.5.1/prank`), and for TargetDiff/Pocket2Mol the relevant conda env *and* the pretrained checkpoint at the expected path.
+Both TargetDiff env specs install under the same conda env name (`targetdiff_env`); only the file differs, chosen per machine. You also need P2Rank installed (`~/p2rank_2.5.1/prank`) for pocket detection, and the TargetDiff checkpoint at `autonomous_drug_discovery/modules/02_generation/targetdiff/pretrained_models/pretrained_diffusion.pt` (mirrored at <https://huggingface.co/vladsft/agent-harness-weights>).
+
+### Run
+
+```bash
+# Full pipeline, RDKit generator (fast, CPU)
+conda run -n base python autonomous_drug_discovery/orchestrator.py run \
+    autonomous_drug_discovery/data/processed/1M17.pdb --mode rdkit
+
+# Full pipeline, TargetDiff diffusion on the local GPU
+conda run -n base python autonomous_drug_discovery/orchestrator.py run \
+    autonomous_drug_discovery/data/processed/1M17.pdb \
+    --mode targetdiff --device cuda --num_samples 30
+```
+
+`--device` accepts `auto` (the default — detects a GPU), `cuda`, or `cpu`. For per-stage commands and parameters, see [`docs/pipeline-guide.md`](docs/pipeline-guide.md).
 
 ## License
 

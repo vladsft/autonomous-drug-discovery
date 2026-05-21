@@ -1,6 +1,6 @@
 # Adaptive Discovery Orchestrator — Architectural Plan
 
-This is the canonical plan. The [README](../README.md) and other docs under [`docs/`](../docs/) reference this file; if they disagree, this file wins. Last major revision: 2026-05-11.
+This is the canonical plan. The [README](../README.md) and other docs under [`docs/`](../docs/) reference this file; if they disagree, this file wins. Last major revision: 2026-05-21 (Phase 1.5 — fire-and-forget batch driver — added).
 
 ## Where we are
 
@@ -24,46 +24,58 @@ This is the canonical plan. The [README](../README.md) and other docs under [`do
 ## Architecture (target state)
 
 ```
-                      ┌────────────────────┐
-                      │  GitHub (code +    │
-                      │  Actions CI build) │
-                      └─────────┬──────────┘
-                                │
-                  ┌─────────────┴──────────────┐
-                  │                            │
-                  ▼                            ▼
-        ┌───────────────────┐         ┌──────────────────┐
-        │ GHCR              │         │ Hugging Face Hub │
-        │ ghcr.io/.../      │         │ <org>/td-weights │
-        │ agent-harness:    │         │ <org>/p2m-weights│
-        │ <git-sha>         │         │ (108 MB total)   │
-        └─────────┬─────────┘         └────────┬─────────┘
-                  │ docker pull                │ baked into image at build time
-       ┌──────────┴───────────┐                │
-       │                      │                │
-       ▼                      ▼                │
-┌─────────────┐     ┌──────────────────┐       │
-│ Laptop A    │     │ RunPod GPU pod   │       │
-│ (you)       │     │ (3090 / A40,     │       │
-│ Docker CLI  │     │  ephemeral)      │       │
-└──────┬──────┘     └────────┬─────────┘       │
-       │                     │                 │
-       └─────────┬───────────┘                 │
-                 │                             │
-                 ▼                             │
-        ┌────────────────────┐                 │
-        │ Cloudflare R2      │  ←──────────────┘
-        │ (campaigns/,       │     (image pulls weights once at build,
-        │  telemetry.db,     │      so cloud runs are immediately usable)
-        │  large artefacts)  │
-        └────────┬───────────┘
-                 │ static export
-                 ▼
-        ┌────────────────────┐
-        │ GitHub Pages       │     ← professor opens this URL
-        │ (dashboard/*)      │
-        └────────────────────┘
+                          ┌────────────────────────────┐
+                          │  GitHub                    │
+                          │  ├─ build.yml   (CI build) │
+                          │  ├─ pages.yml   (deploy)   │
+                          │  └─ batch.yml   (dispatch) │◄── workflow_dispatch
+                          └────────────┬───────────────┘    (you, once, from
+                                       │                     the Actions UI)
+              ┌────────────────────────┼──────────────────┐
+              │                        │                  │
+              ▼                        ▼                  ▼
+   ┌──────────────────┐      ┌────────────────┐    ┌────────────────────┐
+   │ Hugging Face Hub │      │ GHCR           │    │ GitHub Action       │
+   │ <org>/td-weights │      │ ghcr.io/.../   │    │ (batch_cloud_run)   │
+   │ (~108 MB)        │      │ harness:<sha>  │    │ Python orchestrator │
+   └──────────────────┘      └────────┬───────┘    │ — semaphore=N pods  │
+              ▲                       │            │ — sentinel polling  │
+              │ baked in              │            │ — cost guard        │
+              │ at image-build        │            │ — telemetry merge   │
+              │                       ▼            │ — dashboard regen   │
+              │             ┌──────────────────┐   │ — auto-commit       │
+              │             │ Laptop A         │   └─────────┬───────────┘
+              │             │ (interactive,    │             │
+              │             │  per-target run) │             │ provisions N pods,
+              │             └────────┬─────────┘             │ each running the
+              │                      │                       │ same image
+              │                      │            ┌──────────┼──────────┐
+              │                      │            ▼          ▼          ▼
+              │                      │     ┌───────────┐┌───────────┐┌───────────┐
+              │                      │     │ RunPod #1 ││ RunPod #2 ││ RunPod #k │
+              │                      │     │ TARGET=A  ││ TARGET=B  ││ TARGET=…  │
+              │                      │     │ ephemeral ││ ephemeral ││ ephemeral │
+              │                      │     └─────┬─────┘└─────┬─────┘└─────┬─────┘
+              │                      │           │            │            │
+              │                      └──────┬────┴────────────┴────────────┘
+              │                             ▼
+              │                  ┌────────────────────────┐
+              │                  │ Cloudflare R2          │
+              └──── weights ──── │ campaigns/<id>/        │
+                                 │ sentinels/<id>.done    │
+                                 │ telemetry.db (merged)  │
+                                 │ dashboard/*.json       │
+                                 └───────────┬────────────┘
+                                             │ batch action pushes
+                                             │ regenerated dashboard/
+                                             ▼
+                                 ┌────────────────────────┐
+                                 │ GitHub Pages           │ ← professor URL
+                                 │ multi-target selector  │
+                                 └────────────────────────┘
 ```
+
+Two paths into the same architecture. **Per-target, interactive (Phase 1):** `make cloud-run TARGET=X` from a laptop provisions one pod. **Batched, hands-free (Phase 1.5):** one `workflow_dispatch` of `batch.yml` provisions N pods concurrently, merges telemetry, regenerates the dashboard, deploys. The pods run the same image either way — only the orchestrator above them changes.
 
 ### Operating principles (load-bearing)
 
@@ -97,6 +109,24 @@ This is the canonical plan. The [README](../README.md) and other docs under [`do
 **Why:** Removes manual pod-launching tedium. Removes "did I forget to shut down the GPU?" cost overruns. Removes the lid-close failure mode entirely (the pod is independent of your laptop).
 
 **Rejected:** *Manual web UI workflow.* What we have today. Fine for one-off; bad for repeating 5 times. *Modal.* Strictly better long-term answer for GPU functions, but requires turning `subprocess.check_call(conda run …)` into `@modal.function`. ~1 day refactor. Deferred to Phase 3+. *AWS Batch / Vertex AI.* Enterprise overkill at two-laptop scale.
+
+#### Batch dispatcher: a GitHub Action fans out N pods
+**Decision:** A second GitHub Actions workflow, `.github/workflows/batch.yml`, triggered exclusively by `workflow_dispatch`, runs a Python orchestrator (`scripts/batch_cloud_run.py`) that:
+
+1. Reads inputs: `targets` (space-separated list), `mode` (rdkit / targetdiff / pocket2mol), `num_samples`, `parallelism` (default 5), `force` (default false — skip targets with a fresh successful campaign).
+2. Pre-flights: checks the RunPod balance via GraphQL; refuses to start if balance < `parallelism × ~$0.30 × estimated_hours × 1.5`. Fetches any missing PDBs from RCSB into R2.
+3. Provisions pods in a worker pool (`asyncio.Semaphore(parallelism)`) — *not* an Actions matrix. Pods are independent, Actions runners are scarce; one runner provisioning N pods is the right shape.
+4. Each pod runs the existing `pod_campaign.sh` end-to-end and, on success/failure, writes a sentinel file at `r2:bucket/sentinels/<campaign_id>.done` (or `.failed`) before exiting.
+5. The orchestrator polls R2 every 60 s for sentinels; collects outcomes; replaces dead pods (RunPod is preemptible) up to a retry ceiling.
+6. After all pods drain: `scripts/merge_telemetry.py` consolidates per-campaign telemetry DBs into the canonical R2 `telemetry.db`. `scripts/regenerate_dashboard.py --all-targets` rebuilds the dashboard JSON. The action commits `dashboard/` and pushes to `main`. The Pages workflow picks the change up and redeploys.
+
+**Why a Python orchestrator inside the Action, not Actions matrix:** GitHub free-tier minutes are budgeted; spinning up N Actions runners for ~3 hours of *wall clock* burns ~3N × 60 = a lot. One runner spending those minutes *waiting on R2* burns much less. The runner is doing I/O and ten lines of GraphQL — fits comfortably in a free-tier job.
+
+**Why R2 sentinels, not RunPod status polling:** RunPod's pod-status API is eventually consistent and lies about exit codes when the container terminates ungracefully. A sentinel file written by the pod *just before exit* is authoritative: present ⇒ the pod's payload completed; absent + pod gone ⇒ failure. The orchestrator never has to trust RunPod's view of "did the work finish?"
+
+**Why all of this is the right layer, not Modal / Vertex AI / Kubernetes:** Modal and Vertex are better fits *once we have a stable batch surface to migrate*. Today we don't. The Action + bash + RunPod path is what we already half-built — finishing it costs 2-3 days, and the result is a strict superset of the per-target flow (the per-target path remains unchanged). Modal becomes a Phase 3+ refactor once we know what the surface should look like.
+
+**Concession:** RunPod GPUs can be reclaimed; a long batch may lose a pod mid-run. The orchestrator handles this with at-most-three retries per target. If a target genuinely refuses to run (PDB malformed, weights missing), it gets logged as `.failed` and the batch continues — one bad target must not poison the rest.
 
 #### State lives in object storage
 **Decision:** Cloudflare R2 bucket holds `data/campaign_*/`, `data/telemetry.db`, and large artefacts. `make sync-up` / `make sync-down` wrap `rclone bisync`. The Docker image ships pre-configured with `rclone`; credentials come from a mounted `.env`.
@@ -141,16 +171,29 @@ make clean            # nuke local cache
 
 **Why:** Without this, the Docker image drifts from the code. With it, "what's running in cloud GPU" = "what's tagged `:latest`" = "what's on `main`."
 
-## Roadmap (4 phases)
+## Roadmap (5 phases — Phase 1.5 added 2026-05-21)
 
-### Phase 1 — Containerised cloud-GPU run on 5 targets, 20 quality results
+The shape is: prove the primitive (1), scale it hands-free (1.5), get it in front of an expert (2), make it adaptive (3), and measure honestly (4). Each phase produces something demonstrable before the next one is allowed to start.
 
-**Goal:** The architecture above shipped end-to-end. Five targets (1M17, 2HYY, 6P3D, KRAS G12C, JAK2) × ~30 TargetDiff molecules each, full pipeline through screening + docking + ranking + dashboard. Output is the 20-quality-result corpus the professor sees.
+### Phase 1 — Containerised cloud-GPU run on a target set, 20 quality results
+
+**Goal:** The architecture above shipped end-to-end. A target set × ~30 TargetDiff molecules each, full pipeline through screening + docking + ranking + dashboard. Output is the 20-quality-result corpus the professor sees.
+
+**Target set (actual, as of 2026-05-21):**
+
+| Target | Disease | Status |
+|---|---|---|
+| 1M17 (EGFR) | Lung cancer | ✅ Phase-1 campaigns complete (RDKit + Pocket2Mol) |
+| 2HYY (BCR-ABL) | CML | ✅ Phase-1 campaigns complete |
+| 6P3D (BRAF V600E) | Melanoma | ✅ Phase-1 campaigns complete |
+| 8P1L | Internal validation | ✅ TargetDiff campaign complete on local Blackwell GPU |
+
+**Deferred from this phase:** KRAS G12C and JAK2 were in the original plan but not run yet — they're follow-up work, not a blocker for the professor demo. The deliverable (20 quality candidates with the new infrastructure) is met by the four targets above. 1UYD / 3KRR / 6OIM PDBs are checked into `data/processed/` for downstream use but not part of the Phase 1 campaign corpus.
 
 **Success criteria:**
 - `docker pull` + `make run TARGET=… MODE=simulation` works on both contributors' laptops with no manual intervention
 - `make cloud-run` provisions a RunPod GPU, runs TargetDiff, syncs results to R2, tears down the pod, all from a single command
-- Five targets × ~30 TargetDiff molecules generated, screened, docked, ranked, logged to telemetry
+- The target set × ~30 molecules each generated, screened, docked, ranked, logged to telemetry
 - ≥ 20 candidates labelled "quality" (passed tightened screening + docking better than median of generation set; ideally within 1 kcal/mol of known-drug baseline on at least three targets)
 - Dashboard loads at `https://<you>.github.io/agent-harness/`; auto-deploys on every commit; no manual JSON editing
 - Total cloud spend < $5
@@ -159,9 +202,104 @@ make clean            # nuke local cache
 
 **Pocket2Mol is explicitly deferred.** Its checkpoint isn't recovered, its env doesn't run on Blackwell, and TargetDiff alone covers the deliverable. We revisit Pocket2Mol post-demo only if TargetDiff results disappoint.
 
+### Phase 1.5 — Fire-and-forget batch over 30-50 targets
+
+**Goal:** One button-press triggers a campaign over 30-50 enzymes. No laptop involvement after kickoff. ~3 hours later, the professor URL shows a multi-target dashboard with all the results.
+
+This is the load-bearing piece between Phase 1 (one-target primitive proved working) and Phase 2 (professor demo). Without it, "scale the corpus" remains a manual chore — 50 invocations of `make cloud-run`, 50 chances to forget one, no laptop allowed to sleep for ~25 hours. With it, the professor demo becomes a function of *target list curation*, not of human babysitting.
+
+**Success criteria:**
+- One `workflow_dispatch` of `batch.yml`, given a target list of 30-50 PDB codes, runs the full pipeline on every target on RunPod GPUs.
+- The orchestrator runs `parallelism` (default 5) pods concurrently; total wallclock ≈ ceil(N / parallelism) × ~30 min.
+- Per-target failure is recorded as a `.failed` sentinel and reported in the Action's summary; the batch never aborts on a single target.
+- Telemetry from every pod is merged into the canonical R2 `telemetry.db`.
+- The dashboard is regenerated for **all** completed targets and auto-deployed to GitHub Pages without any local commit.
+- One notification at the end: GitHub's built-in Action-completed email is enough.
+- Total cloud spend < $20 for a 50-target batch (5 concurrent × ~30 min/target × ~$0.30/h = $5 best case; budget 4× for retries + provisioning delay).
+
+**Detailed flow (T+ from clicking "Run workflow"):**
+
+| Time | Where it runs | What happens |
+|---|---|---|
+| T+0  | You, in browser | Open `Actions → batch_cloud_run → Run workflow`. Fill `targets="1M17 2HYY 6P3D 8P1L …"`, `mode=targetdiff`, `num_samples=30`. Click run. |
+| T+5s | Action runner | `scripts/batch_cloud_run.py` parses inputs, validates target codes (4-character alphanumeric), de-dupes. |
+| T+10s | Action runner | Query R2 `telemetry.db`: for each target, if a successful campaign exists newer than 24 h (and `force=false`), drop it from the work-list. Print the skip-list. |
+| T+15s | Action runner | Cost guard: query RunPod's GraphQL `myself { credits }`. Compute `estimated_spend = parallelism × $0.30 × ceil(len(work_list) / parallelism) × 1.5`. If credits insufficient, fail immediately. |
+| T+30s | Action runner | For each missing PDB: `curl https://files.rcsb.org/download/<TARGET>.pdb` → `rclone copy` to `r2:bucket/processed/`. |
+| T+1m  | Action runner | Spin up the first `parallelism` pods via RunPod GraphQL `podFindAndDeployOnDemand`. Each pod runs `pod_campaign.sh`. Record `pod_id → target` mapping locally. |
+| T+1m  | Pods (parallel) | Each pod: `rclone copy r2:bucket data --progress` → `python orchestrator.py run data/processed/<TARGET>.pdb --mode … --num_samples …` → `rclone copy data r2:bucket --progress` → write `r2:bucket/sentinels/<campaign_id>.done` → exit 0. On error: write `.failed` + error trace, exit non-zero. |
+| ~T+30m | Action runner | Polling loop, 60 s tick: list `r2:bucket/sentinels/`. For each new `.done`, mark the target complete; cycle a new pod in from the work-list. For each `.failed`, decrement that target's retry budget and re-queue if budget > 0. |
+| T+~3h | Action runner | All sentinels accounted for. Print per-target outcomes. |
+| T+~3h+2m | Action runner | `rclone copy r2:bucket/campaigns/ ./data/` (only the new ones, by sentinel timestamp). Run `scripts/merge_telemetry.py` against the canonical R2 `telemetry.db` to fold in per-campaign DBs. Push the merged DB back to R2. |
+| T+~3h+3m | Action runner | `python scripts/regenerate_dashboard.py --all-targets` reads the merged telemetry and emits a multi-target `dashboard/professor_demo.{js,json}`. |
+| T+~3h+4m | Action runner | `git add dashboard/`, commit with `[skip ci]` on the build workflow but *not* on Pages, `git push` via the workflow's `GITHUB_TOKEN`. |
+| T+~3h+5m | Pages workflow | Auto-fires on `paths: ['dashboard/**']` change. Deploys to Pages. |
+| T+~3h+7m | You | Email: "batch_cloud_run completed". Open the Pages URL → multi-target dashboard live. |
+
+**Failure modes the design handles:**
+- **Pod reclaimed mid-run.** RunPod can terminate a preemptible pod. Detected by `pod_id` disappearing from the status endpoint without a `.done` sentinel; the orchestrator retries (up to 3 times) on a fresh pod.
+- **One target's pipeline fails (bad PDB / no pocket).** Pod writes `.failed`, exits non-zero. Orchestrator records it, moves on. Final report flags it; the rest of the batch is unaffected.
+- **RunPod outage / GraphQL flakiness.** GraphQL calls wrapped in `tenacity`-style retry-with-backoff (or bare `requests` retry, no need to add the dep). After 5 minutes of failure to provision, the action errors with a clean message instead of silently hanging.
+- **R2 outage.** The pod will fail to push results; sentinel won't appear; orchestrator retries. If R2 stays down > 10 min, the orchestrator aborts and reports.
+- **Action runner timeout (6h limit on free tier).** For 50 targets at parallelism=5, wallclock is ~5 hours — comfortably under. For 100 targets, bump parallelism to 10 (free-tier RunPod balance permitting) or split into two batch runs.
+- **A pod hangs forever (e.g., P2Rank deadlocks on a malformed PDB).** Each pod sets a 90-minute wallclock fuse inside `pod_campaign.sh`; the orchestrator additionally times pods out at 75 min and explicitly terminates them via GraphQL.
+
+**Failure modes the design does NOT handle (by intent, deferred to Phase 3+):**
+- **Cross-batch deduplication of identical campaigns** (same target, same mode, same num_samples, recently). The 24h skip-list is the only check; bumping `num_samples` or `mode` produces a new campaign. That's the right behaviour for an exploration phase.
+- **Live progress UI.** The Action's stdout is the only progress view. Building a real dashboard for "what's running right now" is Phase 3+ work (this is what an Obsidian campaign emitter would surface).
+- **Cost amortisation across batches.** Each batch provisions its own pods. Keeping one pod warm for serial use would save $1-2 per batch but adds complexity (and the lid-close problem reappears in a different form).
+
+**Multi-target dashboard schema (extension of the current single-target shape):**
+
+```jsonc
+{
+  "targets": {
+    "1M17": { "pdb": "1M17", "name": "EGFR (…)", "disease": "NSCLC",
+              "known_drug": "Erlotinib", "backends": { … same shape … } },
+    "2HYY": { "pdb": "2HYY", "name": "BCR-ABL", "disease": "CML",
+              "known_drug": "Imatinib", "backends": { … } },
+    "…": { … }
+  },
+  "default_target": "1M17",          // the first key with a complete campaign
+  "generated_at": "2026-05-…",
+  "pipeline": { … unchanged … },
+  "admet_pass_rules": { … unchanged … },
+  "generator_descriptions": { … unchanged … }
+}
+```
+
+The dashboard JS picks up a top-level *target selector* (dropdown in the header); each target keeps the existing backend tabs / molecule cards / attrition funnel verbatim. No structural rewrite — one element added, one nested level of indexing.
+
+**Components to build (in dependency order):**
+
+1. **Pod-side sentinel.** Append three lines to `scripts/pod_campaign.sh` so the pod writes `sentinels/<campaign_id>.done` (or `.failed` with the exit code and last 50 log lines) right before `exit`. ~15 min.
+2. **`scripts/fetch_pdb.py`.** `curl rcsb.org/download/<TARGET>.pdb` → R2. Idempotent; skips PDBs already in R2. ~30 min.
+3. **`scripts/batch_cloud_run.py`.** The Python orchestrator described above. Async pool, sentinel polling, RunPod GraphQL with retries, cost guard, retry budget. Reuses `cloud_run.sh`'s GraphQL mutations (copy them into Python; don't shell out — easier to retry and error-handle). ~6-8 hours.
+4. **Multi-target `regenerate_dashboard.py`.** Add `--all-targets` flag: enumerate distinct targets in telemetry, run the existing per-target assembly for each, splice into the new top-level schema. ~2 hours including a new test.
+5. **Multi-target dashboard JS.** Add a `<select>` element + `setActiveTarget(pdb)` function; everything else stays. ~2 hours including manual browser test on the existing committed dataset.
+6. **`.github/workflows/batch.yml`.** `workflow_dispatch` with the inputs above. Single job: install Python deps (`pip install requests`), run `python scripts/batch_cloud_run.py`, configure git for the commit + push step at the end. ~1 hour.
+7. **Secrets.** Repo Settings → Secrets and variables → Actions: `RUNPOD_API_KEY`, `RUNPOD_NETWORK_VOLUME_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`, `R2_BUCKET`. The Action exports these as env vars exactly the way `.env` already shapes them, so `cloud_run.sh` and `batch_cloud_run.py` consume identical config. ~15 min.
+8. **Docs update.** New section in `docs/pipeline-guide.md` titled "Batch runs (cloud, hands-free)" with a single example. Update `README.md` Quick Start to mention the batch path alongside `make cloud-run`. ~30 min.
+
+**Total estimated work: ~2 days end-to-end, including a real 5-target dry-run on RunPod to shake out timing and idempotency bugs.**
+
+**Cost envelope (running once, 50 targets, parallelism=5):**
+
+| Item | Cost |
+|---|---|
+| RunPod 3090 × 5 pods × ~3h wallclock × $0.30/h | ~$4.50 best case |
+| Retry budget (assume ~15% pod-loss rate) | +$0.70 |
+| R2 storage delta (~5 GB extra per 50-target batch) | ~$0.08/mo |
+| GitHub Actions minutes (single ~3h job, free-tier ceiling 2000 min/month) | $0 |
+| **One-shot total** | **~$5-6** |
+
+**Why this is Phase 1.5, not Phase 2:** Phase 2 is *show the professor*. Showing them 4 targets manually-curated is qualitatively different from showing them 40 targets the system found on its own. The pitch lands harder with the second story. Phase 1.5 is the difference between a demo and a product.
+
 ### Phase 2 — Show the professor; capture qualitative feedback
 
-**Goal:** Walk a medicinal chemistry advisor through the dashboard for the Phase 1 targets. Capture which ranked candidates they think are sensible, which look like generative junk, what they'd modify, what's missing. The conversation includes the forward-looking architecture (Layer 4 below) so we shape Phase 3 with their input.
+**Goal:** Walk a medicinal chemistry advisor through the **Phase 1.5 dashboard** — the 30-50-target multi-selector view, not the 4-target Phase 1 dashboard. Capture which ranked candidates they think are sensible, which look like generative junk, what they'd modify, what's missing. The conversation includes the forward-looking architecture (Layer 4 below) so we shape Phase 3 with their input.
+
+**Why the dashboard width matters here:** Showing a chemist 4 targets invites the response "interesting, run more." Showing them 40 targets invites the response "let's talk about which 5 are actually promising and why" — which is the conversation we want. The shift from "demo" to "tool the chemist already wants to use" happens between Phase 1.5 and Phase 2.
 
 **Success criteria:**
 - 1-2 hour review session with at least one medicinal chemistry expert (Imperial Chemistry / Cancer Research / etc.)
@@ -227,8 +365,12 @@ Current survival rates are 73-98% (target: 40-60%). The generator is over-produc
 ### Pocket2Mol checkpoint recovery (Phase 3 prep)
 The checkpoint is the one piece of state we cannot self-mirror — we never had a local copy. Path: open a polite issue on `pengxingang/Pocket2Mol` asking for a re-host; in parallel, ask anyone in our academic network who's run Pocket2Mol recently. Until recovered, Pocket2Mol stays out of the build.
 
-### Pocket2Mol + TargetDiff env rebuild for Blackwell (Phase 3+)
-Both envs (Pocket2Mol: pytorch 1.10 / cu113, TargetDiff: pytorch 1.13 / cu117) target pre-Blackwell architectures. If we want to run on an RTX 5060 (sm_120) or newer locally, we rebuild both on pytorch 2.4 / cu121 with matching PyG wheels from <https://data.pyg.org/whl/>. Trivial diagnostic: `python -c "import torch; x=torch.randn(2000,2000).cuda(); [x@x.T for _ in range(10)]; torch.cuda.synchronize(); print('ok')"` should return in <1 sec. Estimated 30-60 min per env, mostly conda babysitting. Not needed for Phase 1 (RunPod 3090 supports the existing CUDA 11.7 fine).
+### Pocket2Mol + TargetDiff env rebuild for Blackwell
+Both upstream envs (Pocket2Mol: pytorch 1.10 / cu113, TargetDiff: pytorch 1.13 / cu117) target pre-Blackwell architectures and cannot execute on an RTX 50-series GPU (sm_120) — CUDA 11.x ships no kernels for it.
+
+**TargetDiff — done.** `envs/env_targetdiff_blackwell.yml` rebuilds `targetdiff_env` on PyTorch 2.8 / CUDA 12.8 with prebuilt PyG wheels (`torch-scatter/cluster/sparse`) from <https://data.pyg.org/whl/> — no source compile needed. The submodule's PyTorch 2.x break (`torch.load` now defaults to `weights_only=True`) is handled by `targetdiff_patches/02-torch2-compat.patch`, and `run_generation.py` / `orchestrator.py` now take a `--device` flag that auto-detects the GPU. This is the **local-GPU** counterpart to the cloud path: the Docker image and RunPod keep the cu117 env (it runs fine on RunPod's Ampere GPUs); the cu128 env is the no-Docker path for a local Blackwell box. See `docs/pipeline-guide.md` → "Full pipeline, local GPU".
+
+**Pocket2Mol — still pending.** Its cu113 env has not been rebuilt; deferred with the rest of the Pocket2Mol work. Diagnostic that a rebuilt env works: `python -c "import torch; x=torch.randn(2000,2000).cuda(); [x@x.T for _ in range(10)]; torch.cuda.synchronize(); print('ok')"` should return in <1 s.
 
 ### GNINA rescoring (post-Phase 2)
 Add GNINA CNN-based rescoring alongside Vina. Needs GPU; download binary from <https://github.com/gnina/gnina/releases>. Only worthwhile after screening is properly calibrated and we have evidence Vina's r=0.4-0.6 correlation is the limiting factor.
@@ -262,15 +404,16 @@ Strict sequence. Each day's output is the next day's input. If anything cracks, 
 - [ ] **`make cloud-run TARGET=2HYY MODE=targetdiff NUM=30`** end-to-end on one target. Verify output in R2 and via `make pull` locally. ~2 hours.
 
 ### Day 4 — Demo corpus generation (~3 hours active + ~3 hours waiting)
-- [ ] **Tighten screening thresholds** in `default_scoring_config.json` to ~50% survival target. ~30 min.
-- [ ] **Add `--num_samples` CLI flag** to `run_generation.py`. ~15 min.
-- [ ] **`make cloud-run` × 5 targets** (1M17, 2HYY, 6P3D, KRAS G12C, JAK2 — fetch PDBs for the latter two). NUM=30 each. ~3 hours wallclock batched. Total spend ~$2.
+- [x] **Tighten screening thresholds** in `default_scoring_config.json`. Done — lead-like window (MW 250-450, heavy atoms 18-35, QED ≥ 0.5, SA ≤ 4.5) + chemical-sanity filter.
+- [x] **Add `--num_samples` CLI flag** to `run_generation.py`. Done.
+- [x] **Generate the target-set corpus.** Done — RDKit + Pocket2Mol on 1M17/2HYY/6P3D + TargetDiff on 8P1L (local Blackwell, since `:cu117` can't target sm_120). KRAS G12C / JAK2 deferred.
+- [ ] **`make cloud-run` smoke against one target** to prove the RunPod path. Pending — script exists, end-to-end verification still owed.
 - [ ] **Spot-check the SDFs** in PyMOL or via `Chem.MolToImage`. ~1 hour.
 
 ### Day 5 — Dashboard polish + deploy (5-6 hours)
-- [ ] **`scripts/regenerate_dashboard.py`.** Reads `telemetry.db` + ranking outputs from R2, rewrites `dashboard/professor_demo.js` with per-target tabs, top-4 cards per target (SVG + dock score + QED + SA + ADMET flags), attrition funnel, known-drug baseline row. ~3 hours.
-- [ ] **GitHub Pages workflow.** Auto-deploy `dashboard/` on `main` push. ~1 hour.
-- [ ] **Share the URL** with the professor. Done.
+- [x] **`scripts/regenerate_dashboard.py`.** Auto-discovers the latest successful campaign per (target, backend) from `telemetry.db` and emits `dashboard/professor_demo.js`. `make dashboard` is now a no-arg call.
+- [x] **GitHub Pages workflow.** `.github/workflows/pages.yml` deploys `dashboard/` on every `main` push. Activates the moment PR #1 merges.
+- [ ] **Share the URL** with the professor. Pending until PR #1 merges.
 
 ### Day 6-7 — Buffer
 Anything that overran. Last-mile polish. Demo dry run. Notes for the meeting.
@@ -305,6 +448,38 @@ If we keep a GPU pod running ~8 hours/week post-demo for iteration: + ~$8/month.
 | Kubernetes / k3s | Two laptops + one GPU pod. K8s pays off at ~10+ workloads. |
 | Live FastAPI dashboard | Static is enough for the demo; live UI is Phase 3+. |
 | Custom Python CLI | Makefile is sufficient. |
+
+## Immediate Action Plan (week of 2026-05-21) — Phase 1.5 batch driver
+
+Sequenced so each day's output is the next day's input. Roughly 2 working days end-to-end if there are no RunPod-side surprises.
+
+### Day 1 — Pod-side sentinels + PDB fetch + Python orchestrator skeleton (~5-6 hours)
+- [x] **Append sentinel writes to `scripts/pod_campaign.sh`.** Three lines: on success, `rclone touch r2:${R2_BUCKET}/sentinels/${CAMPAIGN_ID}.done`. On non-zero exit, `rclone copy <(echo "$ERR_TAIL") r2:.../${CAMPAIGN_ID}.failed`. ~30 min.
+- [x] **`scripts/fetch_pdb.py`.** `argparse --targets`, `requests.get(https://files.rcsb.org/download/<T>.pdb)`, write to a temp dir, `rclone copy` to `r2:bucket/processed/`. Skips PDBs already in R2. Unit-tested against `https://files.rcsb.org/download/1M17.pdb` over the wire (cheap, public). ~45 min.
+- [x] **`scripts/batch_cloud_run.py` — first cut.** Stub the orchestrator: parse args, load targets, call `fetch_pdb.py`, print a work-list, exit. No RunPod calls yet. ~1 hour.
+- [x] **`scripts/batch_cloud_run.py` — RunPod pool.** Ported the GraphQL mutations to Python with `requests`. Implemented as `ThreadPoolExecutor(max_workers=parallelism)` instead of `asyncio.Semaphore` — same parallelism shape, no asyncio surface area, no new deps. ~3 hours.
+- [x] **Local dry-run.** `python scripts/batch_cloud_run.py --targets 1M17 2HYY --parallelism 2 --dry-run` prints the dispatch plan without provisioning pods. ~30 min.
+
+### Day 2 — Polling loop + workflow + smoke test (~5-7 hours)
+- [x] **Sentinel-polling loop.** Every 60 s, list `r2:bucket/sentinels/`, mark targets `done` or `failed`, cycle a new pod from the work-list, enforce retry budget (3 retries per target). Outer pod timeout enforces a 90-min ceiling per attempt.
+- [x] **Cost guard.** `myself { clientBalance }` query, refuse to start if balance < worst-case estimate. Best-effort: if the field schema shifts, we log and proceed rather than block the batch.
+- [x] **Telemetry merge + dashboard regen at the end.** `regenerate_dashboard.py --all-targets` is invoked by the workflow's tail. `merge_telemetry.py` is wired in as the integration point — today's pods write directly to the canonical DB so it's a no-op, marked for activation when per-campaign DBs land.
+- [x] **`.github/workflows/batch.yml`.** `workflow_dispatch` with inputs, single ubuntu-latest job (350-min ceiling), env vars wired from repo Secrets, runs `python scripts/batch_cloud_run.py`. Concurrency-grouped so two batches can't race.
+- [ ] **First real batch — pending user.** Add repo secrets (RUNPOD_API_KEY, RUNPOD_NETWORK_VOLUME_ID, R2_*), then click Run workflow with `targets="1M17 2HYY"`, `parallelism=2`, `num_samples=10`. Verify R2 sentinels appear and no orphaned pods remain.
+
+### Day 3 — Multi-target dashboard + production batch (~4-5 hours)
+- [x] **Multi-target schema in `regenerate_dashboard.py`.** `--all-targets` enumerates distinct targets; new top-level `targets` map; single-target path uses the same schema for consistency. 6 unit tests pass.
+- [x] **Multi-target dashboard JS.** `<select id="target-select">` in the header + `setActiveTarget(pdb)` plumbing. Backend pills, summary stats, molecule table, detail panel all re-render on target change. Dock-slider min is the union over all targets × backends so the range is stable.
+- [ ] **Production batch — pending user.** Curate the 30-50 target list. Click Run workflow. Walk away. Come back to the Pages URL.
+
+### What I'm explicitly *not* doing in this batch (defer to Phase 3+)
+
+| Skipped | Reason |
+|---|---|
+| Replacing RunPod with Modal | Migrating off the GraphQL API once the batch shape is proven is a clean Phase 3 refactor, not a Phase 1.5 detour. |
+| Live progress dashboard | Action stdout + email is enough for hands-free. Live UI is Obsidian/Phase 3. |
+| Smart target-list generation | The target list is curated by a human until the Bayesian recommender ships (Phase 3b). |
+| Cross-campaign rerank | Each batch is independent; the multi-target dashboard does not rerank across batches. |
 
 ## What we learned from the 2026-05-11 2HYY attempt
 

@@ -22,8 +22,37 @@ import sqlite3
 import uuid
 import json
 import hashlib
+import platform
+import importlib.metadata
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _collect_tool_versions() -> dict:
+    """Best-effort snapshot of the runtime environment for provenance.
+
+    Captures the Python version and the versions of the scientific libraries
+    whose silent upgrades have broken runs before (a gemmi point-release once
+    emptied every receptor and turned all docking scores into 0.0). Recorded on
+    every run so an env regression is diagnosable from telemetry alone.
+
+    Versions are read from installed-package metadata via importlib.metadata —
+    the packages are deliberately NOT imported. Importing a heavy C-extension
+    (rdkit, torch, meeko) just to read __version__ is both slow and unsafe: a
+    NumPy 1.x/2.x ABI mismatch in one of them would otherwise crash every
+    module that opens telemetry, including stages that never use that package.
+    A package without discoverable metadata is simply omitted; this never raises.
+    """
+    versions = {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+    }
+    for dist_name in ("gemmi", "rdkit", "vina", "torch", "numpy", "meeko"):
+        try:
+            versions[dist_name] = importlib.metadata.version(dist_name)
+        except Exception:
+            continue
+    return versions
 
 
 _SCHEMA_RUNS = """
@@ -180,6 +209,12 @@ class TelemetryDB:
         input_hash = _compute_file_hash(input_path)
         now = datetime.now(timezone.utc).isoformat()
 
+        # Stamp the runtime environment into the parameters JSON so every run
+        # carries its own provenance. Stored under "_env" to keep it separate
+        # from the module's own parameters.
+        parameters_with_env = dict(parameters or {})
+        parameters_with_env.setdefault("_env", _collect_tool_versions())
+
         self._conn.execute(
             """INSERT INTO runs
                (run_id, campaign_id, module_name, started_at, status,
@@ -193,7 +228,7 @@ class TelemetryDB:
                 "running",
                 input_hash,
                 str(input_path),
-                json.dumps(parameters),
+                json.dumps(parameters_with_env),
                 git_commit,
                 notes,
             ),

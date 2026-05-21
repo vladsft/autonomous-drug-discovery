@@ -104,12 +104,37 @@ def _pains_catalog():
         return None
 
 
-def _compute_properties(mol, sa_scorer, pains_catalog, molscore_fn=None) -> dict:
+def _compile_sanity_patterns(config: dict) -> list[tuple[str, object]]:
+    """Compile the `chemical_sanity_smarts` entries from the config.
+
+    Returns a list of (name, RDKit query mol). Entries with invalid SMARTS are
+    skipped with a warning rather than failing the whole screening run.
+    """
+    patterns = []
+    for entry in config.get("chemical_sanity_smarts", []):
+        smarts = entry.get("smarts")
+        name = entry.get("name", smarts)
+        if not smarts:
+            continue
+        query = Chem.MolFromSmarts(smarts)
+        if query is None:
+            print(f"[Screening] Warning: invalid chemical-sanity SMARTS '{smarts}' "
+                  f"({name}) — skipping.")
+            continue
+        patterns.append((name, query))
+    return patterns
+
+
+def _compute_properties(mol, sa_scorer, pains_catalog, molscore_fn=None,
+                        sanity_patterns=None) -> dict:
     """Compute all descriptors + PAINS flag for a single molecule.
 
     If `molscore_fn` is provided (a MolScore descriptor callable), it is used
     as the source of truth for the RDKit descriptors it exposes. Missing values
     fall back to direct RDKit calls so the property dict is always complete.
+
+    `sanity_patterns` is a list of (name, query-mol) from `_compile_sanity_patterns`;
+    any match sets `filter_ChemicalSanity` to 1 (i.e. the molecule is rejected).
     """
     props: dict = {}
 
@@ -143,6 +168,19 @@ def _compute_properties(mol, sa_scorer, pains_catalog, molscore_fn=None) -> dict
             props["filter_PAINS"] = 0
     else:
         props["filter_PAINS"] = 0
+
+    # Chemical-sanity flag: 1 if the molecule matches any non-physical pattern.
+    sanity_hit = None
+    for name, query in (sanity_patterns or []):
+        try:
+            if mol.HasSubstructMatch(query):
+                sanity_hit = name
+                break
+        except Exception:
+            continue
+    props["filter_ChemicalSanity"] = 1 if sanity_hit else 0
+    if sanity_hit:
+        props["chemical_sanity_alert"] = sanity_hit
 
     return props
 
@@ -183,6 +221,7 @@ def _screen_molecules(mols, smiles_list, config, backend):
     thresholds = config.get("filter_thresholds", {})
     sa_scorer = _get_sa_scorer()
     pains_catalog = _pains_catalog()
+    sanity_patterns = _compile_sanity_patterns(config)
 
     # Instantiate MolScore descriptor object once if available.
     molscore_fn = None
@@ -208,7 +247,8 @@ def _screen_molecules(mols, smiles_list, config, backend):
             continue
 
         try:
-            props = _compute_properties(mol, sa_scorer, pains_catalog, molscore_fn)
+            props = _compute_properties(mol, sa_scorer, pains_catalog, molscore_fn,
+                                        sanity_patterns)
         except Exception as e:
             results.append({
                 "molecule_id": mol_id,

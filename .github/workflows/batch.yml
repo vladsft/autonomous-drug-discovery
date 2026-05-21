@@ -1,0 +1,152 @@
+# Phase 1.5 — fire-and-forget batch over a target list.
+#
+# Trigger: Actions → "batch_cloud_run" → "Run workflow". The form fields
+# below become inputs to scripts/batch_cloud_run.py. After the batch drains,
+# the action regenerates the multi-target dashboard, commits dashboard/, and
+# deploys Pages inline (we don't rely on the pages workflow firing on
+# `paths`, because the default GITHUB_TOKEN won't trigger cross-workflow
+# runs).
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   RUNPOD_API_KEY            — RunPod console, Settings → API Keys
+#   RUNPOD_NETWORK_VOLUME_ID  — RunPod Storage → Network Volume
+#   R2_BUCKET                 — Cloudflare R2 bucket name (e.g. agent-harness)
+#   R2_ACCESS_KEY_ID          — R2 access key
+#   R2_SECRET_ACCESS_KEY      — R2 secret
+#   R2_ENDPOINT               — https://<accountid>.r2.cloudflarestorage.com
+#
+# Optional repo variable (Settings → Secrets and variables → Variables):
+#   IMAGE                     — defaults to ghcr.io/${{ github.repository }}:latest
+#   RUNPOD_GPU_TYPE           — defaults to "NVIDIA GeForce RTX 3090"
+
+name: batch_cloud_run
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'PDB codes (whitespace or comma separated, e.g. "1M17 2HYY 6P3D 8P1L")'
+        required: true
+        type: string
+      mode:
+        description: 'Generation backend'
+        required: true
+        default: targetdiff
+        type: choice
+        options: [targetdiff, rdkit, pocket2mol, simulation]
+      num_samples:
+        description: 'Molecules per target'
+        required: true
+        default: '30'
+        type: string
+      parallelism:
+        description: 'Concurrent RunPod pods (≤ 10 keeps free-tier credit healthy)'
+        required: true
+        default: '5'
+        type: string
+      force:
+        description: 'Ignore the 24h idempotency skip-list'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+# A batch run can take hours; ensure only one is in flight at a time per repo.
+# `cancel-in-progress: false` because cancelling a running batch would leak
+# pods — better to queue.
+concurrency:
+  group: batch_cloud_run
+  cancel-in-progress: false
+
+permissions:
+  contents: write    # commit the regenerated dashboard back to main
+  pages: write       # inline Pages deploy
+  id-token: write    # required by deploy-pages
+
+env:
+  IMAGE: ${{ vars.IMAGE || format('ghcr.io/{0}:latest', github.repository) }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  batch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # 5h50m; the free-tier ceiling is 6h.
+    environment:
+      name: github-pages
+      url: ${{ steps.pages-deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # we commit to main at the end
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install rclone + Python deps
+        run: |
+          curl -fsSL -o /tmp/rclone.zip \
+              https://github.com/rclone/rclone/releases/download/v1.74.1/rclone-v1.74.1-linux-amd64.zip
+          unzip -j /tmp/rclone.zip '*/rclone' -d /usr/local/bin/
+          chmod +x /usr/local/bin/rclone
+          rclone --version
+          python -m pip install --upgrade pip
+          # batch_cloud_run.py + regenerate_dashboard.py + build_demo_dataset.py.
+          pip install requests rdkit-pypi
+
+      - name: Run the batch
+        env:
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_NETWORK_VOLUME_ID: ${{ secrets.RUNPOD_NETWORK_VOLUME_ID }}
+          RUNPOD_GPU_TYPE: ${{ vars.RUNPOD_GPU_TYPE || 'NVIDIA GeForce RTX 3090' }}
+        run: |
+          set -euo pipefail
+          force_flag=""
+          if [ "${{ inputs.force }}" = "true" ]; then force_flag="--force"; fi
+          python scripts/batch_cloud_run.py \
+            --targets "${{ inputs.targets }}" \
+            --mode "${{ inputs.mode }}" \
+            --num-samples ${{ inputs.num_samples }} \
+            --parallelism ${{ inputs.parallelism }} \
+            ${force_flag}
+
+      - name: Regenerate the multi-target dashboard
+        run: |
+          python scripts/regenerate_dashboard.py --all-targets
+
+      - name: Commit dashboard back to main
+        run: |
+          git config user.name  "agent-harness-bot"
+          git config user.email "agent-harness@users.noreply.github.com"
+          if git diff --quiet dashboard/; then
+            echo "No dashboard changes to commit."
+          else
+            git add dashboard/
+            git commit -m "batch: refresh dashboard from $(date -u +%Y-%m-%d) campaigns"
+            git push
+          fi
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dashboard
+
+      # Inline Pages deploy — we don't rely on the separate pages.yml firing on
+      # a push, because GITHUB_TOKEN-driven pushes don't trigger child workflows.
+      - id: pages-deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Upload batch summary as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-summary
+          path: data/batch_summary.json
+          if-no-files-found: ignore
+          retention-days: 30

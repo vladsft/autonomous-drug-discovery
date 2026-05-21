@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Regenerate the static chemist dashboard from local telemetry.
+
+This is what `make dashboard` calls and what `batch_cloud_run.py` invokes at
+the end of a batch. Auto-discovers, per target and per generator backend, the
+latest successful campaign in telemetry.db and assembles a multi-target,
+multi-backend `professor_demo.js`. The heavy lifting (RDKit drawing, ADMET
+flags, composite score) lives in `build_demo_dataset.py`; this script is the
+glue that finds the inputs and calls into it.
+
+Usage:
+    # Single target (default 1M17)
+    python scripts/regenerate_dashboard.py
+    python scripts/regenerate_dashboard.py --target 2HYY
+
+    # All targets present in telemetry (the Phase-1.5 path)
+    python scripts/regenerate_dashboard.py --all-targets
+
+Output schema (multi-target):
+    { "targets": { "1M17": { … single-target shape … },
+                   "2HYY": { … }, … },
+      "default_target": "1M17",
+      "generated_at": "...",
+      ... shared metadata ... }
+
+For each backend, the script looks for an AiZynthFinder output at
+`<data_dir>/outputs/aizynth_<backend>.json` (the convention this repo already
+uses for the EGFR demo). If absent, that backend's molecules are emitted
+without synthesis annotations — the dashboard still loads.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PKG_ROOT = REPO_ROOT / "autonomous_drug_discovery"
+
+# build_demo_dataset.py lives next to us; reuse its dataset assembly.
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+import build_demo_dataset as bdd  # noqa: E402
+
+# A target's "known drug" caption on the dashboard. Add new targets here as we
+# extend Phase 1; missing entries fall back to a generic caption.
+TARGET_METADATA: dict[str, dict] = {
+    "1M17": {
+        "name": "EGFR (Epidermal Growth Factor Receptor)",
+        "disease": "Non-small cell lung cancer",
+        "known_drug": "Erlotinib",
+    },
+    "2HYY": {
+        "name": "BCR-ABL kinase",
+        "disease": "Chronic myeloid leukemia",
+        "known_drug": "Imatinib",
+    },
+    "6P3D": {
+        "name": "BRAF V600E",
+        "disease": "Melanoma",
+        "known_drug": "Ponatinib",
+    },
+    "8P1L": {
+        "name": "8P1L (research target)",
+        "disease": "Internal validation",
+        "known_drug": None,
+    },
+}
+
+# Order matters: the first backend with a complete campaign becomes the
+# dashboard's default tab. RDKit ships in every image, so put it first.
+BACKEND_ORDER = ["rdkit", "targetdiff", "pocket2mol"]
+
+
+def latest_successful_campaign(
+    db_path: Path, target: str, backend: str
+) -> str | None:
+    """Return the most recent campaign_id whose generation stage succeeded
+    for (target, backend), or None if no such campaign exists."""
+    if not db_path.exists():
+        return None
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # Match the manifest by stem so both `<TARGET>_manifest.json` and
+        # per-pocket variants like `<TARGET>_pocket2_manifest.json` count.
+        # Two LIKE patterns instead of one with a wildcard in the middle —
+        # otherwise `target="1M1"` would false-match `1M17_manifest.json`.
+        rows = conn.execute(
+            """SELECT campaign_id, parameters
+               FROM runs
+               WHERE module_name = '02_generation'
+                 AND status = 'success'
+                 AND (input_path LIKE ? OR input_path LIKE ?)
+               ORDER BY started_at DESC""",
+            (f"%/{target}_manifest.json", f"%/{target}_pocket%_manifest.json"),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for cid, params_json in rows:
+        try:
+            params = json.loads(params_json) if params_json else {}
+        except json.JSONDecodeError:
+            continue
+        if params.get("mode") == backend:
+            return cid
+    return None
+
+
+# Map backend → list of acceptable AiZynth filenames inside data/outputs/. The
+# bare `aizynth_<backend>.json` form is the canonical name going forward; the
+# legacy aliases below are the names used by the original EGFR demo (2026-05-10).
+# When you add a new backend, prefer the canonical form and skip the alias.
+LEGACY_AIZYNTH_ALIASES: dict[str, list[str]] = {
+    "rdkit": ["aizynth_rdkit.json", "aizynth_top10.json"],
+    "pocket2mol": ["aizynth_pocket2mol.json", "aizynth_p2m.json"],
+    "targetdiff": ["aizynth_targetdiff.json", "aizynth_td.json"],
+}
+
+
+def discover_aizynth(data_dir: Path, backend: str, campaign_id: str) -> Path | None:
+    """Find an AiZynthFinder result JSON for this campaign, if any.
+
+    Preference order:
+      1. Per-campaign:  data/<campaign>/aizynth_top10.json (canonical, future)
+      2. Global:        data/outputs/aizynth_<backend>.json (+ legacy aliases)
+    """
+    per_campaign = data_dir / campaign_id / "aizynth_top10.json"
+    if per_campaign.exists():
+        return per_campaign
+    candidates = LEGACY_AIZYNTH_ALIASES.get(backend, [f"aizynth_{backend}.json"])
+    for name in candidates:
+        path = data_dir / "outputs" / name
+        if path.exists():
+            return path
+    # build_demo_dataset.py expects a JSON file; an empty list keeps it happy
+    # and the dashboard handles missing synthesis annotations gracefully.
+    return None
+
+
+@contextlib.contextmanager
+def _campaign_base(data_dir: Path):
+    """Temporarily repoint build_demo_dataset.CAMPAIGN_BASE.
+
+    `bdd` is hard-coded to read campaigns under autonomous_drug_discovery/data;
+    we point it at whichever data dir the caller asked for, then restore. The
+    restore-on-exit is what makes this safe to call repeatedly inside tests
+    that use distinct tmp directories.
+    """
+    previous = bdd.CAMPAIGN_BASE
+    bdd.CAMPAIGN_BASE = data_dir
+    try:
+        yield
+    finally:
+        bdd.CAMPAIGN_BASE = previous
+
+
+def discover_targets(db_path: Path) -> list[str]:
+    """Return the distinct target codes present in telemetry, newest-first.
+
+    Mirrors the LIKE-pattern matching used by `latest_successful_campaign`.
+    Used by --all-targets to enumerate the dashboard's target list.
+    """
+    if not db_path.exists():
+        return []
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            """SELECT input_path FROM runs
+               WHERE module_name = '02_generation'
+                 AND status = 'success'
+                 AND input_path LIKE '%_manifest.json'
+               ORDER BY started_at DESC"""
+        ).fetchall()
+    finally:
+        conn.close()
+
+    seen: list[str] = []
+    for (path,) in rows:
+        if not path:
+            continue
+        stem = Path(path).stem
+        if stem.endswith("_manifest"):
+            stem = stem[: -len("_manifest")]
+        # Strip per-pocket suffix (e.g. "8P1L_pocket2" → "8P1L").
+        target = stem.split("_")[0]
+        if target and target not in seen:
+            seen.append(target)
+    return seen
+
+
+def build_target_dataset(
+    target: str,
+    data_dir: Path,
+    max_per_backend: int,
+    backends_requested: list[str],
+) -> dict | None:
+    """Assemble one target's per-backend dataset. Returns None if the target
+    has no usable campaigns. Pure: writes no files."""
+    db_path = data_dir / "telemetry.db"
+    if not db_path.exists():
+        print(f"[regen] telemetry.db not found at {db_path}", file=sys.stderr)
+        return None
+
+    backends_data: dict[str, dict] = {}
+    insertion_order: list[str] = []
+
+    with _campaign_base(data_dir):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="regen_dash_") as tmp:
+            empty_path = Path(tmp) / "empty_aizynth.json"
+            empty_path.write_text("[]")
+
+            for backend in backends_requested:
+                cid = latest_successful_campaign(db_path, target, backend)
+                if cid is None:
+                    print(f"[regen] {target}: no successful {backend} campaign; skipping")
+                    continue
+                az_path = discover_aizynth(data_dir, backend, cid) or empty_path
+                print(f"[regen] {target}: {backend} campaign={cid} aizynth={az_path.name}")
+                try:
+                    backends_data[backend] = bdd.build_backend_dataset(
+                        backend, cid, az_path, max_molecules=max_per_backend
+                    )
+                    insertion_order.append(backend)
+                except FileNotFoundError as e:
+                    print(f"[regen] {target}: {backend} skipped — {e}", file=sys.stderr)
+
+    if not backends_data:
+        return None
+
+    meta = TARGET_METADATA.get(target, {
+        "name": target, "disease": "—", "known_drug": None,
+    })
+    return {
+        "pdb": target, **meta,
+        "backends": backends_data,
+        "backend_order": insertion_order,
+        "default_backend": insertion_order[0],
+    }
+
+
+def write_dashboard(out_dir: Path, targets_data: dict[str, dict],
+                    target_order: list[str]) -> int:
+    """Write the multi-target dashboard JSON + JS bridge. Returns 0 / 1."""
+    if not targets_data:
+        print("[regen] no targets to write", file=sys.stderr)
+        return 1
+    doc = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "default_target": target_order[0],
+        "target_order": target_order,
+        "targets": targets_data,
+        "pipeline": {
+            "screening_backend": "MolScore + ADMET-AI (104 properties)",
+            "docking_backend": "AutoDock Vina (production)",
+            "synthesis_backend": "AiZynthFinder (USPTO + ZINC)",
+        },
+        "generator_descriptions": dict(bdd.GENERATOR_DESCRIPTIONS),
+        "admet_pass_rules": {
+            k: {"kind": v[0], "threshold": v[1]}
+            for k, v in bdd.ADMET_PASS_RULES.items()
+        },
+    }
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / "professor_demo.json"
+    js_path = out_dir / "professor_demo.js"
+    json_path.write_text(json.dumps(doc, indent=2))
+    with js_path.open("w") as f:
+        f.write("window.PROFESSOR_DEMO_DATA = ")
+        json.dump(doc, f)
+        f.write(";\n")
+
+    print(f"[regen] wrote {json_path}")
+    print(f"[regen] wrote {js_path}")
+    print(f"[regen] targets: {', '.join(target_order)}")
+    return 0
+
+
+def assemble(
+    target: str,
+    data_dir: Path,
+    out_dir: Path,
+    max_per_backend: int,
+    backends_requested: list[str],
+) -> int:
+    """Single-target convenience wrapper. Always writes the multi-target
+    schema with a single key (so the dashboard JS has one consistent shape)."""
+    payload = build_target_dataset(target, data_dir, max_per_backend, backends_requested)
+    if payload is None:
+        print(f"[regen] no usable campaigns for {target}", file=sys.stderr)
+        return 1
+    return write_dashboard(out_dir, {target: payload}, [target])
+
+
+def assemble_all(
+    data_dir: Path,
+    out_dir: Path,
+    max_per_backend: int,
+    backends_requested: list[str],
+    targets_override: list[str] | None = None,
+) -> int:
+    """Enumerate every target in telemetry and assemble each. Targets without
+    any successful campaign in the requested backends are silently dropped."""
+    db_path = data_dir / "telemetry.db"
+    if not db_path.exists():
+        print(f"[regen] telemetry.db not found at {db_path}", file=sys.stderr)
+        return 1
+
+    targets = targets_override or discover_targets(db_path)
+    if not targets:
+        print("[regen] no targets found in telemetry", file=sys.stderr)
+        return 1
+
+    targets_data: dict[str, dict] = {}
+    order: list[str] = []
+    for t in targets:
+        payload = build_target_dataset(t, data_dir, max_per_backend, backends_requested)
+        if payload is not None:
+            targets_data[t] = payload
+            order.append(t)
+
+    if not order:
+        print("[regen] none of the discovered targets had usable campaigns",
+              file=sys.stderr)
+        return 1
+    return write_dashboard(out_dir, targets_data, order)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--target", default="1M17",
+                    help="PDB stem (default: 1M17 — ignored when --all-targets is set)")
+    ap.add_argument("--all-targets", action="store_true",
+                    help="Discover every target in telemetry; the Phase-1.5 batch path")
+    ap.add_argument("--data-dir", default=str(PKG_ROOT / "data"), type=Path,
+                    help="Root data directory (must contain telemetry.db)")
+    ap.add_argument("--out", default=str(REPO_ROOT / "dashboard"), type=Path,
+                    help="Dashboard output directory")
+    ap.add_argument("--max-per-backend", type=int, default=30,
+                    help="Cap molecules per backend (default 30)")
+    ap.add_argument("--backends", nargs="+", default=BACKEND_ORDER,
+                    help=f"Backends to include (default: {' '.join(BACKEND_ORDER)})")
+    args = ap.parse_args()
+    if args.all_targets:
+        return assemble_all(
+            data_dir=Path(args.data_dir),
+            out_dir=Path(args.out),
+            max_per_backend=args.max_per_backend,
+            backends_requested=list(args.backends),
+        )
+    return assemble(
+        target=args.target,
+        data_dir=Path(args.data_dir),
+        out_dir=Path(args.out),
+        max_per_backend=args.max_per_backend,
+        backends_requested=list(args.backends),
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

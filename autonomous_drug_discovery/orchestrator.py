@@ -47,6 +47,24 @@ def get_python_cmd(env_name):
     return [conda_bin, "run", "-n", env_name, "python"]
 
 
+def check_stage_output(path, description, min_bytes=1):
+    """Tripwire: verify a stage actually produced a non-trivial output file.
+
+    A module can exit 0 yet leave an empty or missing artefact (a broken
+    receptor once produced a docking CSV of all-zero scores). Returns True if
+    `path` exists and is at least `min_bytes`; otherwise prints why and returns
+    False so the pipeline stops instead of feeding garbage to the next stage.
+    """
+    p = Path(path)
+    if not p.exists():
+        print(f"[Orchestrator] TRIPWIRE: {description} missing — expected {p}")
+        return False
+    if p.stat().st_size < min_bytes:
+        print(f"[Orchestrator] TRIPWIRE: {description} is empty — {p}")
+        return False
+    return True
+
+
 def run_ingestion(pdb_path, db_path, campaign_id, clean_pdb=False, pocket_backend="p2rank"):
     """Run the ingestion module (P2Rank or fpocket)."""
     print(f"\n{'='*60}")
@@ -79,12 +97,16 @@ def run_ingestion(pdb_path, db_path, campaign_id, clean_pdb=False, pocket_backen
 
 
 def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
-                   output_dir=None):
+                   output_dir=None, num_samples=None, device="auto"):
     """Run the generation module.
 
     Dispatches to the appropriate conda env based on `mode`:
     RDKit/simulation stay in `base`, `targetdiff` → `targetdiff_env`,
     `pocket2mol` → `pocket2mol_env`.
+
+    `num_samples`, when set, overrides the per-mode default campaign size.
+    `device` ("auto"/"cuda"/"cpu") selects the compute device for the
+    GPU-capable backends; "auto" detects a GPU.
     """
     print(f"\n{'='*60}")
     print(f"[Orchestrator] Stage 2: GENERATION — mode={mode}")
@@ -108,6 +130,10 @@ def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
         "--campaign_id", campaign_id,
         "--mode", mode,
     ]
+    if num_samples is not None:
+        cmd += ["--num_samples", str(num_samples)]
+    if device:
+        cmd += ["--device", str(device)]
 
     try:
         subprocess.check_call(cmd)
@@ -183,8 +209,14 @@ def run_docking(manifest_path, db_path, campaign_id, mode="simulation",
         return False
 
 
-def run_ranking(docking_csv, screening_json, db_path, campaign_id, output_dir=None):
-    """Run the ranking module (multi-criteria final ranker)."""
+def run_ranking(docking_csv, screening_json, db_path, campaign_id, output_dir=None,
+                aizynth_config=None):
+    """Run the ranking module (multi-criteria final ranker).
+
+    `aizynth_config`, when set, points the ranker at an AiZynthFinder config so
+    the top-N candidates get retrosynthetic feasibility scores; otherwise the
+    synthesis term stays neutral.
+    """
     print(f"\n{'='*60}")
     print(f"[Orchestrator] Stage 5: RANKING")
     print(f"{'='*60}")
@@ -205,6 +237,8 @@ def run_ranking(docking_csv, screening_json, db_path, campaign_id, output_dir=No
     ]
     if screening_json:
         cmd += ["--screening_json", str(screening_json)]
+    if aizynth_config:
+        cmd += ["--aizynth_config", str(aizynth_config)]
 
     try:
         subprocess.check_call(cmd)
@@ -212,6 +246,48 @@ def run_ranking(docking_csv, screening_json, db_path, campaign_id, output_dir=No
         return True
     except subprocess.CalledProcessError as e:
         print(f"[Orchestrator] ERROR: Ranking failed with code {e.returncode}")
+        return False
+
+
+def run_validation(holo_pdb, db_path, campaign_id, ligand_resname,
+                   ligand_smiles=None, exhaustiveness=16, decoys=None):
+    """Run retrospective docking validation (re-dock a known ligand)."""
+    print(f"\n{'='*60}")
+    print(f"[Orchestrator] DOCKING VALIDATION — {holo_pdb} (ligand={ligand_resname})")
+    print(f"{'='*60}")
+
+    script_path = MODULES_DIR / "04_docking" / "validate_docking.py"
+    if not script_path.exists():
+        print(f"Error: Validation module not found at {script_path}")
+        return False
+
+    cmd = get_python_cmd("base") + [
+        str(script_path),
+        "--holo_pdb", str(holo_pdb),
+        "--ligand_resname", ligand_resname,
+        "--output_dir", str(DATA_DIR / "validation"),
+        "--db_path", db_path,
+        "--campaign_id", campaign_id,
+        "--exhaustiveness", str(exhaustiveness),
+    ]
+    if ligand_smiles:
+        cmd += ["--ligand_smiles", ligand_smiles]
+    if decoys:
+        cmd += ["--decoys", str(decoys)]
+
+    try:
+        subprocess.check_call(cmd)
+        print("[Orchestrator] Validation PASSED (pose RMSD within threshold).\n")
+        return True
+    except subprocess.CalledProcessError as e:
+        # validate_docking.py exits 2 specifically when re-docking misses the
+        # RMSD bar — that's a meaningful "docking setup is not trustworthy"
+        # result, not a crash.
+        if e.returncode == 2:
+            print("[Orchestrator] Validation FAILED: re-docking did not "
+                  "reproduce the crystal pose within the RMSD threshold.")
+        else:
+            print(f"[Orchestrator] ERROR: Validation failed with code {e.returncode}")
         return False
 
 
@@ -262,6 +338,11 @@ def main():
     gen_parser.add_argument("manifest", help="Path to ingestion manifest.json")
     gen_parser.add_argument("--mode", choices=["simulation", "rdkit", "targetdiff", "pocket2mol", "production"],
                             default="simulation", help="Execution mode")
+    gen_parser.add_argument("--num_samples", type=int, default=None,
+                            help="Number of molecules to generate (overrides the per-mode default)")
+    gen_parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                            help="Compute device for GPU-capable backends "
+                                 "(targetdiff/pocket2mol); 'auto' detects a GPU")
 
     # Screen command
     screen_parser = subparsers.add_parser("screen", help="Screen molecules through fast triage")
@@ -278,6 +359,24 @@ def main():
     rank_parser.add_argument("docking_csv", help="Path to docking_results.csv (Stage 4 output)")
     rank_parser.add_argument("--screening_json", default=None,
                              help="Optional screening_report.json for ADMET enrichment")
+    rank_parser.add_argument("--aizynth_config", default=os.environ.get("AIZYNTH_CONFIG"),
+                             help="AiZynthFinder config.yml — enables retrosynthetic "
+                                  "scoring of the top-N candidates (default: $AIZYNTH_CONFIG)")
+
+    # Validate command (retrospective docking validation)
+    validate_parser = subparsers.add_parser(
+        "validate", help="Retrospective docking validation — re-dock a known ligand")
+    validate_parser.add_argument("holo_pdb", help="Holo PDB (protein + co-crystal ligand)")
+    validate_parser.add_argument("--ligand_resname", required=True,
+                                 help="3-letter HETATM residue name of the ligand")
+    validate_parser.add_argument("--ligand_smiles", default=None,
+                                 help="Ligand SMILES — assigns correct bond orders "
+                                      "to the crystal pose (recommended)")
+    validate_parser.add_argument("--exhaustiveness", type=int, default=16,
+                                 help="Vina exhaustiveness for the re-docking")
+    validate_parser.add_argument("--decoys", default=None,
+                                 help="Optional decoy SMILES file for an "
+                                      "enrichment check")
 
     # Full Pipeline command
     pipeline_parser = subparsers.add_parser("run", help="Run full pipeline")
@@ -286,8 +385,16 @@ def main():
                                  default="simulation", help="Execution mode")
     pipeline_parser.add_argument("--backend", choices=["p2rank", "fpocket"], default="p2rank",
                                  help="Pocket detection backend (default: p2rank)")
+    pipeline_parser.add_argument("--num_samples", type=int, default=None,
+                                 help="Number of molecules to generate (overrides the per-mode default)")
     pipeline_parser.add_argument("--clean", action="store_true",
                                  help="Drop HETATM/waters/alt locs before detection")
+    pipeline_parser.add_argument("--aizynth_config", default=os.environ.get("AIZYNTH_CONFIG"),
+                                 help="AiZynthFinder config.yml — enables retrosynthetic "
+                                      "scoring in Stage 5 (default: $AIZYNTH_CONFIG)")
+    pipeline_parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                                 help="Compute device for GPU-capable generation "
+                                      "(targetdiff/pocket2mol); 'auto' detects a GPU")
 
     args = parser.parse_args()
 
@@ -307,7 +414,8 @@ def main():
 
     elif args.command == "generate":
         mode = getattr(args, "mode", "simulation")
-        ok = run_generation(args.manifest, db_path, campaign_id, mode)
+        ok = run_generation(args.manifest, db_path, campaign_id, mode,
+                            num_samples=args.num_samples, device=args.device)
 
     elif args.command == "screen":
         ok = run_screening(args.input_sdf, db_path, campaign_id)
@@ -318,7 +426,15 @@ def main():
 
     elif args.command == "rank":
         ok = run_ranking(args.docking_csv, args.screening_json,
-                         db_path, campaign_id)
+                         db_path, campaign_id,
+                         aizynth_config=args.aizynth_config)
+
+    elif args.command == "validate":
+        ok = run_validation(args.holo_pdb, db_path, campaign_id,
+                            ligand_resname=args.ligand_resname,
+                            ligand_smiles=args.ligand_smiles,
+                            exhaustiveness=args.exhaustiveness,
+                            decoys=args.decoys)
 
     elif args.command == "run":
         mode = getattr(args, "mode", "simulation")
@@ -344,25 +460,37 @@ def main():
         print(f"[Orchestrator] Running FULL PIPELINE — gen={gen_mode}, dock={dock_mode}")
         print(f"[Orchestrator] Campaign directory: {campaign_dir}")
 
+        manifest_path = DATA_DIR / "processed" / f"{pdb_path.stem}_manifest.json"
+        sdf_path = Path(gen_dir) / "generated_molecules.sdf"
+        screened_sdf = Path(screen_dir) / "screened_molecules.sdf"
+        docking_csv = Path(dock_dir) / "docking_results.csv"
+
         ok = run_ingestion(pdb_path, db_path, campaign_id,
                            clean_pdb=args.clean, pocket_backend=args.backend)
         if ok:
-            manifest_path = DATA_DIR / "processed" / f"{pdb_path.stem}_manifest.json"
-            ok = run_generation(manifest_path, db_path, campaign_id, gen_mode,
-                                output_dir=gen_dir)
+            ok = check_stage_output(manifest_path, "ingestion manifest")
         if ok:
-            sdf_path = Path(gen_dir) / "generated_molecules.sdf"
+            ok = run_generation(manifest_path, db_path, campaign_id, gen_mode,
+                                output_dir=gen_dir, num_samples=args.num_samples,
+                                device=args.device)
+        if ok:
+            ok = check_stage_output(sdf_path, "generated molecules SDF", min_bytes=64)
+        if ok:
             ok = run_screening(sdf_path, db_path, campaign_id,
                                output_dir=screen_dir)
+        if ok:
+            ok = check_stage_output(screened_sdf, "screened molecules SDF")
         if ok:
             ok = run_docking(manifest_path, db_path, campaign_id, dock_mode,
                              candidates_dir=screen_dir, output_dir=dock_dir)
         if ok:
-            docking_csv = Path(dock_dir) / "docking_results.csv"
+            ok = check_stage_output(docking_csv, "docking results CSV", min_bytes=64)
+        if ok:
             screening_json = Path(screen_dir) / "screening_report.json"
             ok = run_ranking(docking_csv,
                              screening_json if screening_json.exists() else None,
-                             db_path, campaign_id, output_dir=rank_dir)
+                             db_path, campaign_id, output_dir=rank_dir,
+                             aizynth_config=args.aizynth_config)
 
         print_campaign_summary(db_path, campaign_id)
     else:

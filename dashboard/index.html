@@ -107,8 +107,23 @@
       font-family: var(--mono);
       font-size: 12px;
       color: var(--text-dim);
+      display: flex;
+      gap: 10px;
+      align-items: center;
     }
     header.summary .target b { color: var(--text); font-weight: 600; }
+    .target-select {
+      font-family: var(--mono);
+      font-size: 12px;
+      background: var(--bg);
+      color: var(--accent);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 4px 8px;
+      cursor: pointer;
+    }
+    .target-select:hover { border-color: var(--accent); }
+    .target-info { color: var(--text-dim); }
     header.summary .stat .label {
       font-size: 10px;
       text-transform: uppercase;
@@ -332,7 +347,10 @@
       <div class="sub">candidate review · v0.1</div>
     </div>
     <div class="backends" id="backend-pills"></div>
-    <div class="target" id="target-info"></div>
+    <div class="target">
+      <select id="target-select" class="target-select" aria-label="Target"></select>
+      <span class="target-info" id="target-info"></span>
+    </div>
     <div class="stat"><div class="label">Generated</div><div class="value" id="stat-generated">—</div></div>
     <div class="stat"><div class="label">Passed Screening</div><div class="value" id="stat-screening">—</div><div class="sub" id="stat-screening-pct"></div></div>
     <div class="stat"><div class="label">Synthesis Routes</div><div class="value" id="stat-synth">—</div><div class="sub" id="stat-synth-sub"></div></div>
@@ -424,19 +442,28 @@
     return;
   }
 
-  // ---- Multi-backend support -------------------------------------------
-  // Schema: data.backends = { name: {summary, molecules, ...} }; data.backend_order
-  // gives the display order; data.default_backend names the initially active one.
-  const backendOrder = data.backend_order || Object.keys(data.backends || {});
+  // ---- Multi-target + multi-backend support ----------------------------
+  // Schema (Phase 1.5):
+  //   data.targets        = { "1M17": {pdb, name, disease, known_drug,
+  //                                    backends: {…}, backend_order, default_backend},
+  //                            "2HYY": {…}, … }
+  //   data.target_order   = ordered list of target codes
+  //   data.default_target = first target shown
+  // Pre-1.5 shape (data.target + data.backends) is no longer emitted; the
+  // single-target path is just a one-key targets map.
+  const targetsMap = data.targets || {};
+  const targetOrder = data.target_order || Object.keys(targetsMap);
+  if (targetOrder.length === 0) {
+    document.body.innerHTML = '<div style="padding:40px;font-family:monospace;color:#f85149">'
+      + 'professor_demo.js is empty (no targets). Run regenerate_dashboard.py.</div>';
+    return;
+  }
   const generatorDescriptions = data.generator_descriptions || {};
-
-  // ---- Target line + brand --------------------------------------------
-  const t = data.target || {};
-  $('target-info').innerHTML = `Target: <b>${t.pdb || ''}</b> · ${t.name || ''} · ${t.disease || ''} · known drug: <b>${t.known_drug || '—'}</b>`;
 
   // ---- State ------------------------------------------------------------
   const state = {
-    activeBackend: data.default_backend || backendOrder[0],
+    activeTarget: data.default_target || targetOrder[0],
+    activeBackend: null,   // computed per active target
     sortKey: 'composite_score',
     sortDir: 'desc',
     selectedId: null,
@@ -447,8 +474,42 @@
     }
   };
 
+  function currentTarget() {
+    return targetsMap[state.activeTarget] || { pdb: '—', backends: {}, backend_order: [] };
+  }
+  function currentBackendOrder() {
+    return currentTarget().backend_order || Object.keys(currentTarget().backends || {});
+  }
   function currentDataset() {
-    return (data.backends || {})[state.activeBackend] || { molecules: [], summary: {} };
+    return (currentTarget().backends || {})[state.activeBackend] || { molecules: [], summary: {} };
+  }
+
+  // ---- Target line ----------------------------------------------------
+  function renderTargetSelector() {
+    const sel = $('target-select');
+    sel.innerHTML = targetOrder.map(code => {
+      const t = targetsMap[code] || {};
+      const label = t.name ? `${code} — ${t.name.split(' (')[0]}` : code;
+      const selected = code === state.activeTarget ? ' selected' : '';
+      return `<option value="${code}"${selected}>${label}</option>`;
+    }).join('');
+    sel.onchange = () => setActiveTarget(sel.value);
+  }
+  function renderTargetInfo() {
+    const t = currentTarget();
+    $('target-info').innerHTML = `· ${t.disease || '—'} · known drug: <b>${t.known_drug || '—'}</b>`;
+  }
+  function setActiveTarget(code) {
+    if (!targetsMap[code]) return;
+    state.activeTarget = code;
+    state.activeBackend = currentTarget().default_backend || currentBackendOrder()[0];
+    state.selectedId = null;
+    renderTargetInfo();
+    renderBackendPills();
+    renderGeneratorDescription();
+    renderSummary();
+    renderRows();
+    renderDetail(null);
   }
 
   function renderSummary() {
@@ -467,8 +528,10 @@
   }
 
   function renderBackendPills() {
-    const s = (b) => (data.backends[b].summary || {});
-    $('backend-pills').innerHTML = '<span class="label">Generator</span>' + backendOrder.map(b => {
+    const backends = currentTarget().backends || {};
+    const order = currentBackendOrder();
+    const s = (b) => (backends[b]?.summary || {});
+    $('backend-pills').innerHTML = '<span class="label">Generator</span>' + order.map(b => {
       const summary = s(b);
       const n = summary.total_generated ?? 0;
       const cls = b === state.activeBackend ? 'pill active' : 'pill';
@@ -487,7 +550,7 @@
   }
 
   function setActiveBackend(name) {
-    if (!data.backends[name]) return;
+    if (!(currentTarget().backends || {})[name]) return;
     state.activeBackend = name;
     state.selectedId = null;
     renderBackendPills();
@@ -735,12 +798,18 @@
       renderRows();
     });
   }
-  // Set initial dock-max bound based on the union of all backends, so the
-  // slider range stays stable as the user toggles between generators.
+  // Set initial dock-max bound based on the union of all targets × backends, so
+  // the slider range stays stable as the user toggles between targets/generators.
   const dockEl = $('dock-max');
-  const allDockingScores = backendOrder.flatMap(b =>
-    (data.backends[b].molecules || []).map(m => m.docking_score ?? 0)
-  );
+  const allDockingScores = [];
+  for (const tcode of targetOrder) {
+    const tbe = targetsMap[tcode]?.backends || {};
+    for (const b of Object.keys(tbe)) {
+      for (const m of tbe[b].molecules || []) {
+        if (typeof m.docking_score === 'number') allDockingScores.push(m.docking_score);
+      }
+    }
+  }
   const dockMin = Math.floor(Math.min(0, ...allDockingScores) - 1);
   dockEl.min = dockMin;
   dockEl.value = 0;
@@ -781,6 +850,10 @@
     });
   });
 
+  // Seed activeBackend off the active target before any render touches it.
+  state.activeBackend = currentTarget().default_backend || currentBackendOrder()[0];
+  renderTargetSelector();
+  renderTargetInfo();
   renderBackendPills();
   renderGeneratorDescription();
   renderSummary();

@@ -1,0 +1,30 @@
+# AiZynthFinder Environment — retrosynthetic route feasibility (Stage 5 ranking).
+#
+# Kept separate from `base`: AiZynthFinder pins its own ML stack (onnxruntime +
+# a pinned RDKit) that conflicts with the orchestrator environment. Stage 5
+# shells into this env via `conda run -n aizynth_env` — see
+# scripts/aizynth_score.py — so the two never have to co-resolve.
+#
+# Install:
+#   conda env create -f env_aizynth.yml
+#
+# Then download the public USPTO expansion model + ZINC stock (~600 MB). This
+# also writes the config.yml the ranker points at:
+#   conda run -n aizynth_env download_public_data ~/aizynth_data
+#
+# Run the pipeline with synthesis scoring enabled:
+#   orchestrator.py rank docking_results.csv --aizynth_config ~/aizynth_data/config.yml
+# or set AIZYNTH_CONFIG=~/aizynth_data/config.yml in the environment.
+#
+# Without a config the pipeline still runs — synthesis just stays neutral.
+
+name: aizynth_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - rdkit
+  - pip
+  - pip:
+    - aizynthfinder>=4.3

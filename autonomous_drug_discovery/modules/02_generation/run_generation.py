@@ -64,12 +64,19 @@ _DEFAULT_PARAMS_BY_MODE = {
     "simulation": {"num_samples": 1},
     "rdkit": {"num_samples": 100, "seed": 42},
     "targetdiff": {
-        "num_samples": 3,
+        # Diffusion validity is low and the new lead-like screening floor
+        # (heavy-atom / MW minimums) rejects undersized output, so generate a
+        # real batch — a default of 3 leaves nothing to be selective with.
+        "num_samples": 20,
         "sampling_steps": 1000,
         "noise_schedule": "polynomial_2",
         "batch_size": 16,
         "device": "cpu",
         "seed": 2021,
+        # How TargetDiff picks each ligand's atom count. "prior" samples from a
+        # learned size prior conditioned on the pocket; "range" sweeps sizes
+        # across a batch; "ref" copies a reference ligand's count (needs one).
+        "sample_num_atoms": "prior",
     },
     "pocket2mol": {
         "num_samples": 1,
@@ -88,6 +95,21 @@ def _default_params(mode: str) -> dict:
     if mode == "production":  # legacy alias → rdkit
         mode = "rdkit"
     return dict(_DEFAULT_PARAMS_BY_MODE.get(mode, _DEFAULT_PARAMS_BY_MODE["rdkit"]))
+
+
+def _resolve_device(requested):
+    """Resolve a device request to a concrete 'cuda' or 'cpu'.
+
+    'auto' (or None) picks 'cuda' when a usable GPU is visible, else 'cpu'.
+    An explicit 'cuda'/'cpu' is returned unchanged.
+    """
+    if requested not in (None, "auto"):
+        return requested
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -149,38 +171,45 @@ LINKERS = [
 
 
 def run_generation_simulation(manifest, out_path, parameters):
-    """Simulation mode: generate a stub SDF for pipeline testing."""
+    """Simulation mode: emit a few lead-like stub molecules for pipeline testing.
+
+    The stubs are deliberately lead-sized and chemically sane (approved drugs)
+    so they survive the Stage-3 lead-like screening floor and let the smoke
+    test exercise docking + ranking too. A bare benzene stub would be filtered
+    out at screening, leaving the rest of the pipeline untested.
+    """
     print("[Generation] (SIMULATION MODE) Generating stub molecules...")
 
     simulated_mol = out_path / "generated_molecules.sdf"
     out_path.mkdir(parents=True, exist_ok=True)
 
-    sdf_content = """
-     RDKit          3D
+    if not HAS_RDKIT:
+        raise ImportError("RDKit is required for simulation-mode stub generation.")
 
-  6  6  0  0  0  0  0  0  0  0999 V2000
-    1.2124    0.7000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-    1.2124   -0.7000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-    0.0000   -1.4000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-   -1.2124   -0.7000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-   -1.2124    0.7000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-    0.0000    1.4000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-  1  2  2  0
-  2  3  1  0
-  3  4  2  0
-  4  5  1  0
-  5  6  2  0
-  6  1  1  0
-M  END
->  <molecule_id>
-mol_0000
+    # Lead-sized, chemically sane reference molecules (approved drugs): each
+    # clears the default screening thresholds (MW 250-450, 18-35 heavy atoms).
+    stub_smiles = [
+        "CN1C(=O)CN=C(c2ccccc2)c2cc(Cl)ccc21",    # diazepam
+        "CC(=O)CC(c1ccccc1)c1c(O)c2ccccc2oc1=O",  # warfarin
+        "CC(C)NCC(O)COc1cccc2ccccc12",            # propranolol
+    ]
+    writer = Chem.SDWriter(str(simulated_mol))
+    written = 0
+    for i, smi in enumerate(stub_smiles):
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        mol = Chem.AddHs(mol)
+        if AllChem.EmbedMolecule(mol, randomSeed=42) != 0:
+            continue
+        mol = Chem.RemoveHs(mol)
+        mol.SetProp("molecule_id", f"mol_{i:04d}")
+        mol.SetProp("_Name", f"mol_{i:04d}")
+        writer.write(mol)
+        written += 1
+    writer.close()
 
-$$$$
-"""
-    with open(simulated_mol, "w") as f:
-        f.write(sdf_content)
-
-    print(f"[Generation] Stub SDF written to {simulated_mol}")
+    print(f"[Generation] Stub SDF ({written} molecules) written to {simulated_mol}")
     return str(simulated_mol)
 
 
@@ -491,6 +520,14 @@ def run_generation_targetdiff(manifest, out_path, parameters):
 
     # Generate a sampling config YAML for this run
     num_samples = parameters.get("num_samples", 100)
+    # sample_num_atoms must be one TargetDiff understands; an unknown value
+    # would be silently mishandled upstream, so validate and fall back here.
+    _VALID_NUM_ATOMS = {"prior", "range", "ref"}
+    sample_num_atoms = parameters.get("sample_num_atoms", "prior")
+    if sample_num_atoms not in _VALID_NUM_ATOMS:
+        print(f"[Generation] Unknown sample_num_atoms='{sample_num_atoms}'; "
+              f"falling back to 'prior'. Valid: {sorted(_VALID_NUM_ATOMS)}")
+        sample_num_atoms = "prior"
     sampling_config = out_path / "sampling_config.yml"
     import yaml
     config_data = {
@@ -503,7 +540,7 @@ def run_generation_targetdiff(manifest, out_path, parameters):
             "num_steps": parameters.get("sampling_steps", 1000),
             "pos_only": False,
             "center_pos_mode": "protein",
-            "sample_num_atoms": "prior",
+            "sample_num_atoms": sample_num_atoms,
         },
     }
     with open(sampling_config, "w") as f:
@@ -569,6 +606,15 @@ def run_generation_targetdiff(manifest, out_path, parameters):
                 writer.write(mol)
                 mol_count += 1
     writer.close()
+
+    # Guard: TargetDiff can write SDF files that contain no RDKit-parsable
+    # molecules (every record failed sanitisation). An empty consolidated SDF
+    # would let screening/docking "succeed" on nothing — fail loudly instead.
+    if mol_count == 0:
+        raise RuntimeError(
+            f"TargetDiff produced {len(individual_sdfs)} SDF file(s) but none "
+            f"contained a valid molecule. Generation yielded nothing usable."
+        )
 
     print(f"[Generation] {mol_count} molecules consolidated from {len(individual_sdfs)} TargetDiff outputs")
     print(f"[Generation] Output: {output_sdf}")
@@ -729,7 +775,7 @@ def run_generation_pocket2mol(manifest, out_path, parameters):
 
 
 def run_generation(manifest_path, output_dir, mode="simulation",
-                   db_path=None, campaign_id=None):
+                   db_path=None, campaign_id=None, num_samples=None, device="auto"):
     """Run molecule generation with full telemetry.
 
     Args:
@@ -738,6 +784,9 @@ def run_generation(manifest_path, output_dir, mode="simulation",
         mode: "simulation", "rdkit", or "targetdiff".
         db_path: Optional telemetry database path.
         campaign_id: Optional campaign identifier.
+        num_samples: Optional override for the per-mode default campaign size.
+        device: Compute device for GPU-capable backends — "auto" (detect a
+            GPU), "cuda", or "cpu". Ignored by the CPU-only backends.
     """
     manifest_path = Path(manifest_path).resolve()
     out_path = Path(output_dir).resolve()
@@ -751,6 +800,16 @@ def run_generation(manifest_path, output_dir, mode="simulation",
         manifest = json.load(f)
 
     parameters = {**_default_params(mode), "mode": mode}
+    if num_samples is not None:
+        parameters["num_samples"] = num_samples
+    # Device selection. Only the pocket-conditioned backends carry a "device"
+    # default. An explicit --device always wins; a bare "auto" upgrades
+    # TargetDiff's legacy cpu default to the detected GPU, while Pocket2Mol
+    # keeps its intentional cpu default (its cu113 env predates Blackwell).
+    if device not in (None, "auto"):
+        parameters["device"] = device
+    elif mode == "targetdiff":
+        parameters["device"] = _resolve_device("auto")
     git_commit = _get_git_commit(TARGETDIFF_REPO) if TARGETDIFF_REPO.exists() else None
 
     db = None
@@ -836,9 +895,15 @@ def main():
                         default="simulation", help="Execution mode")
     parser.add_argument("--db_path", default=None, help="Path to telemetry database")
     parser.add_argument("--campaign_id", default=None, help="Campaign ID for telemetry")
+    parser.add_argument("--num_samples", type=int, default=None,
+                        help="Number of molecules to generate (overrides the per-mode default)")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                        help="Compute device for GPU-capable backends "
+                             "(targetdiff/pocket2mol); 'auto' detects a GPU")
     args = parser.parse_args()
 
-    run_generation(args.manifest, args.output_dir, args.mode, args.db_path, args.campaign_id)
+    run_generation(args.manifest, args.output_dir, args.mode, args.db_path,
+                   args.campaign_id, num_samples=args.num_samples, device=args.device)
 
 
 if __name__ == "__main__":
