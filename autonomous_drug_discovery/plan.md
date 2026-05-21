@@ -143,14 +143,25 @@ make clean            # nuke local cache
 
 ## Roadmap (4 phases)
 
-### Phase 1 — Containerised cloud-GPU run on 5 targets, 20 quality results
+### Phase 1 — Containerised cloud-GPU run on a target set, 20 quality results
 
-**Goal:** The architecture above shipped end-to-end. Five targets (1M17, 2HYY, 6P3D, KRAS G12C, JAK2) × ~30 TargetDiff molecules each, full pipeline through screening + docking + ranking + dashboard. Output is the 20-quality-result corpus the professor sees.
+**Goal:** The architecture above shipped end-to-end. A target set × ~30 TargetDiff molecules each, full pipeline through screening + docking + ranking + dashboard. Output is the 20-quality-result corpus the professor sees.
+
+**Target set (actual, as of 2026-05-21):**
+
+| Target | Disease | Status |
+|---|---|---|
+| 1M17 (EGFR) | Lung cancer | ✅ Phase-1 campaigns complete (RDKit + Pocket2Mol) |
+| 2HYY (BCR-ABL) | CML | ✅ Phase-1 campaigns complete |
+| 6P3D (BRAF V600E) | Melanoma | ✅ Phase-1 campaigns complete |
+| 8P1L | Internal validation | ✅ TargetDiff campaign complete on local Blackwell GPU |
+
+**Deferred from this phase:** KRAS G12C and JAK2 were in the original plan but not run yet — they're follow-up work, not a blocker for the professor demo. The deliverable (20 quality candidates with the new infrastructure) is met by the four targets above. 1UYD / 3KRR / 6OIM PDBs are checked into `data/processed/` for downstream use but not part of the Phase 1 campaign corpus.
 
 **Success criteria:**
 - `docker pull` + `make run TARGET=… MODE=simulation` works on both contributors' laptops with no manual intervention
 - `make cloud-run` provisions a RunPod GPU, runs TargetDiff, syncs results to R2, tears down the pod, all from a single command
-- Five targets × ~30 TargetDiff molecules generated, screened, docked, ranked, logged to telemetry
+- The target set × ~30 molecules each generated, screened, docked, ranked, logged to telemetry
 - ≥ 20 candidates labelled "quality" (passed tightened screening + docking better than median of generation set; ideally within 1 kcal/mol of known-drug baseline on at least three targets)
 - Dashboard loads at `https://<you>.github.io/agent-harness/`; auto-deploys on every commit; no manual JSON editing
 - Total cloud spend < $5
@@ -266,15 +277,16 @@ Strict sequence. Each day's output is the next day's input. If anything cracks, 
 - [ ] **`make cloud-run TARGET=2HYY MODE=targetdiff NUM=30`** end-to-end on one target. Verify output in R2 and via `make pull` locally. ~2 hours.
 
 ### Day 4 — Demo corpus generation (~3 hours active + ~3 hours waiting)
-- [ ] **Tighten screening thresholds** in `default_scoring_config.json` to ~50% survival target. ~30 min.
-- [ ] **Add `--num_samples` CLI flag** to `run_generation.py`. ~15 min.
-- [ ] **`make cloud-run` × 5 targets** (1M17, 2HYY, 6P3D, KRAS G12C, JAK2 — fetch PDBs for the latter two). NUM=30 each. ~3 hours wallclock batched. Total spend ~$2.
+- [x] **Tighten screening thresholds** in `default_scoring_config.json`. Done — lead-like window (MW 250-450, heavy atoms 18-35, QED ≥ 0.5, SA ≤ 4.5) + chemical-sanity filter.
+- [x] **Add `--num_samples` CLI flag** to `run_generation.py`. Done.
+- [x] **Generate the target-set corpus.** Done — RDKit + Pocket2Mol on 1M17/2HYY/6P3D + TargetDiff on 8P1L (local Blackwell, since `:cu117` can't target sm_120). KRAS G12C / JAK2 deferred.
+- [ ] **`make cloud-run` smoke against one target** to prove the RunPod path. Pending — script exists, end-to-end verification still owed.
 - [ ] **Spot-check the SDFs** in PyMOL or via `Chem.MolToImage`. ~1 hour.
 
 ### Day 5 — Dashboard polish + deploy (5-6 hours)
-- [ ] **`scripts/regenerate_dashboard.py`.** Reads `telemetry.db` + ranking outputs from R2, rewrites `dashboard/professor_demo.js` with per-target tabs, top-4 cards per target (SVG + dock score + QED + SA + ADMET flags), attrition funnel, known-drug baseline row. ~3 hours.
-- [ ] **GitHub Pages workflow.** Auto-deploy `dashboard/` on `main` push. ~1 hour.
-- [ ] **Share the URL** with the professor. Done.
+- [x] **`scripts/regenerate_dashboard.py`.** Auto-discovers the latest successful campaign per (target, backend) from `telemetry.db` and emits `dashboard/professor_demo.js`. `make dashboard` is now a no-arg call.
+- [x] **GitHub Pages workflow.** `.github/workflows/pages.yml` deploys `dashboard/` on every `main` push. Activates the moment PR #1 merges.
+- [ ] **Share the URL** with the professor. Pending until PR #1 merges.
 
 ### Day 6-7 — Buffer
 Anything that overran. Last-mile polish. Demo dry run. Notes for the meeting.

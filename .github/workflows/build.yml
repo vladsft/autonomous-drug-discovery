@@ -18,6 +18,11 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  # Opt into Node.js 24 for JS actions ahead of the June-2026 forced switch.
+  # The published @v4/@v5 tags of our pinned actions still ship Node 20 binaries;
+  # this flag tells the runner to execute them under Node 24 instead, silencing
+  # the deprecation warning without changing action versions.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   lint:

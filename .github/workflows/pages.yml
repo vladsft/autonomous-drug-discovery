@@ -19,6 +19,10 @@ permissions:
   pages: write
   id-token: write
 
+env:
+  # See build.yml for context — opt into Node 24 ahead of the forced switch.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 # Never let two deploys race; the newest commit wins.
 concurrency:
   group: pages

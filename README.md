@@ -25,9 +25,9 @@ Validated against three cancer targets with crystallographic ground truth:
 
 ## Quick start
 
-The pipeline ships as a single Docker image with all conda environments, P2Rank, and (mirrored) model checkpoints baked in. Both contributors run the same image; the cloud GPU pod runs the same image.
+The pipeline ships as a single Docker image with all conda environments, P2Rank, and (mirrored) model checkpoints baked in. Both contributors run the same image; the cloud GPU pod runs the same image. CI builds the image on every `main` push and publishes it to `ghcr.io/vladsft/autonomous-drug-discovery:latest`.
 
-> **Note on the Docker image:** The Dockerfile and CI workflow are part of the Phase 1 work currently in flight (see [`autonomous_drug_discovery/plan.md`](autonomous_drug_discovery/plan.md)). Until that lands, the image at `ghcr.io/vladsft/autonomous-drug-discovery` does not yet exist; the legacy manual conda setup at the bottom of this README is the fallback. The commands below describe the target workflow.
+> **Note on the Docker image:** The image is published by the `build` workflow on every `main` push (`:latest` and `:<sha>`). If `docker pull` fails immediately after a fresh clone, the most likely reason is that no commit has hit `main` yet on this fork — fall back to the [no-Docker path](#running-locally-without-docker) below until CI has run once.
 
 ### Prerequisites
 
