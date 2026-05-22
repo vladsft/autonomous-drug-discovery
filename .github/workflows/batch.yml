@@ -132,9 +132,9 @@ jobs:
             git push
           fi
 
+      # Requires Pages to have been enabled once manually (Settings -> Pages ->
+      # Source = GitHub Actions); the default token can't create the site.
       - uses: actions/configure-pages@v5
-        with:
-          enablement: true   # turn Pages on via the API if it isn't already
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dashboard
