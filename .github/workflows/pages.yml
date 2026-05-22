@@ -4,7 +4,9 @@
 # dashboard/professor_demo.js, you commit it, this deploys it) — so the
 # professor's URL always reflects the latest campaign data.
 #
-# One-time setup: repo Settings -> Pages -> Source = "GitHub Actions".
+# No manual setup needed: `configure-pages` runs with `enablement: true`, so
+# it turns Pages on (Source = GitHub Actions) via the API on first run rather
+# than failing with "Pages not enabled".
 
 name: pages
 
@@ -37,6 +39,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+        with:
+          # Enable Pages (Source = GitHub Actions) via the API on first run,
+          # so a fresh repo doesn't need a manual Settings -> Pages click.
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dashboard

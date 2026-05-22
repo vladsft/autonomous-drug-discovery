@@ -133,6 +133,8 @@ jobs:
           fi
 
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true   # turn Pages on via the API if it isn't already
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dashboard
