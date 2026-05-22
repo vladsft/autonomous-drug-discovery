@@ -381,8 +381,10 @@ def main():
     # Full Pipeline command
     pipeline_parser = subparsers.add_parser("run", help="Run full pipeline")
     pipeline_parser.add_argument("pdb_file", help="Path to input PDB file")
-    pipeline_parser.add_argument("--mode", choices=["simulation", "production", "targetdiff", "pocket2mol"],
-                                 default="simulation", help="Execution mode")
+    pipeline_parser.add_argument("--mode",
+                                 choices=["simulation", "production", "rdkit", "targetdiff", "pocket2mol"],
+                                 default="simulation",
+                                 help="Execution mode (`rdkit` and `production` are aliases)")
     pipeline_parser.add_argument("--backend", choices=["p2rank", "fpocket"], default="p2rank",
                                  help="Pocket detection backend (default: p2rank)")
     pipeline_parser.add_argument("--num_samples", type=int, default=None,

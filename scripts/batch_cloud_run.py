@@ -70,6 +70,12 @@ SENTINEL_STALENESS_S = 6 * 3600
 POD_TIMEOUT_MIN_DEFAULT = 90
 # A pod that fails this many times in a row gets dropped from the work-list.
 MAX_RETRIES_PER_TARGET = 3
+# Crash-loop detection. If, after a startup grace period (long enough to pull
+# the multi-GB image), the container has never stayed alive longer than
+# CRASH_LOOP_UPTIME_S, its command is dying on startup — abort the attempt
+# rather than waiting out the whole timeout.
+CRASH_LOOP_GRACE_S = 8 * 60
+CRASH_LOOP_UPTIME_S = 150
 # Idempotency window: targets with a successful campaign newer than this are
 # skipped unless --force.
 SKIP_WINDOW_HOURS = 24
@@ -170,6 +176,24 @@ def provision_pod(api_key: str, image: str, gpu_type: str, network_volume_id: st
     if not pod_id:
         raise RuntimeError(f"RunPod returned no pod id: {data}")
     return pod_id
+
+
+def query_pod_uptime(api_key: str, pod_id: str) -> int | None:
+    """Return the pod's current container uptime in seconds, or None if the
+    pod is gone / not yet running. A pod that keeps reporting near-zero uptime
+    while wall-clock advances is crash-looping (its command exits immediately
+    and RunPod restarts the container)."""
+    try:
+        data = runpod_gql(
+            api_key,
+            "query Status($input: PodFilter!) { pod(input: $input) "
+            "{ runtime { uptimeInSeconds } } }",
+            {"input": {"podId": pod_id}}, retries=1,
+        )
+        rt = (data.get("pod") or {}).get("runtime") or {}
+        return rt.get("uptimeInSeconds")
+    except Exception:
+        return None
 
 
 def terminate_pod(api_key: str, pod_id: str) -> None:
@@ -325,10 +349,14 @@ def run_one_target(target: str, mode: str, num_samples: int | None,
         )
         print(f"[pool] {target}: pod {pod_id} provisioned")
 
-        # Poll sentinels. We don't poll RunPod's pod-status API — sentinels
-        # are the source of truth (see plan.md). The pod's inner fuse already
-        # bounds runtime; we add an outer timeout as a belt.
-        deadline = time.monotonic() + timeout_min * 60
+        # Poll for the sentinel (the source of truth for "did it finish?").
+        # Alongside it, watch pod uptime so a crash-looping container — one
+        # whose command dies on startup and gets restarted forever, never
+        # producing a sentinel — is caught in minutes instead of hanging for
+        # the full timeout. (This is exactly the failure a bad --mode caused.)
+        start = time.monotonic()
+        deadline = start + timeout_min * 60
+        max_uptime = 0
         while time.monotonic() < deadline:
             time.sleep(SENTINEL_POLL_INTERVAL_S)
             sentinels = list_sentinels(env)
@@ -338,6 +366,19 @@ def run_one_target(target: str, mode: str, num_samples: int | None,
                 print(f"[pool] {target}: sentinel={outcome}\n{tail}")
                 return {"target": target, "sentinel_key": sentinel_key,
                         "outcome": outcome, "pod_id": pod_id, "tail": tail}
+
+            uptime = query_pod_uptime(env["RUNPOD_API_KEY"], pod_id) or 0
+            max_uptime = max(max_uptime, uptime)
+            elapsed = time.monotonic() - start
+            # Crash-loop heuristic: after a generous startup grace (image pull
+            # can take minutes), if the container has never stayed alive longer
+            # than CRASH_LOOP_UPTIME_S, its command is dying on startup.
+            if elapsed > CRASH_LOOP_GRACE_S and max_uptime < CRASH_LOOP_UPTIME_S:
+                print(f"[pool] {target}: crash-loop detected "
+                      f"(elapsed {int(elapsed)}s, max container uptime {max_uptime}s, "
+                      f"no sentinel) — aborting this attempt")
+                return {"target": target, "sentinel_key": sentinel_key,
+                        "outcome": "crash_loop", "pod_id": pod_id}
 
         print(f"[pool] {target}: outer timeout ({timeout_min} min) hit")
         return {"target": target, "sentinel_key": sentinel_key,
@@ -469,6 +510,11 @@ def main() -> int:
             last = run_one_target(target, args.mode, args.num_samples,
                                   env, args.dry_run, args.timeout_min)
             if last["outcome"] == "done":
+                return last
+            # A crash-loop is deterministic (bad image/config/args) — retrying
+            # just burns money on the same failure. Stop immediately.
+            if last["outcome"] == "crash_loop":
+                print(f"[pool] {target}: crash_loop is non-retryable — giving up")
                 return last
             print(f"[pool] {target}: outcome={last['outcome']}, "
                   f"attempt {attempts[target]}/{MAX_RETRIES_PER_TARGET}")
