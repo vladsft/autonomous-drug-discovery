@@ -95,8 +95,9 @@ def load_env() -> dict[str, str]:
         print("Inside the Action these come from repo Secrets; locally from .env.",
               file=sys.stderr)
         sys.exit(1)
-    return {k: os.environ[k] for k in required + ["RUNPOD_GPU_TYPE", "RUNPOD_TIMEOUT_MIN"]
-            if os.environ.get(k)}
+    optional = ["RUNPOD_GPU_TYPE", "RUNPOD_TIMEOUT_MIN",
+                "RUNPOD_CONTAINER_REGISTRY_AUTH_ID"]
+    return {k: os.environ[k] for k in required + optional if os.environ.get(k)}
 
 
 # ── RunPod GraphQL ───────────────────────────────────────────────────────────
@@ -139,20 +140,27 @@ def query_balance(api_key: str) -> float | None:
 
 
 def provision_pod(api_key: str, image: str, gpu_type: str, network_volume_id: str,
-                  pod_name: str, env_vars: dict[str, str]) -> str:
-    """Create an on-demand pod. Returns pod_id."""
+                  pod_name: str, env_vars: dict[str, str],
+                  registry_auth_id: str | None = None) -> str:
+    """Create an on-demand pod. Returns pod_id.
+
+    `registry_auth_id`, when set, references a RunPod Container Registry Auth
+    credential so a *private* GHCR image can be pulled. Leave it None for a
+    public image.
+    """
     env_list = [{"key": k, "value": v} for k, v in env_vars.items()]
-    variables = {
-        "input": {
-            "cloudType": "ALL", "gpuCount": 1, "gpuTypeId": gpu_type,
-            "name": pod_name, "imageName": image,
-            "dockerArgs": "bash /app/scripts/pod_campaign.sh",
-            "containerDiskInGb": 20,
-            "networkVolumeId": network_volume_id,
-            "volumeMountPath": "/app/autonomous_drug_discovery/data",
-            "env": env_list,
-        }
+    pod_input = {
+        "cloudType": "ALL", "gpuCount": 1, "gpuTypeId": gpu_type,
+        "name": pod_name, "imageName": image,
+        "dockerArgs": "bash /app/scripts/pod_campaign.sh",
+        "containerDiskInGb": 20,
+        "networkVolumeId": network_volume_id,
+        "volumeMountPath": "/app/autonomous_drug_discovery/data",
+        "env": env_list,
     }
+    if registry_auth_id:
+        pod_input["containerRegistryAuthId"] = registry_auth_id
+    variables = {"input": pod_input}
     data = runpod_gql(api_key,
                       """mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
                            podFindAndDeployOnDemand(input: $input) { id }
@@ -313,6 +321,7 @@ def run_one_target(target: str, mode: str, num_samples: int | None,
             env.get("RUNPOD_GPU_TYPE", "NVIDIA GeForce RTX 3090"),
             env["RUNPOD_NETWORK_VOLUME_ID"],
             pod_name, pod_env,
+            registry_auth_id=env.get("RUNPOD_CONTAINER_REGISTRY_AUTH_ID"),
         )
         print(f"[pool] {target}: pod {pod_id} provisioned")
 

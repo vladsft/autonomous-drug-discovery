@@ -90,16 +90,23 @@ ENV_JSON="$(jq -n \
        {key:"RCLONE_CONFIG_R2_SECRET_ACCESS_KEY",value:$sk},
        {key:"RCLONE_CONFIG_R2_ENDPOINT",value:$ep} ]')"
 
+# When the GHCR image is private, RunPod needs a registry credential to pull
+# it. Register a GitHub PAT (read:packages) under RunPod → Settings → Container
+# Registry Auth, then put the resulting auth ID in RUNPOD_CONTAINER_REGISTRY_AUTH_ID.
+# Left empty ⇒ the image is assumed public and no auth is attached.
+AUTH_ID="${RUNPOD_CONTAINER_REGISTRY_AUTH_ID:-}"
 INPUT_JSON="$(jq -n \
     --arg name "${POD_NAME}" --arg image "${IMAGE}" --arg gpu "${GPU_TYPE}" \
     --arg vol "${RUNPOD_NETWORK_VOLUME_ID}" --argjson env "${ENV_JSON}" \
+    --arg authid "${AUTH_ID}" \
     '{ cloudType: "ALL", gpuCount: 1, gpuTypeId: $gpu,
        name: $name, imageName: $image,
        dockerArgs: "bash /app/scripts/pod_campaign.sh",
        containerDiskInGb: 20,
        networkVolumeId: $vol,
        volumeMountPath: "/app/autonomous_drug_discovery/data",
-       env: $env }')"
+       env: $env }
+     + (if $authid == "" then {} else {containerRegistryAuthId: $authid} end)')"
 
 DEPLOY='mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
   podFindAndDeployOnDemand(input: $input) { id machineId }
