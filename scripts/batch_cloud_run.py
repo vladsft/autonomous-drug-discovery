@@ -340,13 +340,22 @@ def run_one_target(target: str, mode: str, num_samples: int | None,
                 "outcome": "dry-run", "pod_id": None}
 
     try:
-        pod_id = provision_pod(
-            env["RUNPOD_API_KEY"], env["IMAGE"],
-            env.get("RUNPOD_GPU_TYPE", "NVIDIA GeForce RTX 3090"),
-            env["RUNPOD_NETWORK_VOLUME_ID"],
-            pod_name, pod_env,
-            registry_auth_id=env.get("RUNPOD_CONTAINER_REGISTRY_AUTH_ID"),
-        )
+        try:
+            pod_id = provision_pod(
+                env["RUNPOD_API_KEY"], env["IMAGE"],
+                env.get("RUNPOD_GPU_TYPE", "NVIDIA GeForce RTX 3090"),
+                env["RUNPOD_NETWORK_VOLUME_ID"],
+                pod_name, pod_env,
+                registry_auth_id=env.get("RUNPOD_CONTAINER_REGISTRY_AUTH_ID"),
+            )
+        except Exception as e:
+            # A provision failure (RunPod 5xx, quota, volume contention) must
+            # not crash the whole batch — record it as a retryable outcome for
+            # this one target and let the pool carry on with the others.
+            print(f"[pool] {target}: provision failed — {e}")
+            return {"target": target, "sentinel_key": sentinel_key,
+                    "outcome": "provision_error", "pod_id": None,
+                    "tail": str(e)}
         print(f"[pool] {target}: pod {pod_id} provisioned")
 
         # Poll for the sentinel (the source of truth for "did it finish?").

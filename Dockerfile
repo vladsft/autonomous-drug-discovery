@@ -68,6 +68,15 @@ RUN mamba env update -n base -f /tmp/envs/env_orchestrator.yml \
     && conda clean -afy \
     && rm -rf /tmp/envs
 
+# Verify the base env can import every dependency the pipeline needs at run
+# time — especially vina + meeko, whose absence only surfaces in production
+# docking (Stage 4), a path the simulation-mode CI smoke test never exercises.
+# Failing the build here converts a silent runtime crash into a loud build
+# error, exactly as the weight-verifier does for the checkpoints.
+RUN conda run -n base python -c "import rdkit, vina, meeko, gemmi; \
+import vina as _v; from meeko import MoleculePreparation; \
+print('base deps OK: rdkit, vina, meeko, gemmi importable')"
+
 # --- P2Rank (pocket detection, Stage 1) --------------------------------------
 # Java is supplied by `openjdk` inside the `base` environment, which is where
 # Stage 1 runs — so `prank` finds a JVM on PATH at run time.
