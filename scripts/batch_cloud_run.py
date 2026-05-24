@@ -76,6 +76,19 @@ MAX_RETRIES_PER_TARGET = 3
 # rather than waiting out the whole timeout.
 CRASH_LOOP_GRACE_S = 8 * 60
 CRASH_LOOP_UPTIME_S = 150
+
+# GPU types tried in order when RUNPOD_GPU_TYPE isn't set, falling through on
+# supply shortage. All are Ampere+ (fine for TargetDiff); for CPU-bound rdkit
+# any of them just provides a host. Ordered cheap-and-common first to maximise
+# the odds of landing a pod in a tight market.
+DEFAULT_GPU_PRIORITY = ",".join([
+    "NVIDIA GeForce RTX 3090",
+    "NVIDIA RTX A5000",
+    "NVIDIA RTX A4000",
+    "NVIDIA RTX A4500",
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA L4",
+])
 # Idempotency window: targets with a successful campaign newer than this are
 # skipped unless --force.
 SKIP_WINDOW_HOURS = 24
@@ -353,22 +366,42 @@ def run_one_target(target: str, mode: str, num_samples: int | None,
                 "outcome": "dry-run", "pod_id": None}
 
     try:
-        try:
-            pod_id = provision_pod(
-                env["RUNPOD_API_KEY"], env["IMAGE"],
-                env.get("RUNPOD_GPU_TYPE", "NVIDIA GeForce RTX 3090"),
-                env.get("RUNPOD_NETWORK_VOLUME_ID"),
-                pod_name, pod_env,
-                registry_auth_id=env.get("RUNPOD_CONTAINER_REGISTRY_AUTH_ID"),
-            )
-        except Exception as e:
-            # A provision failure (RunPod 5xx, quota, volume contention) must
-            # not crash the whole batch — record it as a retryable outcome for
-            # this one target and let the pool carry on with the others.
-            print(f"[pool] {target}: provision failed — {e}")
+        # Try each acceptable GPU type in order, falling through on supply
+        # shortages. For a CPU-bound rdkit run any of these works; the list is
+        # also fine for TargetDiff (all Ampere+). Override via RUNPOD_GPU_TYPE
+        # (comma-separated to set your own priority order).
+        gpu_types = [g.strip() for g in
+                     env.get("RUNPOD_GPU_TYPE", DEFAULT_GPU_PRIORITY).split(",")
+                     if g.strip()]
+        pod_id = None
+        last_supply_err: str | None = None
+        for gpu in gpu_types:
+            try:
+                pod_id = provision_pod(
+                    env["RUNPOD_API_KEY"], env["IMAGE"], gpu,
+                    env.get("RUNPOD_NETWORK_VOLUME_ID"),
+                    pod_name, pod_env,
+                    registry_auth_id=env.get("RUNPOD_CONTAINER_REGISTRY_AUTH_ID"),
+                )
+                print(f"[pool] {target}: got {gpu}")
+                break
+            except Exception as e:
+                if "SUPPLY_CONSTRAINT" in str(e) or "no longer any instances" in str(e):
+                    print(f"[pool] {target}: {gpu} out of stock, trying next")
+                    last_supply_err = str(e)
+                    continue
+                # A non-supply provision failure (RunPod 5xx, quota, bad input)
+                # must not crash the whole batch — record it and let the pool
+                # carry on with the other targets.
+                print(f"[pool] {target}: provision failed — {e}")
+                return {"target": target, "sentinel_key": sentinel_key,
+                        "outcome": "provision_error", "pod_id": None,
+                        "tail": str(e)}
+        if pod_id is None:
+            print(f"[pool] {target}: no GPU type had stock ({gpu_types})")
             return {"target": target, "sentinel_key": sentinel_key,
-                    "outcome": "provision_error", "pod_id": None,
-                    "tail": str(e)}
+                    "outcome": "no_capacity", "pod_id": None,
+                    "tail": last_supply_err or "all GPU types out of stock"}
         print(f"[pool] {target}: pod {pod_id} provisioned")
 
         # Poll for the sentinel (the source of truth for "did it finish?").
@@ -534,9 +567,11 @@ def main() -> int:
             if last["outcome"] == "done":
                 return last
             # A crash-loop is deterministic (bad image/config/args) — retrying
-            # just burns money on the same failure. Stop immediately.
-            if last["outcome"] == "crash_loop":
-                print(f"[pool] {target}: crash_loop is non-retryable — giving up")
+            # just burns money on the same failure. no_capacity means every GPU
+            # type was out of stock; an instant retry won't conjure supply.
+            # Both are non-retryable here.
+            if last["outcome"] in ("crash_loop", "no_capacity"):
+                print(f"[pool] {target}: {last['outcome']} is non-retryable — giving up")
                 return last
             print(f"[pool] {target}: outcome={last['outcome']}, "
                   f"attempt {attempts[target]}/{MAX_RETRIES_PER_TARGET}")
