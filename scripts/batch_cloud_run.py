@@ -89,6 +89,11 @@ DEFAULT_GPU_PRIORITY = ",".join([
     "NVIDIA GeForce RTX 4090",
     "NVIDIA L4",
 ])
+# RunPod on-demand placement is flaky in a tight market. Sweep the GPU list,
+# and if nothing places, back off and re-sweep — capacity fluctuates minute to
+# minute. Bounded so a genuinely empty market fails in a couple of minutes.
+PROVISION_SWEEPS = 3
+PROVISION_BACKOFF_S = 45
 # Idempotency window: targets with a successful campaign newer than this are
 # skipped unless --force.
 SKIP_WINDOW_HOURS = 24
@@ -182,9 +187,10 @@ def provision_pod(api_key: str, image: str, gpu_type: str,
         "cloudType": "ALL", "gpuCount": 1, "gpuTypeId": gpu_type,
         "name": pod_name, "imageName": image,
         "dockerArgs": "bash /app/scripts/pod_campaign.sh",
-        # Ephemeral working disk. The image lives outside this; data/ holds a
-        # handful of SDFs/CSVs pulled from R2, so 30 GB is ample headroom.
-        "containerDiskInGb": 30,
+        # Ephemeral working disk. Keep modest: a large request ("does not have
+        # the resources to deploy your pod") shrinks the set of machines that
+        # can place the pod. data/ is a handful of SDFs/CSVs pulled from R2.
+        "containerDiskInGb": 20,
         "env": env_list,
     }
     if network_volume_id:
@@ -366,42 +372,50 @@ def run_one_target(target: str, mode: str, num_samples: int | None,
                 "outcome": "dry-run", "pod_id": None}
 
     try:
-        # Try each acceptable GPU type in order, falling through on supply
-        # shortages. For a CPU-bound rdkit run any of these works; the list is
-        # also fine for TargetDiff (all Ampere+). Override via RUNPOD_GPU_TYPE
-        # (comma-separated to set your own priority order).
+        # Acceptable GPU types in priority order. For a CPU-bound rdkit run any
+        # works; all are Ampere+ so the list is fine for TargetDiff too.
+        # Override via RUNPOD_GPU_TYPE (comma-separated).
         gpu_types = [g.strip() for g in
                      env.get("RUNPOD_GPU_TYPE", DEFAULT_GPU_PRIORITY).split(",")
                      if g.strip()]
+
+        # Provisioning a pod on RunPod's on-demand market is best-effort: a
+        # request can bounce off SUPPLY_CONSTRAINT (no card of that type) OR a
+        # transient placement error ("this machine does not have the resources
+        # … try a different machine"). Both are recoverable by trying another
+        # GPU type and, failing that, waiting and sweeping again. So: sweep the
+        # whole GPU list, and if none place, back off and re-sweep a few times.
         pod_id = None
-        last_supply_err: str | None = None
-        for gpu in gpu_types:
-            try:
-                pod_id = provision_pod(
-                    env["RUNPOD_API_KEY"], env["IMAGE"], gpu,
-                    env.get("RUNPOD_NETWORK_VOLUME_ID"),
-                    pod_name, pod_env,
-                    registry_auth_id=env.get("RUNPOD_CONTAINER_REGISTRY_AUTH_ID"),
-                )
-                print(f"[pool] {target}: got {gpu}")
-                break
-            except Exception as e:
-                if "SUPPLY_CONSTRAINT" in str(e) or "no longer any instances" in str(e):
-                    print(f"[pool] {target}: {gpu} out of stock, trying next")
-                    last_supply_err = str(e)
+        last_err: str | None = None
+        for sweep in range(PROVISION_SWEEPS):
+            for gpu in gpu_types:
+                try:
+                    pod_id = provision_pod(
+                        env["RUNPOD_API_KEY"], env["IMAGE"], gpu,
+                        env.get("RUNPOD_NETWORK_VOLUME_ID"),
+                        pod_name, pod_env,
+                        registry_auth_id=env.get("RUNPOD_CONTAINER_REGISTRY_AUTH_ID"),
+                    )
+                    print(f"[pool] {target}: got {gpu}")
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    short = last_err.split("'message':")[-1][:80]
+                    print(f"[pool] {target}: {gpu} unavailable ({short}); next")
                     continue
-                # A non-supply provision failure (RunPod 5xx, quota, bad input)
-                # must not crash the whole batch — record it and let the pool
-                # carry on with the other targets.
-                print(f"[pool] {target}: provision failed — {e}")
-                return {"target": target, "sentinel_key": sentinel_key,
-                        "outcome": "provision_error", "pod_id": None,
-                        "tail": str(e)}
+            if pod_id is not None:
+                break
+            if sweep < PROVISION_SWEEPS - 1:
+                print(f"[pool] {target}: no capacity on any GPU; "
+                      f"re-sweeping in {PROVISION_BACKOFF_S}s "
+                      f"(sweep {sweep + 1}/{PROVISION_SWEEPS})")
+                time.sleep(PROVISION_BACKOFF_S)
+
         if pod_id is None:
-            print(f"[pool] {target}: no GPU type had stock ({gpu_types})")
+            print(f"[pool] {target}: no capacity after {PROVISION_SWEEPS} sweeps")
             return {"target": target, "sentinel_key": sentinel_key,
                     "outcome": "no_capacity", "pod_id": None,
-                    "tail": last_supply_err or "all GPU types out of stock"}
+                    "tail": last_err or "all GPU types unavailable"}
         print(f"[pool] {target}: pod {pod_id} provisioned")
 
         # Poll for the sentinel (the source of truth for "did it finish?").
