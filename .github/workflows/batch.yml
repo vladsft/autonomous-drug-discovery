@@ -69,7 +69,12 @@ permissions:
   id-token: write    # required by deploy-pages
 
 env:
-  IMAGE: ${{ vars.IMAGE || format('ghcr.io/{0}:latest', github.repository) }}
+  # Pin to the immutable per-commit tag, not :latest. RunPod caches images by
+  # tag per physical machine and will happily reuse a days-old :latest instead
+  # of re-pulling — which silently ran a stale image with broken docking deps.
+  # A unique :<sha> tag can never be stale. (build.yml pushes both :latest and
+  # :<sha>; the build for this commit must have finished before dispatching.)
+  IMAGE: ${{ vars.IMAGE || format('ghcr.io/{0}:{1}', github.repository, github.sha) }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
