@@ -113,7 +113,11 @@ jobs:
           RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-          RUNPOD_NETWORK_VOLUME_ID: ${{ secrets.RUNPOD_NETWORK_VOLUME_ID }}
+          # Volume intentionally NOT passed: attaching it region-locks pods to
+          # one datacenter (EU-CZ-1), which is chronically GPU-starved. Running
+          # volumeless lets pods land in any datacenter with free GPUs; R2 is
+          # the source of truth. Set vars.RUNPOD_NETWORK_VOLUME_ID to re-enable.
+          RUNPOD_NETWORK_VOLUME_ID: ${{ vars.RUNPOD_NETWORK_VOLUME_ID || '' }}
           RUNPOD_GPU_TYPE: ${{ vars.RUNPOD_GPU_TYPE || 'NVIDIA GeForce RTX 3090' }}
           # Optional — only needed for a private GHCR image. Empty secret is fine.
           RUNPOD_CONTAINER_REGISTRY_AUTH_ID: ${{ secrets.RUNPOD_CONTAINER_REGISTRY_AUTH_ID }}

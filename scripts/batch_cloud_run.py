@@ -93,7 +93,7 @@ def load_env() -> dict[str, str]:
         "R2_BUCKET", "RCLONE_CONFIG_R2_TYPE", "RCLONE_CONFIG_R2_PROVIDER",
         "RCLONE_CONFIG_R2_ACCESS_KEY_ID", "RCLONE_CONFIG_R2_SECRET_ACCESS_KEY",
         "RCLONE_CONFIG_R2_ENDPOINT",
-        "RUNPOD_API_KEY", "RUNPOD_NETWORK_VOLUME_ID", "IMAGE",
+        "RUNPOD_API_KEY", "IMAGE",
     ]
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
@@ -101,8 +101,12 @@ def load_env() -> dict[str, str]:
         print("Inside the Action these come from repo Secrets; locally from .env.",
               file=sys.stderr)
         sys.exit(1)
+    # RUNPOD_NETWORK_VOLUME_ID is optional: when set, pods attach it (and are
+    # thus region-locked to its datacenter). Left empty, pods run in ANY
+    # datacenter with free GPUs and use ephemeral container disk — R2 is the
+    # source of truth either way, so nothing is lost by going volumeless.
     optional = ["RUNPOD_GPU_TYPE", "RUNPOD_TIMEOUT_MIN",
-                "RUNPOD_CONTAINER_REGISTRY_AUTH_ID"]
+                "RUNPOD_CONTAINER_REGISTRY_AUTH_ID", "RUNPOD_NETWORK_VOLUME_ID"]
     return {k: os.environ[k] for k in required + optional if os.environ.get(k)}
 
 
@@ -145,10 +149,16 @@ def query_balance(api_key: str) -> float | None:
         return None
 
 
-def provision_pod(api_key: str, image: str, gpu_type: str, network_volume_id: str,
+def provision_pod(api_key: str, image: str, gpu_type: str,
+                  network_volume_id: str | None,
                   pod_name: str, env_vars: dict[str, str],
                   registry_auth_id: str | None = None) -> str:
     """Create an on-demand pod. Returns pod_id.
+
+    `network_volume_id`, when set, attaches a persistent volume at the data
+    dir — but it region-locks the pod to the volume's datacenter. Left None,
+    the pod runs in any datacenter with a free GPU and uses ephemeral
+    container disk; the pipeline still syncs through R2.
 
     `registry_auth_id`, when set, references a RunPod Container Registry Auth
     credential so a *private* GHCR image can be pulled. Leave it None for a
@@ -159,11 +169,14 @@ def provision_pod(api_key: str, image: str, gpu_type: str, network_volume_id: st
         "cloudType": "ALL", "gpuCount": 1, "gpuTypeId": gpu_type,
         "name": pod_name, "imageName": image,
         "dockerArgs": "bash /app/scripts/pod_campaign.sh",
-        "containerDiskInGb": 20,
-        "networkVolumeId": network_volume_id,
-        "volumeMountPath": "/app/autonomous_drug_discovery/data",
+        # Ephemeral working disk. The image lives outside this; data/ holds a
+        # handful of SDFs/CSVs pulled from R2, so 30 GB is ample headroom.
+        "containerDiskInGb": 30,
         "env": env_list,
     }
+    if network_volume_id:
+        pod_input["networkVolumeId"] = network_volume_id
+        pod_input["volumeMountPath"] = "/app/autonomous_drug_discovery/data"
     if registry_auth_id:
         pod_input["containerRegistryAuthId"] = registry_auth_id
     variables = {"input": pod_input}
@@ -344,7 +357,7 @@ def run_one_target(target: str, mode: str, num_samples: int | None,
             pod_id = provision_pod(
                 env["RUNPOD_API_KEY"], env["IMAGE"],
                 env.get("RUNPOD_GPU_TYPE", "NVIDIA GeForce RTX 3090"),
-                env["RUNPOD_NETWORK_VOLUME_ID"],
+                env.get("RUNPOD_NETWORK_VOLUME_ID"),
                 pod_name, pod_env,
                 registry_auth_id=env.get("RUNPOD_CONTAINER_REGISTRY_AUTH_ID"),
             )
