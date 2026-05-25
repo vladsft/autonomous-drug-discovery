@@ -73,9 +73,10 @@ RUN mamba env update -n base -f /tmp/envs/env_orchestrator.yml \
 # docking (Stage 4), a path the simulation-mode CI smoke test never exercises.
 # Failing the build here converts a silent runtime crash into a loud build
 # error, exactly as the weight-verifier does for the checkpoints.
-RUN conda run -n base python -c "import rdkit, vina, meeko, gemmi; \
-import vina as _v; from meeko import MoleculePreparation; \
-print('base deps OK: rdkit, vina, meeko, gemmi importable')"
+# Mirror run_docking.py's EXACT imports — not lenient `import vina`/`import
+# meeko`, which can pass while the specific names run_docking needs fail. If
+# these don't resolve in `base`, fail the build here instead of at pod runtime.
+RUN conda run -n base python -c "from rdkit import Chem; from vina import Vina; from meeko import MoleculePreparation, PDBQTWriterLegacy; print('docking deps import OK in base')"
 
 # --- P2Rank (pocket detection, Stage 1) --------------------------------------
 # Java is supplied by `openjdk` inside the `base` environment, which is where

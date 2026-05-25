@@ -42,18 +42,25 @@ try:
 except ImportError:
     HAS_RDKIT = False
 
-# Check for Vina Python API + Meeko (production docking)
+# Check for Vina Python API + Meeko (production docking).
+# Capture the REAL exception (not just ImportError — a failed shared-library
+# load surfaces as ImportError/OSError) so a "missing" report can say *why*.
+# Silently swallowing this is what hid the docking failure for so long.
+VINA_IMPORT_ERROR = None
 try:
     from vina import Vina
     HAS_VINA = True
-except ImportError:
+except Exception as e:  # noqa: BLE001
     HAS_VINA = False
+    VINA_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
+MEEKO_IMPORT_ERROR = None
 try:
     from meeko import MoleculePreparation, PDBQTWriterLegacy
     HAS_MEEKO = True
-except ImportError:
+except Exception as e:  # noqa: BLE001
     HAS_MEEKO = False
+    MEEKO_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
 
 # Default docking parameters
@@ -220,12 +227,15 @@ def run_docking_production(manifest, candidates_dir, out_path, parameters, db=No
     if not HAS_VINA or not HAS_MEEKO or not HAS_RDKIT:
         missing = []
         if not HAS_VINA:
-            missing.append("vina (conda install -c conda-forge vina)")
+            missing.append(f"vina [{VINA_IMPORT_ERROR}]")
         if not HAS_MEEKO:
-            missing.append("meeko (pip install meeko)")
+            missing.append(f"meeko [{MEEKO_IMPORT_ERROR}]")
         if not HAS_RDKIT:
             missing.append("rdkit")
-        raise ImportError(f"Production docking requires: {', '.join(missing)}")
+        # Surface the interpreter + env so a base/env mismatch is obvious.
+        print(f"[Docking] python={sys.executable}", file=sys.stderr)
+        print(f"[Docking] CONDA_PREFIX={os.environ.get('CONDA_PREFIX')}", file=sys.stderr)
+        raise ImportError(f"Production docking requires: {'; '.join(missing)}")
 
     receptor_pdb = _receptor_pdb_from_manifest(manifest)
 
