@@ -367,6 +367,11 @@ def run_one_target(target: str, mode: str, num_samples: int | None,
         "RCLONE_CONFIG_R2_ACCESS_KEY_ID": env["RCLONE_CONFIG_R2_ACCESS_KEY_ID"],
         "RCLONE_CONFIG_R2_SECRET_ACCESS_KEY": env["RCLONE_CONFIG_R2_SECRET_ACCESS_KEY"],
         "RCLONE_CONFIG_R2_ENDPOINT": env["RCLONE_CONFIG_R2_ENDPOINT"],
+        # R2 "Object Read & Write" tokens can PUT objects but cannot create
+        # buckets. rclone's default upload path does a CreateBucket precheck,
+        # which 403s — so every result/sentinel write from the pod failed
+        # silently. Skip the precheck and write objects directly.
+        "RCLONE_CONFIG_R2_NO_CHECK_BUCKET": "true",
     }
 
     if dry_run:

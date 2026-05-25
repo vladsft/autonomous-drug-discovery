@@ -112,6 +112,9 @@ jobs:
           RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          # R2 object tokens can't CreateBucket; skip rclone's precheck so the
+          # runner's own R2 writes (and the value passed to pods) succeed.
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           # Volume intentionally NOT passed: attaching it region-locks pods to
           # one datacenter (EU-CZ-1), which is chronically GPU-starved. Running
