@@ -68,15 +68,17 @@ RUN mamba env update -n base -f /tmp/envs/env_orchestrator.yml \
     && conda clean -afy \
     && rm -rf /tmp/envs
 
-# Verify the base env can import every dependency the pipeline needs at run
-# time — especially vina + meeko, whose absence only surfaces in production
-# docking (Stage 4), a path the simulation-mode CI smoke test never exercises.
-# Failing the build here converts a silent runtime crash into a loud build
-# error, exactly as the weight-verifier does for the checkpoints.
-# Mirror run_docking.py's EXACT imports — not lenient `import vina`/`import
-# meeko`, which can pass while the specific names run_docking needs fail. If
-# these don't resolve in `base`, fail the build here instead of at pod runtime.
-RUN conda run -n base python -c "from rdkit import Chem; from vina import Vina; from meeko import MoleculePreparation, PDBQTWriterLegacy; print('docking deps import OK in base')"
+# Verify the base env can actually RUN the production docking stack (Stage 4),
+# not merely import it. Imports alone are insufficient: a Meeko/RDKit version
+# mismatch imports cleanly and only fails when prepare() is called, and the
+# libstdc++ CXXABI mismatch only bites when vina's compiled extension is
+# instantiated. Both used to surface an hour into a GPU campaign. The script
+# exercises the real path (instantiate Vina, prepare a ligand to PDBQT), so any
+# regression fails the build loudly, exactly as the weight-verifier does for the
+# checkpoints. Copied alone (above the code COPY) so it only busts cache when
+# the check itself changes. Keep it in lock-step with run_docking.py.
+COPY scripts/check_docking_deps.py /tmp/check_docking_deps.py
+RUN conda run -n base python /tmp/check_docking_deps.py
 
 # --- P2Rank (pocket detection, Stage 1) --------------------------------------
 # Java is supplied by `openjdk` inside the `base` environment, which is where

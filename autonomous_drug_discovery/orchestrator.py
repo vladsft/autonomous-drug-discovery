@@ -42,9 +42,56 @@ def ensure_dirs():
 
 
 def get_python_cmd(env_name):
-    """Return the command to run python in a specific conda environment."""
+    """Return the command to run python in a specific conda environment.
+
+    If we are ALREADY running inside `env_name`, reuse this very interpreter
+    (`sys.executable`) instead of spawning a nested `conda run -n env_name`.
+
+    Why this matters: the container entrypoint launches the orchestrator with
+    `conda run -n base python orchestrator.py`. A stage that also runs in `base`
+    (docking, screening, ranking) would otherwise be spawned as a SECOND,
+    nested `conda run -n base` — and that nested activation does not reliably
+    restore the dynamic-loader paths that conda packages with compiled
+    extensions need. `vina` links Boost `.so`s out of `$CONDA_PREFIX/lib`, so
+    `import vina` then fails at runtime even though a *single* `conda run -n
+    base` imports it fine (which the Docker build check proves). `sys.executable`
+    already carries the parent's fully-activated environment, so the import
+    works. Cross-env hops (e.g. base -> targetdiff_env) still go through
+    `conda run`, which is correct.
+    """
+    if os.environ.get("CONDA_DEFAULT_ENV") == env_name:
+        return [sys.executable]
     conda_bin = os.environ.get("CONDA_EXE", "conda")
     return [conda_bin, "run", "-n", env_name, "python"]
+
+
+def stage_env(env_name):
+    """Environment for a stage subprocess.
+
+    When a stage runs in the env we're ALREADY in (base — see get_python_cmd),
+    prepend that env's lib dir to LD_LIBRARY_PATH so the dynamic loader resolves
+    `libstdc++.so.6` (and other compiled deps) from conda, not the older system
+    copy under /lib/x86_64-linux-gnu.
+
+    Why: a stage like docking imports `tdc`/`scipy` *before* `vina`. Those map
+    the system libstdc++ into the process first; vina's compiled extension then
+    binds to that already-loaded lib, which lacks the `CXXABI_1.3.15` symbol its
+    conda build needs, and `import vina` aborts. LD_LIBRARY_PATH is read by the
+    loader at exec time, so it must be set on the child's environment here —
+    setting it from inside the child is too late once the system lib is mapped.
+
+    This is deliberately NOT applied to cross-env launches (e.g. base ->
+    targetdiff_env via `conda run`): prepending base's lib there could shadow
+    targetdiff_env's own CUDA/torch libraries. The CONDA_DEFAULT_ENV guard
+    confines the override to same-env (base) stages, which is exactly where the
+    sys.executable launch path runs.
+    """
+    env = os.environ.copy()
+    if os.environ.get("CONDA_DEFAULT_ENV") == env_name:
+        lib = os.path.join(sys.prefix, "lib")
+        prev = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = lib + (os.pathsep + prev if prev else "")
+    return env
 
 
 def check_stage_output(path, description, min_bytes=1):
@@ -88,7 +135,7 @@ def run_ingestion(pdb_path, db_path, campaign_id, clean_pdb=False, pocket_backen
         cmd.append("--clean")
 
     try:
-        subprocess.check_call(cmd)
+        subprocess.check_call(cmd, env=stage_env("base"))
         print("[Orchestrator] Ingestion complete.\n")
         return True
     except subprocess.CalledProcessError as e:
@@ -120,7 +167,8 @@ def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
     out_dir = output_dir or str(DATA_DIR / "candidates")
 
     env_map = {"targetdiff": "targetdiff_env", "pocket2mol": "pocket2mol_env"}
-    cmd = get_python_cmd(env_map.get(mode, "base"))
+    gen_env = env_map.get(mode, "base")
+    cmd = get_python_cmd(gen_env)
 
     cmd += [
         str(script_path),
@@ -136,7 +184,7 @@ def run_generation(manifest_path, db_path, campaign_id, mode="simulation",
         cmd += ["--device", str(device)]
 
     try:
-        subprocess.check_call(cmd)
+        subprocess.check_call(cmd, env=stage_env(gen_env))
         print("[Orchestrator] Generation complete.\n")
         return True
     except subprocess.CalledProcessError as e:
@@ -166,7 +214,7 @@ def run_screening(sdf_path, db_path, campaign_id, output_dir=None):
     ]
 
     try:
-        subprocess.check_call(cmd)
+        subprocess.check_call(cmd, env=stage_env("base"))
         print("[Orchestrator] Screening complete.\n")
         return True
     except subprocess.CalledProcessError as e:
@@ -201,7 +249,7 @@ def run_docking(manifest_path, db_path, campaign_id, mode="simulation",
     ]
 
     try:
-        subprocess.check_call(cmd)
+        subprocess.check_call(cmd, env=stage_env("base"))
         print("[Orchestrator] Docking complete.\n")
         return True
     except subprocess.CalledProcessError as e:
@@ -241,7 +289,7 @@ def run_ranking(docking_csv, screening_json, db_path, campaign_id, output_dir=No
         cmd += ["--aizynth_config", str(aizynth_config)]
 
     try:
-        subprocess.check_call(cmd)
+        subprocess.check_call(cmd, env=stage_env("base"))
         print("[Orchestrator] Ranking complete.\n")
         return True
     except subprocess.CalledProcessError as e:
@@ -276,7 +324,7 @@ def run_validation(holo_pdb, db_path, campaign_id, ligand_resname,
         cmd += ["--decoys", str(decoys)]
 
     try:
-        subprocess.check_call(cmd)
+        subprocess.check_call(cmd, env=stage_env("base"))
         print("[Orchestrator] Validation PASSED (pose RMSD within threshold).\n")
         return True
     except subprocess.CalledProcessError as e:
