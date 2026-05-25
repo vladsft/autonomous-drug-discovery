@@ -69,12 +69,16 @@ permissions:
   id-token: write    # required by deploy-pages
 
 env:
-  # Pin to the immutable per-commit tag, not :latest. RunPod caches images by
-  # tag per physical machine and will happily reuse a days-old :latest instead
-  # of re-pulling — which silently ran a stale image with broken docking deps.
-  # A unique :<sha> tag can never be stale. (build.yml pushes both :latest and
-  # :<sha>; the build for this commit must have finished before dispatching.)
-  IMAGE: ${{ vars.IMAGE || format('ghcr.io/{0}:{1}', github.repository, github.sha) }}
+  # Pick the image by mode, pinned to the immutable per-commit tag (never
+  # :latest — RunPod caches by tag per machine and would reuse a stale one):
+  #   rdkit / simulation -> :slim-<sha>  (CPU-only ~3 GB; pulls in minutes)
+  #   targetdiff / pocket2mol -> :<sha>  (full ~10 GB; CUDA + diffusion weights)
+  # The 10 GB image timed out cold machines mid-pull past the startup grace;
+  # the CPU modes don't need any of that weight, so they get the slim image.
+  # build.yml pushes :<sha> and :slim-<sha> on every push to main — the build
+  # for this commit must have finished before dispatching. vars.IMAGE still
+  # overrides everything if set (e.g. to debug a specific tag).
+  IMAGE: ${{ vars.IMAGE || ((inputs.mode == 'rdkit' || inputs.mode == 'simulation') && format('ghcr.io/{0}:slim-{1}', github.repository, github.sha) || format('ghcr.io/{0}:{1}', github.repository, github.sha)) }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:

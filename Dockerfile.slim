@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1.7
+#
+# Agent Harness — SLIM (CPU-only) image.
+#
+# A stripped variant of the full Dockerfile for the CPU pipeline modes
+# (rdkit, simulation): ingestion (P2Rank), RDKit generation, screening
+# (ADMET-AI), AutoDock Vina docking, ranking. It deliberately OMITS everything
+# only the GPU diffusion path needs — the CUDA base layer, the targetdiff_env
+# conda environment, and the TargetDiff diffusion weights — which cuts the
+# image from ~10 GB to ~3 GB. A cold RunPod machine then pulls it in a few
+# minutes instead of blowing past the dispatcher's startup-grace window (the
+# 10 GB full image timed out two batches mid-pull). For `targetdiff` /
+# `pocket2mol` runs, use the full image (Dockerfile) — they need CUDA + weights.
+#
+# Keep the shared layers (OS packages, rclone, miniforge, the `base` conda env,
+# the docking build-check, P2Rank, entrypoint) in lock-step with Dockerfile.
+# The ONLY differences are: ubuntu base instead of nvidia/cuda, no
+# targetdiff_env, and no TargetDiff weights / patch / verify steps.
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CONDA_DIR=/opt/conda \
+    PATH=/opt/conda/bin:/opt/conda/condabin:$PATH \
+    P2RANK_BIN=/opt/p2rank_2.5.1/prank \
+    PYTHONUNBUFFERED=1
+
+# --- OS packages -------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl wget ca-certificates bzip2 procps unzip build-essential patch \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- rclone (pinned; do NOT rename to RCLONE_VERSION — see Dockerfile) --------
+ARG RCLONE_RELEASE=v1.74.1
+RUN curl -fsSL -o /tmp/rclone.zip \
+        "https://github.com/rclone/rclone/releases/download/${RCLONE_RELEASE}/rclone-${RCLONE_RELEASE}-linux-amd64.zip" \
+    && unzip -j /tmp/rclone.zip '*/rclone' -d /usr/local/bin/ \
+    && chmod +x /usr/local/bin/rclone \
+    && rm /tmp/rclone.zip \
+    && rclone version
+
+# --- Miniforge (conda + mamba, conda-forge default channel) ------------------
+RUN curl -fsSL -o /tmp/miniforge.sh \
+        https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
+    && bash /tmp/miniforge.sh -b -p ${CONDA_DIR} \
+    && rm /tmp/miniforge.sh \
+    && conda config --set always_yes yes
+
+# --- base conda env ONLY -----------------------------------------------------
+# Every CPU stage: orchestrator, ingestion (P2Rank, via openjdk in this env),
+# RDKit generation, screening, AutoDock Vina docking, ranking. torch here is
+# the CPU build (see env_orchestrator.yml), so no CUDA runtime is pulled in.
+# Safe to `conda clean` immediately — unlike the full image there is no second
+# env solve that would need the package cache afterwards.
+COPY autonomous_drug_discovery/envs/env_orchestrator.yml /tmp/envs/
+RUN mamba env update -n base -f /tmp/envs/env_orchestrator.yml \
+    && conda clean -afy \
+    && rm -rf /tmp/envs
+
+# --- Docking stack build check (vina instantiate + ligand prep) --------------
+# Same gate as the full image: imports alone pass under a Meeko/RDKit mismatch
+# or a libstdc++ break, so actually instantiate Vina and prepare a ligand.
+COPY scripts/check_docking_deps.py /tmp/check_docking_deps.py
+RUN conda run -n base python /tmp/check_docking_deps.py
+
+# --- P2Rank (pocket detection, Stage 1) --------------------------------------
+RUN curl -fsSL -o /tmp/p2rank.tar.gz \
+        https://github.com/rdk/p2rank/releases/download/2.5.1/p2rank_2.5.1.tar.gz \
+    && tar -xzf /tmp/p2rank.tar.gz -C /opt \
+    && rm /tmp/p2rank.tar.gz \
+    && test -x ${P2RANK_BIN}
+
+# --- Application code --------------------------------------------------------
+# No TargetDiff weights, patch, or verify step — the diffusion path is not part
+# of this image. The targetdiff/ submodule dir may be empty (slim checks out
+# without submodules); nothing in the rdkit/simulation path imports it.
+COPY . /app
+WORKDIR /app
+
+RUN install -m 0755 scripts/docker-entrypoint.sh /usr/local/bin/entrypoint.sh
+
+WORKDIR /app/autonomous_drug_discovery
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["orchestrator.py", "--help"]
