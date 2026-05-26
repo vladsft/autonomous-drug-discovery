@@ -71,9 +71,12 @@ POD_TIMEOUT_MIN_DEFAULT = 90
 # A pod that fails this many times in a row gets dropped from the work-list.
 MAX_RETRIES_PER_TARGET = 3
 # Startup window: how long to wait for the container to FIRST report uptime>0
-# before concluding the image pull is stuck. Generous because a cold
-# community-cloud machine pulling a ~10 GB image legitimately takes a while.
-STARTUP_GRACE_S = 20 * 60
+# before concluding the image pull is stuck. We run the FULL ~10 GB image for
+# every mode, and a cold community-cloud machine can take well over 20 min to
+# pull it — two early batches died at startup_timeout still mid-pull on a 20-min
+# window. 40 min gives ~2x headroom over an observed-slow pull. (The pod's own
+# fuse RUNPOD_TIMEOUT_MIN and the 350-min runner ceiling still bound the total.)
+STARTUP_GRACE_S = 40 * 60
 # Crash-loop detection (only after the container has started): if it never
 # stays alive longer than CRASH_LOOP_UPTIME_S across CRASH_LOOP_GRACE_S of
 # wall-clock since first start, its command is dying on startup.

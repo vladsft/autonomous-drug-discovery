@@ -67,16 +67,13 @@ permissions:
   contents: write    # commit the regenerated dashboard back to main
 
 env:
-  # Pick the image by mode, pinned to the immutable per-commit tag (never
-  # :latest — RunPod caches by tag per machine and would reuse a stale one):
-  #   rdkit / simulation -> :slim-<sha>  (CPU-only ~3 GB; pulls in minutes)
-  #   targetdiff / pocket2mol -> :<sha>  (full ~10 GB; CUDA + diffusion weights)
-  # The 10 GB image timed out cold machines mid-pull past the startup grace;
-  # the CPU modes don't need any of that weight, so they get the slim image.
-  # build.yml pushes :<sha> and :slim-<sha> on every push to main — the build
-  # for this commit must have finished before dispatching. vars.IMAGE still
-  # overrides everything if set (e.g. to debug a specific tag).
-  IMAGE: ${{ vars.IMAGE || ((inputs.mode == 'rdkit' || inputs.mode == 'simulation') && format('ghcr.io/{0}:slim-{1}', github.repository, github.sha) || format('ghcr.io/{0}:{1}', github.repository, github.sha)) }}
+  # Always the full per-commit image, for every mode. Pinned to the immutable
+  # :<sha> tag (never :latest — RunPod caches by tag per machine and would reuse
+  # a stale one). The full ~10 GB image is heavy to pull, so the dispatcher's
+  # STARTUP_GRACE_S is set generously (40 min) to let a cold machine finish the
+  # pull. build.yml pushes :<sha> on every push to main — that build must have
+  # finished before dispatching. vars.IMAGE overrides if set (e.g. to debug).
+  IMAGE: ${{ vars.IMAGE || format('ghcr.io/{0}:{1}', github.repository, github.sha) }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
