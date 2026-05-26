@@ -2,10 +2,10 @@
 #
 # Trigger: Actions → "batch_cloud_run" → "Run workflow". The form fields
 # below become inputs to scripts/batch_cloud_run.py. After the batch drains,
-# the action regenerates the multi-target dashboard, commits dashboard/, and
-# deploys Pages inline (we don't rely on the pages workflow firing on
-# `paths`, because the default GITHUB_TOKEN won't trigger cross-workflow
-# runs).
+# the action regenerates the multi-target dashboard and commits dashboard/ back
+# to main. Publishing to GitHub Pages is currently DISABLED here (Pages isn't
+# enabled on the repo); re-enable via the standalone pages.yml workflow once
+# Settings → Pages → Source = GitHub Actions is set. See the note near the end.
 #
 # Required repo secrets (Settings → Secrets and variables → Actions):
 #   RUNPOD_API_KEY            — RunPod console, Settings → API Keys
@@ -65,8 +65,6 @@ concurrency:
 
 permissions:
   contents: write    # commit the regenerated dashboard back to main
-  pages: write       # inline Pages deploy
-  id-token: write    # required by deploy-pages
 
 env:
   # Pick the image by mode, pinned to the immutable per-commit tag (never
@@ -85,9 +83,6 @@ jobs:
   batch:
     runs-on: ubuntu-latest
     timeout-minutes: 350   # 5h50m; the free-tier ceiling is 6h.
-    environment:
-      name: github-pages
-      url: ${{ steps.pages-deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -155,17 +150,13 @@ jobs:
             git push
           fi
 
-      # Requires Pages to have been enabled once manually (Settings -> Pages ->
-      # Source = GitHub Actions); the default token can't create the site.
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: dashboard
-
-      # Inline Pages deploy — we don't rely on the separate pages.yml firing on
-      # a push, because GITHUB_TOKEN-driven pushes don't trigger child workflows.
-      - id: pages-deploy
-        uses: actions/deploy-pages@v4
+      # Pages deploy is intentionally DISABLED here for now: GitHub Pages isn't
+      # enabled on the repo (Settings -> Pages -> Source = GitHub Actions), and
+      # the default token can't enable it, so configure-pages 404s and fails the
+      # batch. The dashboard is still regenerated and committed to main above, so
+      # no data is lost. To re-enable publishing: flip that Settings toggle once,
+      # then run the standalone `pages.yml` workflow (Actions -> pages -> Run
+      # workflow) — it deploys dashboard/ from main on demand.
 
       - name: Upload batch summary as artifact
         if: always()
