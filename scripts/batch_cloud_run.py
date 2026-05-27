@@ -193,10 +193,16 @@ def provision_pod(api_key: str, image: str, gpu_type: str,
         "cloudType": "ALL", "gpuCount": 1, "gpuTypeId": gpu_type,
         "name": pod_name, "imageName": image,
         "dockerArgs": "bash /app/scripts/pod_campaign.sh",
-        # Ephemeral working disk. Keep modest: a large request ("does not have
-        # the resources to deploy your pod") shrinks the set of machines that
-        # can place the pod. data/ is a handful of SDFs/CSVs pulled from R2.
-        "containerDiskInGb": 20,
+        # Ephemeral container disk. Must hold the image's UNCOMPRESSED layers
+        # (Docker also keeps the compressed copy transiently mid-pull) plus the
+        # data/ pulled from R2 and runtime working files. The full image is
+        # ~5 GB compressed → ~13-15 GB unpacked; at 20 GB the extract peaked at
+        # the limit and the pull silently failed (the container never started,
+        # which RunPod reports as "can't pull the image"). The ~3 GB slim image
+        # fit, which is why only the full image failed. 40 GB gives comfortable
+        # headroom and still places on virtually any machine (the "does not have
+        # resources" errors were GPU supply, not disk).
+        "containerDiskInGb": 40,
         "env": env_list,
     }
     if network_volume_id:
