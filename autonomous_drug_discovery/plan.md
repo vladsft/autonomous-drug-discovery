@@ -472,6 +472,16 @@ Sequenced so each day's output is the next day's input. Roughly 2 working days e
 - [x] **Multi-target dashboard JS.** `<select id="target-select">` in the header + `setActiveTarget(pdb)` plumbing. Backend pills, summary stats, molecule table, detail panel all re-render on target change. Dock-slider min is the union over all targets × backends so the range is stable.
 - [ ] **Production batch — pending user.** Curate the 30-50 target list. Click Run workflow. Walk away. Come back to the Pages URL.
 
+### Known issues (batch driver)
+
+#### Bot dashboard commits have no image — FIXED 2026-05-29
+
+**Symptom (was):** `batch.yml` pinned the pod image to `:${github.sha}` (so RunPod couldn't reuse a stale `:latest`). But the tail of every *successful* batch commits the regenerated `dashboard/` back to `main` as a bot commit via the default `GITHUB_TOKEN`. GitHub does **not** fire workflows from `GITHUB_TOKEN` pushes (loop prevention) — so that commit never triggered `build.yml` and no `:<sha>` image was ever built for it. Any batch dispatched while `HEAD` was that bot commit pinned to a tag GHCR didn't have; pods retried the pull until the 40-min `STARTUP_GRACE_S` aborted them. Confirmed live 2026-05-27 (run #26539113240 on commit `179b92c`, dashboard commit from the prior batch — pod stuck `RUNNING` with `runtime: null`, RunPod logs showing `manifest unknown`).
+
+**Fix:** `batch_cloud_run.py` now runs an **image preflight** before provisioning any pod (`preflight_image` / `image_manifest_exists`). It queries the GitHub Packages API via `gh api /users/<owner>/packages/container/<name>/versions` (also tries `/orgs/…` as fallback) to confirm the requested tag exists; if not, it falls back to `:latest` and mutates `env["IMAGE"]` so every subsequent pod picks up the resolved tag. `:latest` is always safe here because dashboard commits change only `dashboard/`, never anything baked into the image. The workflow also gained `permissions: packages: read` and a `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` env on the run step so `gh` is authenticated for the (private) package. Non-ghcr.io references and any probe failure return True (graceful — a flaky probe must never block a real batch; the pod surfaces the real pull error if it actually can't pull).
+
+**Verification:** the new probe correctly returns False for the exact broken tag `:179b92c3155726ceb1fa356e8ef5647bc50dd294`, True for `:latest` and the known-good sha `:ee3e04fd…`, False for garbage tags, and True (graceful) for non-ghcr.io references.
+
 ### What I'm explicitly *not* doing in this batch (defer to Phase 3+)
 
 | Skipped | Reason |

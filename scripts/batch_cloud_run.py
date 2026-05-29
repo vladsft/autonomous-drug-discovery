@@ -134,6 +134,101 @@ def load_env() -> dict[str, str]:
     return {k: os.environ[k] for k in required + optional if os.environ.get(k)}
 
 
+# ── Image preflight (catch the bot-commit / missing-sha trap early) ─────────
+GHCR_HOST = "ghcr.io"
+
+
+def _split_image_ref(image_ref: str) -> tuple[str, str, str]:
+    """Split 'host/repo:tag' (or '…@sha256:…') into (host, repo, tag-or-digest)."""
+    if "@" in image_ref:
+        ref, _, digest = image_ref.partition("@")
+        tag = digest
+    else:
+        ref, sep, tag = image_ref.rpartition(":")
+        if not sep:
+            ref, tag = image_ref, "latest"
+    host, _, repo = ref.partition("/")
+    return host, repo, tag
+
+
+def image_manifest_exists(image_ref: str) -> bool:
+    """Return True iff `image_ref` exists in GHCR, using the GitHub Packages API.
+
+    Probes via `gh api /{users,orgs}/<owner>/packages/container/<name>/versions`
+    rather than the OCI registry endpoints. Reasons:
+      - Our image is private — anonymous registry probes get 401.
+      - `gh` is pre-installed on Actions runners and authenticated from
+        GITHUB_TOKEN automatically (we add `packages: read` in batch.yml);
+        locally it picks up the user's `gh auth login` session.
+      - The same call shape handles user- and org-owned packages (try one,
+        fall back to the other on 404).
+
+    Non-ghcr.io references and any unexpected probe failure return True —
+    we never want a flaky probe to block a real batch; the pod will surface
+    a real pull error if it actually cannot pull.
+    """
+    host, repo, tag = _split_image_ref(image_ref)
+    if host != GHCR_HOST or "/" not in repo:
+        return True
+    owner, _, name = repo.partition("/")
+    for kind in ("users", "orgs"):
+        try:
+            out = subprocess.run(
+                ["gh", "api", "--paginate",
+                 f"/{kind}/{owner}/packages/container/{name}/versions",
+                 "--jq", ".[].metadata.container.tags[]?"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except FileNotFoundError:
+            print("[preflight] `gh` not installed; skipping image probe")
+            return True
+        except subprocess.TimeoutExpired:
+            print("[preflight] `gh api` timed out; skipping image probe")
+            return True
+        if out.returncode != 0:
+            if "404" in out.stderr or "Not Found" in out.stderr:
+                continue   # try the other owner-kind
+            print(f"[preflight] `gh api` error ({out.stderr.strip()[:200]}); "
+                  f"skipping image probe")
+            return True
+        tags = set(out.stdout.split())
+        return tag in tags
+    print(f"[preflight] package {owner}/{name} not found on GHCR via gh api "
+          f"(neither user nor org)")
+    return False
+
+
+def preflight_image(env: dict[str, str]) -> None:
+    """Verify env['IMAGE'] is pullable from GHCR; fall back to :latest if not.
+
+    Guards the trap documented in plan.md → Phase 1.5 → Known issues: batch.yml
+    pins IMAGE to :${github.sha}, but the dashboard commit a prior successful
+    batch pushes via GITHUB_TOKEN never triggers build.yml (GitHub's loop
+    prevention), so HEAD often has no :<sha> on GHCR. :latest always tracks the
+    last real build, and dashboard-only commits never change the image, so the
+    fallback is correct here.
+
+    Mutates env['IMAGE'] in place when the fallback is used so every pod
+    provisioned afterwards picks up the resolved tag.
+    """
+    image = env["IMAGE"]
+    if image_manifest_exists(image):
+        print(f"[preflight] image OK: {image}")
+        return
+    host, repo, _ = _split_image_ref(image)
+    fallback = f"{host}/{repo}:latest" if host and repo else f"{image.rsplit(':', 1)[0]}:latest"
+    print(f"[preflight] WARNING: {image} is not pullable from GHCR")
+    print("[preflight] (likely a bot dashboard commit at HEAD with no matching "
+          "build — see plan.md Phase 1.5 known issues)")
+    print(f"[preflight] falling back to {fallback}")
+    if not image_manifest_exists(fallback):
+        print(f"[preflight] FATAL: neither {image} nor {fallback} are pullable.",
+              file=sys.stderr)
+        sys.exit(1)
+    env["IMAGE"] = fallback
+    print(f"[preflight] image OK: {fallback}")
+
+
 # ── RunPod GraphQL ───────────────────────────────────────────────────────────
 def runpod_gql(api_key: str, query: str, variables: dict | None = None,
                retries: int = 3, retry_backoff_s: float = 2.0) -> dict:
@@ -561,6 +656,11 @@ def main() -> int:
         return 1
 
     env = load_env()
+
+    # 0. Image preflight: refuse to provision pods against a tag that doesn't
+    #    exist on GHCR (40-min STARTUP_GRACE is too expensive a way to discover
+    #    that). Falls back to :latest when the sha tag is missing.
+    preflight_image(env)
 
     # 1. Skip-list from telemetry (pulled from R2).
     if not args.force:

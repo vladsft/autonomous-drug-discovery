@@ -65,6 +65,7 @@ concurrency:
 
 permissions:
   contents: write    # commit the regenerated dashboard back to main
+  packages: read     # batch_cloud_run.py's image preflight queries GHCR via gh api
 
 env:
   # Always the full per-commit image, for every mode. Pinned to the immutable
@@ -102,6 +103,8 @@ jobs:
 
       - name: Run the batch
         env:
+          # `gh` (used by batch_cloud_run.py's image preflight) reads this for auth.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           RCLONE_CONFIG_R2_TYPE: s3
           RCLONE_CONFIG_R2_PROVIDER: Cloudflare
