@@ -482,6 +482,12 @@ Sequenced so each day's output is the next day's input. Roughly 2 working days e
 
 **Verification:** the new probe correctly returns False for the exact broken tag `:179b92c3155726ceb1fa356e8ef5647bc50dd294`, True for `:latest` and the known-good sha `:ee3e04fd…`, False for garbage tags, and True (graceful) for non-ghcr.io references.
 
+#### Cloud TargetDiff env was unpinned → `libc10_cuda.so` import crash — FIXED 2026-05-29
+
+**Symptom (was):** the first cloud batch to reach TargetDiff generation (run #26663134404, both 1M17 and 2HYY, all 3 retries each) crashed at *import* time — before generating a single molecule — with `OSError: libc10_cuda.so: cannot open shared object file`, raised while `torch_geometric` eagerly imported `torch_cluster`. Root cause: `env_targetdiff.yml` pinned `pytorch=1.13.0` but left the entire PyG stack (`pyg`, `pytorch-cluster/scatter/sparse`) unpinned on the conda `pyg` channel. The image rebuild triggered by the preflight commit (68d9da7) re-solved that env from scratch and pulled a torch build without `libc10_cuda.so` paired with CUDA-built PyG extensions that demand it — a mismatch. The same broken solve also made `torch.cuda.is_available()` return False in `targetdiff_env`, so `--device auto` resolved to `cpu` even on an RTX 3090 pod (a second symptom of the one root cause). The preflight fix worked perfectly here (`[preflight] image OK: …:68d9da7`); this was a separate latent bug it merely exposed by forcing a rebuild.
+
+**Fix:** rewrote `env_targetdiff.yml` to mirror the proven `env_targetdiff_blackwell.yml` structure — conda-forge for the non-torch deps, and a pinned pip stack for torch + PyG from the prebuilt cu117 wheels: `torch==1.13.0+cu117` (from the PyTorch cu117 index, which bundles `libc10_cuda.so`), `torch-scatter==2.1.1+pt113cu117`, `torch-cluster==1.6.1+pt113cu117`, `torch-sparse==0.6.17+pt113cu117` (from `data.pyg.org`), and `torch-geometric==2.3.1`. This makes the build reproducible and, because torch is now a real CUDA build, fixes the device detection too (`--device auto` → cuda on a GPU pod). Needs an image rebuild to take effect; `Dockerfile` installs the env unchanged via `mamba env create`.
+
 ### What I'm explicitly *not* doing in this batch (defer to Phase 3+)
 
 | Skipped | Reason |

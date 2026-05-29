@@ -5,31 +5,38 @@
 # Blackwell GPU use env_targetdiff_blackwell.yml instead. Both install under
 # the same conda env name, `targetdiff_env`; only the file differs, per machine.
 # See docs/pipeline-guide.md -> "Full pipeline, local GPU".
+#
+# The torch + PyG stack is pip-only and DELIBERATELY PINNED, mirroring
+# env_targetdiff_blackwell.yml. The previous version left `pyg`,
+# `pytorch-cluster/scatter/sparse` unpinned on the conda `pyg` channel; a fresh
+# image rebuild then re-solved them to newer builds whose compiled .so files
+# expect a `libc10_cuda.so` the resolved torch didn't provide — every TargetDiff
+# import crashed with "OSError: libc10_cuda.so: cannot open shared object file"
+# (cloud batch 26663134404, 2026-05-29). Pinning to the prebuilt cu117 wheels
+# from data.pyg.org makes the build reproducible and brings the matching CUDA
+# torch, so `torch.cuda.is_available()` is True on a GPU pod (so `--device auto`
+# resolves to cuda, not cpu).
 
 name: targetdiff_env
 channels:
-  - pytorch
-  - nvidia
-  - pyg
   - conda-forge
-  - defaults
 dependencies:
   - python=3.8
-  - pytorch=1.13.0
-  - torchvision
-  - torchaudio
-  - pytorch-cuda=11.7
-  - pyg
-  - pytorch-cluster
-  - pytorch-scatter
-  - pytorch-sparse
   - openbabel
   - rdkit
   - biopython
+  - scipy
   - pandas
   - pyyaml
   - tqdm
   - pip
   - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu117
+    - --find-links https://data.pyg.org/whl/torch-1.13.0+cu117.html
+    - torch==1.13.0+cu117
+    - torch-scatter==2.1.1+pt113cu117
+    - torch-cluster==1.6.1+pt113cu117
+    - torch-sparse==0.6.17+pt113cu117
+    - torch-geometric==2.3.1
     - lmdb
     - easydict
