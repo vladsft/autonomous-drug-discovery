@@ -488,6 +488,8 @@ Sequenced so each day's output is the next day's input. Roughly 2 working days e
 
 **Fix:** rewrote `env_targetdiff.yml` to mirror the proven `env_targetdiff_blackwell.yml` structure — conda-forge for the non-torch deps, and a pinned pip stack for torch + PyG from the prebuilt cu117 wheels: `torch==1.13.0+cu117` (from the PyTorch cu117 index, which bundles `libc10_cuda.so`), `torch-scatter==2.1.1+pt113cu117`, `torch-cluster==1.6.1+pt113cu117`, `torch-sparse==0.6.17+pt113cu117` (from `data.pyg.org`), and `torch-geometric==2.3.1`. This makes the build reproducible and, because torch is now a real CUDA build, fixes the device detection too (`--device auto` → cuda on a GPU pod). Needs an image rebuild to take effect; `Dockerfile` installs the env unchanged via `mamba env create`.
 
+**Verified live (cloud batch 26667598702):** the rebuilt image cleared the `libc10_cuda.so` crash and `--device auto` correctly resolved to `cuda` on the RTX 3090 — but surfaced a *third* domino: `lmdb` (in the pip section) fell back to its cffi backend, which JIT-compiles a C module via gcc at first import, and that compile failed in the cu117/py38 image (`cffi.VerificationError: CompileError: gcc failed`). **Follow-on fix:** moved `lmdb` from pip → conda-forge `python-lmdb` (ships a prebuilt binding + bundled liblmdb, no runtime compiler). One more rebuild needed.
+
 ### What I'm explicitly *not* doing in this batch (defer to Phase 3+)
 
 | Skipped | Reason |

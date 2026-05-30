@@ -380,6 +380,9 @@ def main():
                                help="Pocket detection backend (default: p2rank)")
     ingest_parser.add_argument("--clean", action="store_true",
                                help="Drop HETATM/waters/alt locs before detection")
+    ingest_parser.add_argument("--campaign_id", default=None,
+                               help="Attach this stage to an existing campaign "
+                                    "(default: mint a new one)")
 
     # Generate command
     gen_parser = subparsers.add_parser("generate", help="Generate molecules from a manifest")
@@ -391,16 +394,25 @@ def main():
     gen_parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
                             help="Compute device for GPU-capable backends "
                                  "(targetdiff/pocket2mol); 'auto' detects a GPU")
+    gen_parser.add_argument("--campaign_id", default=None,
+                            help="Attach this stage to an existing campaign "
+                                 "(default: mint a new one)")
 
     # Screen command
     screen_parser = subparsers.add_parser("screen", help="Screen molecules through fast triage")
     screen_parser.add_argument("input_sdf", help="Path to SDF file to screen")
+    screen_parser.add_argument("--campaign_id", default=None,
+                               help="Attach this stage to an existing campaign "
+                                    "(default: mint a new one)")
 
     # Dock command
     dock_parser = subparsers.add_parser("dock", help="Dock generated molecules")
     dock_parser.add_argument("manifest", help="Path to ingestion manifest.json")
     dock_parser.add_argument("--mode", choices=["simulation", "triage", "production"],
                             default="simulation", help="Execution mode")
+    dock_parser.add_argument("--campaign_id", default=None,
+                             help="Attach this stage to an existing campaign "
+                                  "(default: mint a new one)")
 
     # Rank command (Stage 5: multi-criteria ranker)
     rank_parser = subparsers.add_parser("rank", help="Multi-criteria ranking of docked candidates")
@@ -410,6 +422,9 @@ def main():
     rank_parser.add_argument("--aizynth_config", default=os.environ.get("AIZYNTH_CONFIG"),
                              help="AiZynthFinder config.yml — enables retrosynthetic "
                                   "scoring of the top-N candidates (default: $AIZYNTH_CONFIG)")
+    rank_parser.add_argument("--campaign_id", default=None,
+                             help="Attach this stage to an existing campaign "
+                                  "(default: mint a new one)")
 
     # Validate command (retrospective docking validation)
     validate_parser = subparsers.add_parser(
@@ -450,8 +465,11 @@ def main():
 
     ensure_dirs()
 
-    # Generate a new campaign ID for tracking
-    campaign_id = f"campaign_{uuid.uuid4().hex[:8]}"
+    # Campaign ID for telemetry. A standalone stage (screen/dock/rank/generate/
+    # ingest) can pass --campaign_id to attach to an existing campaign instead
+    # of minting a fresh one — otherwise re-running a single stage orphans its
+    # telemetry under a new id, fragmenting the campaign. `run` manages its own.
+    campaign_id = getattr(args, "campaign_id", None) or f"campaign_{uuid.uuid4().hex[:8]}"
     db_path = args.db_path
 
     print(f"[Orchestrator] Campaign ID: {campaign_id}")

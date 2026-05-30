@@ -29,6 +29,12 @@ dependencies:
   - pandas
   - pyyaml
   - tqdm
+  # lmdb from conda-forge (NOT pip): the pip wheel falls back to a cffi backend
+  # that JIT-compiles a C module via gcc at first import, which fails in the
+  # cu117/py38 image (missing lmdb headers) — cloud batch 26667598702. The
+  # conda-forge `python-lmdb` package ships a prebuilt binding + bundled
+  # liblmdb, so no compiler is touched at runtime.
+  - python-lmdb
   - pip
   - pip:
     - --extra-index-url https://download.pytorch.org/whl/cu117
@@ -38,5 +44,4 @@ dependencies:
     - torch-cluster==1.6.1+pt113cu117
     - torch-sparse==0.6.17+pt113cu117
     - torch-geometric==2.3.1
-    - lmdb
     - easydict
