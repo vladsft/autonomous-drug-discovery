@@ -147,20 +147,40 @@ scripts/apply_targetdiff_patches.sh
 
 Both TargetDiff env specs install under the same conda env name (`targetdiff_env`); only the file differs, chosen per machine. You also need P2Rank installed (`~/p2rank_2.5.1/prank`) for pocket detection, and the TargetDiff checkpoint at `autonomous_drug_discovery/modules/02_generation/targetdiff/pretrained_models/pretrained_diffusion.pt` (mirrored at <https://huggingface.co/vladsft/agent-harness-weights>).
 
-### Run
+### Run — the `*-local` make targets (no Docker)
+
+`make run` and `make dashboard` run *inside Docker*; for a no-Docker machine use their `*-local` counterparts, which call conda directly. Only `make pull` / `make push` (pure rclone) and these `*-local` targets work without Docker.
 
 ```bash
-# Full pipeline, RDKit generator (fast, CPU)
-conda run -n base python autonomous_drug_discovery/orchestrator.py run \
-    autonomous_drug_discovery/data/processed/1M17.pdb --mode rdkit
-
-# Full pipeline, TargetDiff diffusion on the local GPU
-conda run -n base python autonomous_drug_discovery/orchestrator.py run \
-    autonomous_drug_discovery/data/processed/1M17.pdb \
-    --mode targetdiff --device cuda --num_samples 30
+make run-local TARGET=1IEP MODE=cascade NUM=5      # full pipeline via conda
+make dashboard-local                               # regenerate dashboard/ from telemetry
 ```
 
-`--device` accepts `auto` (the default — detects a GPU), `cuda`, or `cpu`. For per-stage commands and parameters, see [`docs/pipeline-guide.md`](docs/pipeline-guide.md).
+`MODE` accepts `cascade` (RDKit + TargetDiff), `rdkit`, `targetdiff`, `simulation`; `DEVICE` defaults to `auto` (detects a GPU, else CPU). Equivalent raw invocation:
+
+```bash
+conda run -n base python autonomous_drug_discovery/orchestrator.py run \
+    autonomous_drug_discovery/data/processed/1IEP.pdb --mode cascade --device auto --num_samples 5
+```
+
+> **⚠️ TargetDiff on CPU is slow — ~12 min/molecule** (vs ~30 s on GPU). So on a CPU-only box: `rdkit` mode is ~2 min; a `cascade`/`targetdiff` run is only practical at a **small `NUM`** (e.g. `NUM=5` ≈ ~1 h end-to-end). Don't run `NUM=50` on CPU — that's ~10 h. The synthesizability gate also stays off unless you pass `--aizynth_config` (it needs AiZynthFinder + its ZINC stock); cascade + the pharmacophore bridge still run without it.
+
+### No-Docker demo / parity checklist
+
+To stand up this repo on another machine and both **run it** and **show the accumulated results**:
+
+1. **Clone + submodules**
+   ```bash
+   git clone https://github.com/vladsft/autonomous-drug-discovery.git && cd autonomous-drug-discovery
+   git submodule update --init --recursive && scripts/apply_targetdiff_patches.sh
+   ```
+2. **Copy `.env` manually** (scp / USB / password manager) — it holds the Cloudflare R2 + RunPod credentials and is gitignored. Without it, `make pull` can't reach R2. *This is the one step that can't be automated — secrets never travel through git or the data bucket.*
+3. **Build the conda envs** (one-time, slow): `env_orchestrator.yml` (→ `base`) and an `env_targetdiff*.yml` (→ `targetdiff_env`) per the setup above. Install P2Rank + fetch the TargetDiff checkpoint.
+4. **Pull data + telemetry from R2:** `make pull` — brings `telemetry.db`, every campaign's molecules/scores/rankings, and the `reports/` images into `data/`. (Heavy regenerable intermediates are excluded from the bucket; the demo-relevant outputs are all there.)
+5. **Show the accumulated results** (no GPU needed): `make dashboard-local` then open `dashboard/index.html`; query history with `sqlite3 data/telemetry.db` (see [`docs/telemetry-guide.md`](docs/telemetry-guide.md)).
+6. **One live run:** `make run-local TARGET=1IEP MODE=cascade NUM=5` (kick it off early — ~1 h on CPU — and walk through the dashboard while it runs).
+
+For per-stage commands and parameters, see [`docs/pipeline-guide.md`](docs/pipeline-guide.md).
 
 ## License
 

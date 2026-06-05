@@ -10,6 +10,12 @@
 #   make pull / make push              # sync data/ with Cloudflare R2
 #   make dashboard                     # regenerate the static dashboard
 #
+# No Docker? Use the *-local targets (run via conda instead). Needs the `base`
+# (+ `targetdiff_env` for cascade/targetdiff) conda envs — see README
+# "Running locally without Docker":
+#   make run-local TARGET=1IEP MODE=cascade NUM=5     # full pipeline, no Docker
+#   make dashboard-local                              # regenerate dashboard, no Docker
+#
 # Override any capitalised variable on the command line: `make run TARGET=6P3D`.
 
 # --- Configuration -----------------------------------------------------------
@@ -24,6 +30,11 @@ MODE       ?= simulation
 NUM        ?=
 GPU        ?=
 CAMPAIGN   ?=
+# No-Docker (`*-local`) targets run via conda instead of Docker. DEVICE selects
+# the compute device for GPU-capable generation; on a CPU-only box leave it
+# `auto` (it detects no GPU and uses cpu). CONDA overrides the conda binary.
+DEVICE     ?= auto
+CONDA      ?= conda
 
 # Cloudflare R2: an rclone remote named `r2` (see .env.example / make bootstrap).
 R2_BUCKET  ?= agent-harness
@@ -35,9 +46,12 @@ RUN_AS     := --user $(shell id -u):$(shell id -g) -e HOME=/tmp
 GPU_FLAG   := $(if $(GPU),--gpus all,)
 NUM_FLAG   := $(if $(NUM),--num_samples $(NUM),)
 DOCKER_RUN := docker run --rm $(GPU_FLAG) $(RUN_AS) $(DATA_MOUNT)
+# No-Docker invocation: run the orchestrator/dashboard directly in the `base`
+# conda env (the env must exist — see "Running locally without Docker" in README).
+CONDA_BASE := $(CONDA) run --no-capture-output -n base python
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap build pull push run cloud-run test dashboard deploy logs clean
+.PHONY: help bootstrap build pull push run run-local cloud-run test dashboard dashboard-local deploy logs clean
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -64,6 +78,11 @@ run: ## Run the full pipeline locally (TARGET=, MODE=, NUM=, GPU=1)
 	$(DOCKER_RUN) $(IMAGE) \
 		orchestrator.py run data/processed/$(TARGET).pdb --mode $(MODE) $(NUM_FLAG)
 
+run-local: ## No-Docker run via conda (TARGET=, MODE=cascade, NUM=, DEVICE=auto)
+	@test -f $(DATA_DIR)/processed/$(TARGET).pdb || { echo "Missing $(DATA_DIR)/processed/$(TARGET).pdb"; exit 1; }
+	$(CONDA_BASE) $(REPO_ROOT)/autonomous_drug_discovery/orchestrator.py run \
+		$(DATA_DIR)/processed/$(TARGET).pdb --mode $(MODE) --device $(DEVICE) $(NUM_FLAG)
+
 cloud-run: ## Provision a RunPod GPU, run the pipeline, sync to R2, tear down
 	TARGET=$(TARGET) MODE=$(MODE) NUM=$(NUM) IMAGE=$(IMAGE) \
 		bash $(REPO_ROOT)/scripts/cloud_run.sh
@@ -75,6 +94,10 @@ test: ## Run the test suite inside the image
 dashboard: ## Regenerate the static dashboard from local telemetry
 	$(DOCKER_RUN) -v $(DASH_DIR):/app/dashboard $(IMAGE) \
 		/app/scripts/regenerate_dashboard.py --data-dir data --out /app/dashboard
+
+dashboard-local: ## No-Docker dashboard regen via conda (reads telemetry → dashboard/)
+	$(CONDA_BASE) $(REPO_ROOT)/scripts/regenerate_dashboard.py \
+		--data-dir $(DATA_DIR) --out $(DASH_DIR)
 
 deploy: dashboard ## Regenerate the dashboard, then hand off to CI for Pages
 	@echo "Dashboard regenerated. Commit dashboard/ and push — CI deploys to GitHub Pages."
