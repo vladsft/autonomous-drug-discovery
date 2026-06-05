@@ -45,12 +45,21 @@ def _split_holo_pdb(holo_pdb: Path, ligand_resname: str, out_dir: Path):
     """
     receptor_lines, ligand_lines = [], []
     resn = ligand_resname.strip().upper()
+    # A holo structure often contains MULTIPLE copies of the ligand (one per
+    # protein chain). Extract only the FIRST instance — keyed by (chain,resseq,
+    # icode) — so the ligand block is a single connected molecule; later copies
+    # fall through to the receptor (and are stripped by receptor prep). Without
+    # this, RDKit sees N disconnected molecules and the redock fails the
+    # one-fragment check (e.g. 1IEP has STI in both chain A/201 and B/202).
+    ligand_key = None
     with open(holo_pdb) as f:
         for line in f:
             rec = line[:6]
             if rec in ("ATOM  ", "HETATM"):
                 this_resn = line[17:20].strip().upper()
-                if rec == "HETATM" and this_resn == resn:
+                this_key = (line[21:22], line[22:26], line[26:27])  # chain, resseq, icode
+                if rec == "HETATM" and this_resn == resn and ligand_key in (None, this_key):
+                    ligand_key = this_key
                     ligand_lines.append(line)
                 else:
                     receptor_lines.append(line)
@@ -122,7 +131,8 @@ def _pose_rmsd(docked_mol, crystal_mol) -> float:
     Both poses are already in the receptor coordinate frame, so no alignment is
     applied — this is the true positional error, not a shape comparison.
     """
-    from rdkit.Chem import rdMolAlign, Chem
+    from rdkit import Chem
+    from rdkit.Chem import rdMolAlign
 
     probe = Chem.RemoveHs(docked_mol)
     ref = Chem.RemoveHs(crystal_mol)
