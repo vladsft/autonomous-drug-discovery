@@ -22,6 +22,13 @@ channels:
   - conda-forge
 dependencies:
   - python=3.8
+  # Pin a modern C++ runtime: conda-forge rdkit pulls boost 1.84, whose
+  # libboost_serialization needs GLIBCXX_3.4.31. The Ubuntu 22.04 base image's
+  # system libstdc++ tops out at 3.4.30, so without a recent libstdcxx-ng in the
+  # env, `import rdkit` in this env dies with "GLIBCXX_3.4.31 not found"
+  # (cloud batch 26680339214). >=13.2 provides 3.4.31.
+  - libstdcxx-ng>=13.2
+  - libgcc-ng>=13.2
   - openbabel
   - rdkit
   - biopython

@@ -277,6 +277,10 @@ def run_docking_production(manifest, candidates_dir, out_path, parameters, db=No
     supplier = Chem.SDMolSupplier(str(sdf_file), removeHs=False)
     results = []
     mol_batch = []
+    # Collect recovered docked poses to write one docked_poses.sdf — consumed by
+    # the pharmacophore bridge to compare binding modes in the shared pocket frame.
+    pose_writer = Chem.SDWriter(str(out_path / "docked_poses.sdf"))
+    n_poses_written = 0
 
     for idx, mol in enumerate(supplier):
         mol_id = _mol_id_from_mol(mol, idx)
@@ -286,7 +290,13 @@ def run_docking_production(manifest, candidates_dir, out_path, parameters, db=No
 
         smiles = Chem.MolToSmiles(mol)
         try:
-            affinity = _dock_one_ligand(v, mol, exhaustiveness, n_poses, out_path, mol_id)
+            affinity, docked_mol = _dock_one_ligand(v, mol, exhaustiveness, n_poses, out_path, mol_id)
+            if docked_mol is not None:
+                # carry the backend tag through if the input mol had one
+                if mol.HasProp("backend"):
+                    docked_mol.SetProp("backend", mol.GetProp("backend"))
+                pose_writer.write(docked_mol)
+                n_poses_written += 1
             results.append({"ligand_id": mol_id, "smiles": smiles, "affinity": affinity})
             mol_batch.append({
                 "molecule_id": mol_id,
@@ -304,6 +314,11 @@ def run_docking_production(manifest, candidates_dir, out_path, parameters, db=No
                 "stage_eliminated": f"docking_error: {e}",
             })
             print(f"  {mol_id}: ERROR — {e}")
+
+    pose_writer.close()
+    if n_poses_written:
+        print(f"[Docking] Wrote {n_poses_written} docked poses → "
+              f"{out_path / 'docked_poses.sdf'} (for the pharmacophore bridge)")
 
     # Batch-write telemetry (one transaction instead of per-ligand commits).
     if db and run_id and mol_batch:
@@ -470,7 +485,11 @@ def _prepare_receptor_pdbqt(receptor_pdb, output_pdbqt) -> int:
 
     structure = gemmi.read_structure(str(receptor_pdb))
 
-    # Collect catalytic metal ions BEFORE remove_ligands_and_waters() drops them.
+    # Collect catalytic metal ions BEFORE remove_ligands_and_waters() drops
+    # them. The mutation below frees the C++ atom objects backing gemmi's
+    # Python bindings — holding a reference to `atom` across the call and
+    # then reading `atom.serial` / `atom.name` / `atom.pos.*` raises a
+    # message-less MemoryError (observed on 8c4v / MG). Copy primitives now.
     metals = []
     if len(structure) > 0:
         for chain in structure[0]:
@@ -479,10 +498,19 @@ def _prepare_receptor_pdbqt(receptor_pdb, output_pdbqt) -> int:
                 if resname not in _RECEPTOR_METALS:
                     continue
                 for atom in residue:
-                    metals.append((chain.name, residue.seqid.num, resname, atom))
+                    metals.append({
+                        "chain": chain.name,
+                        "resnum": residue.seqid.num,
+                        "resname": resname,
+                        "serial": atom.serial,
+                        "name": atom.name,
+                        "x": atom.pos.x,
+                        "y": atom.pos.y,
+                        "z": atom.pos.z,
+                    })
     if metals:
         print(f"[Docking] Keeping {len(metals)} metal ion(s) in the receptor: "
-              f"{sorted({m[2] for m in metals})}")
+              f"{sorted({m['resname'] for m in metals})}")
 
     structure.remove_ligands_and_waters()
 
@@ -515,11 +543,11 @@ def _prepare_receptor_pdbqt(receptor_pdb, output_pdbqt) -> int:
                     n_atoms += 1
 
     # Re-append the metal ions with their formal charge and element AD type.
-    for chain_name, resnum, resname, atom in metals:
-        ad_type = _RECEPTOR_METALS[resname]
+    for m in metals:
+        ad_type = _RECEPTOR_METALS[m["resname"]]
         lines.append(_pdbqt_atom_line(
-            atom.serial, atom.name, resname, chain_name, resnum,
-            atom.pos.x, atom.pos.y, atom.pos.z, 2.0, ad_type))
+            m["serial"], m["name"], m["resname"], m["chain"], m["resnum"],
+            m["x"], m["y"], m["z"], 2.0, ad_type))
         n_atoms += 1
 
     lines.append("END")
@@ -602,7 +630,24 @@ def _dock_one_ligand(v, mol, exhaustiveness, n_poses, work_dir, mol_id):
     out_pdbqt = work_dir / f"docked_{mol_id}.pdbqt"
     v.write_poses(str(out_pdbqt), n_poses=1, overwrite=True)
 
-    return best_affinity
+    # Best-effort: reconstruct the docked pose as an RDKit mol (bond orders +
+    # 3D coords in the pocket frame) so the pharmacophore bridge can read it.
+    # Wrapped so a Meeko round-trip hiccup never fails the docking itself —
+    # molecules without a recovered pose just fall back to 2D pharmacophores.
+    docked_mol = None
+    try:
+        from meeko import PDBQTMolecule, RDKitMolCreate
+        pmol = PDBQTMolecule.from_file(str(out_pdbqt), skip_typing=True)
+        rdmols = RDKitMolCreate.from_pdbqt_mol(pmol)
+        if rdmols and rdmols[0] is not None:
+            docked_mol = rdmols[0]
+            docked_mol.SetProp("molecule_id", mol_id)
+            docked_mol.SetProp("_Name", mol_id)
+            docked_mol.SetProp("docking_score", f"{best_affinity:.3f}")
+    except Exception:
+        docked_mol = None
+
+    return best_affinity, docked_mol
 
 
 # ---------------------------------------------------------------------------

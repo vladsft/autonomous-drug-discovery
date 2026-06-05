@@ -38,7 +38,12 @@ on:
         required: true
         default: targetdiff
         type: choice
-        options: [targetdiff, rdkit, pocket2mol, simulation]
+        # `cascade` = RDKit (CPU) + TargetDiff (GPU) merged — the recommended
+        # mode. The synthesizability gate auto-disables on the pod (no AiZynth
+        # in the image / AIZYNTH_CONFIG unset), so the GPU is never held for
+        # CPU-only retrosynthesis — that runs off-pod (local/dispatcher). See
+        # plan.md "Synthesizability gate" + "Cost-optimal cloud".
+        options: [cascade, targetdiff, rdkit, pocket2mol, simulation]
       num_samples:
         description: 'Molecules per target'
         required: true

@@ -24,6 +24,7 @@ from telemetry import TelemetryDB
 
 # Configuration
 BASE_DIR = Path(__file__).parent.resolve()
+REPO_ROOT = BASE_DIR.parent           # repo root holds scripts/ (gate, aizynth)
 DATA_DIR = BASE_DIR / "data"
 MODULES_DIR = BASE_DIR / "modules"
 DEFAULT_DB_PATH = str(DATA_DIR / "telemetry.db")
@@ -297,6 +298,113 @@ def run_ranking(docking_csv, screening_json, db_path, campaign_id, output_dir=No
         return False
 
 
+def run_gate(input_sdf, output_dir, aizynth_config, proxy="rascore",
+             min_score=None, no_confirm=False):
+    """Stage 2.5 — synthesizability gate. Keep only molecules with a real route.
+
+    Runs scripts/synthesizability_gate.py (fast RAScore pre-filter + AiZynth
+    confirm). Writes a gated SDF named `screened_molecules.sdf` so the docking
+    stage can consume the gated set with its existing candidates_dir contract.
+    Measured rationale: TargetDiff yields ~0% makeable, RDKit ~30% — gating
+    before docking stops the pipeline scoring molecules that can't be made.
+    """
+    print(f"\n{'='*60}")
+    print("[Orchestrator] Stage 2.5: SYNTHESIZABILITY GATE")
+    print(f"{'='*60}")
+    script_path = REPO_ROOT / "scripts" / "synthesizability_gate.py"
+    if not aizynth_config:
+        print("[Orchestrator] No AiZynth config (set --aizynth_config / "
+              "$AIZYNTH_CONFIG); skipping gate.")
+        return None  # signal: gate skipped, fall back to ungated set
+    out_dir = Path(output_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = get_python_cmd("base") + [
+        str(script_path),
+        "--input", str(input_sdf),
+        "--config", str(aizynth_config),
+        "--output", str(out_dir / "screened_molecules.sdf"),
+        "--report", str(out_dir / "gate_report.json"),
+        "--proxy", proxy,
+    ]
+    if min_score is not None:
+        cmd += ["--min-score", str(min_score)]
+    if no_confirm:
+        cmd += ["--no-confirm"]
+    try:
+        subprocess.check_call(cmd, env=stage_env("base"))
+        print("[Orchestrator] Gate complete.\n")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[Orchestrator] ERROR: Gate failed with code {e.returncode}")
+        return False
+
+
+def _merge_sdfs(sdf_paths, out_sdf):
+    """Merge multiple backend SDFs into one, re-stamping unique molecule_ids
+    (`<backend-tag>_<n>`) so telemetry joins and downstream ids stay unique."""
+    from rdkit import Chem
+    out_sdf = Path(out_sdf); out_sdf.parent.mkdir(parents=True, exist_ok=True)
+    writer = Chem.SDWriter(str(out_sdf))
+    n = 0
+    for tag, path in sdf_paths:
+        p = Path(path)
+        # Tolerate a backend that produced NOTHING: a missing, empty, or
+        # invalid SDF (e.g. RDKit on an oversized membrane pocket → 0 mols)
+        # must contribute zero, not crash the merge. SDMolSupplier raises
+        # OSError on an empty/invalid file, so guard size AND wrap iteration.
+        if not p.exists() or p.stat().st_size == 0:
+            print(f"[Orchestrator] (merge) {tag}: no/empty SDF at {path}, skipping")
+            continue
+        try:
+            supplier = Chem.SDMolSupplier(str(p), removeHs=False)
+            mols = list(supplier)
+        except Exception as e:
+            print(f"[Orchestrator] (merge) {tag}: unreadable SDF ({e}), skipping")
+            continue
+        kept = 0
+        for mol in mols:
+            if mol is None:
+                continue
+            mid = f"{tag}_{n:04d}"
+            mol.SetProp("molecule_id", mid); mol.SetProp("_Name", mid)
+            mol.SetProp("backend", tag)
+            if not mol.HasProp("smiles"):
+                mol.SetProp("smiles", Chem.MolToSmiles(mol))
+            writer.write(mol); n += 1; kept += 1
+        print(f"[Orchestrator] (merge) {tag}: {kept} molecules")
+    writer.close()
+    print(f"[Orchestrator] (merge) {n} molecules → {out_sdf}")
+    return n
+
+
+def run_bridge(ranked_json, output_json, docked_poses, candidates_sdf):
+    """Pharmacophore bridge — re-rank by fidelity to TargetDiff's binding modes.
+
+    Runs scripts/pharmacophore_bridge.py: TargetDiff's top-docked poses become
+    binding-mode hypotheses; makeable candidates are scored by how well they
+    reproduce that pharmacophore, and that term is folded into the final rank.
+    Cascade-only — this is how TargetDiff's (mostly unmakeable) output is
+    harnessed instead of discarded.
+    """
+    print(f"\n{'='*60}")
+    print("[Orchestrator] Stage 5.5: PHARMACOPHORE BRIDGE (TargetDiff-guided rerank)")
+    print(f"{'='*60}")
+    script_path = REPO_ROOT / "scripts" / "pharmacophore_bridge.py"
+    cmd = get_python_cmd("base") + [
+        str(script_path), "--ranked", str(ranked_json), "--output", str(output_json)]
+    if docked_poses and Path(docked_poses).exists():
+        cmd += ["--docked-poses", str(docked_poses)]
+    if candidates_sdf and Path(candidates_sdf).exists():
+        cmd += ["--candidates-sdf", str(candidates_sdf)]
+    try:
+        subprocess.check_call(cmd, env=stage_env("base"))
+        print("[Orchestrator] Pharmacophore bridge complete.\n")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[Orchestrator] WARNING: pharmacophore bridge failed ({e.returncode}); "
+              f"keeping the plain ranking.")
+        return False
+
+
 def run_validation(holo_pdb, db_path, campaign_id, ligand_resname,
                    ligand_smiles=None, exhaustiveness=16, decoys=None):
     """Run retrospective docking validation (re-dock a known ligand)."""
@@ -442,12 +550,28 @@ def main():
                                       "enrichment check")
 
     # Full Pipeline command
+    # Gate command (Stage 2.5: synthesizability filter, standalone)
+    gate_parser = subparsers.add_parser(
+        "gate", help="Synthesizability gate: keep only molecules with a real route")
+    gate_parser.add_argument("input_sdf", help="SDF of candidate molecules")
+    gate_parser.add_argument("--aizynth_config", default=os.environ.get("AIZYNTH_CONFIG"),
+                             help="AiZynthFinder config.yml (default: $AIZYNTH_CONFIG)")
+    gate_parser.add_argument("--output_dir", default=None,
+                             help="Where to write the gated SDF + report")
+    gate_parser.add_argument("--proxy", choices=["rascore", "none"], default="rascore",
+                             help="Fast pre-filter before AiZynth (default: rascore)")
+    gate_parser.add_argument("--no-confirm", dest="gate_no_confirm", action="store_true",
+                             help="Trust the proxy; skip the AiZynth route search")
+    gate_parser.add_argument("--campaign_id", default=None)
+
     pipeline_parser = subparsers.add_parser("run", help="Run full pipeline")
     pipeline_parser.add_argument("pdb_file", help="Path to input PDB file")
     pipeline_parser.add_argument("--mode",
-                                 choices=["simulation", "production", "rdkit", "targetdiff", "pocket2mol"],
+                                 choices=["simulation", "production", "rdkit", "targetdiff",
+                                          "pocket2mol", "cascade"],
                                  default="simulation",
-                                 help="Execution mode (`rdkit` and `production` are aliases)")
+                                 help="Execution mode. `cascade` = RDKit + TargetDiff merged "
+                                      "(recommended); `rdkit`/`production` are aliases")
     pipeline_parser.add_argument("--backend", choices=["p2rank", "fpocket"], default="p2rank",
                                  help="Pocket detection backend (default: p2rank)")
     pipeline_parser.add_argument("--num_samples", type=int, default=None,
@@ -455,11 +579,19 @@ def main():
     pipeline_parser.add_argument("--clean", action="store_true",
                                  help="Drop HETATM/waters/alt locs before detection")
     pipeline_parser.add_argument("--aizynth_config", default=os.environ.get("AIZYNTH_CONFIG"),
-                                 help="AiZynthFinder config.yml — enables retrosynthetic "
-                                      "scoring in Stage 5 (default: $AIZYNTH_CONFIG)")
+                                 help="AiZynthFinder config.yml — enables the Stage 2.5 "
+                                      "synthesizability gate + Stage 5 scoring (default: $AIZYNTH_CONFIG)")
+    pipeline_parser.add_argument("--no-gate", dest="no_gate", action="store_true",
+                                 help="Disable the Stage 2.5 synthesizability gate")
+    pipeline_parser.add_argument("--gate-proxy", dest="gate_proxy",
+                                 choices=["rascore", "none"], default="rascore",
+                                 help="Fast pre-filter the gate uses before AiZynth")
+    pipeline_parser.add_argument("--gate-no-confirm", dest="gate_no_confirm", action="store_true",
+                                 help="Gate trusts the proxy; skips the AiZynth route search")
     pipeline_parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
                                  help="Compute device for GPU-capable generation "
-                                      "(targetdiff/pocket2mol); 'auto' detects a GPU")
+                                      "(targetdiff); 'auto' detects a GPU. RDKit is CPU-only "
+                                      "by nature (cheminformatics, no GPU work to offload)")
 
     args = parser.parse_args()
 
@@ -497,6 +629,12 @@ def main():
                          db_path, campaign_id,
                          aizynth_config=args.aizynth_config)
 
+    elif args.command == "gate":
+        out_dir = args.output_dir or str(DATA_DIR / "gated")
+        res = run_gate(args.input_sdf, out_dir, args.aizynth_config,
+                       proxy=args.proxy, no_confirm=args.gate_no_confirm)
+        ok = bool(res)
+
     elif args.command == "validate":
         ok = run_validation(args.holo_pdb, db_path, campaign_id,
                             ligand_resname=args.ligand_resname,
@@ -508,13 +646,18 @@ def main():
         mode = getattr(args, "mode", "simulation")
         pdb_path = Path(args.pdb_file)
 
-        # Map pipeline mode to per-stage modes
+        # Map pipeline mode to per-stage modes. `cascade` (the new default-ish
+        # recommended mode) runs RDKit + TargetDiff and merges; Pocket2Mol is
+        # intentionally excluded (Blackwell-incompatible CPU liability, and it
+        # added almost no makeable matter — see synthesizability comparison).
         if mode == "simulation":
             gen_mode, dock_mode = "simulation", "simulation"
         elif mode == "targetdiff":
             gen_mode, dock_mode = "targetdiff", "production"
         elif mode == "pocket2mol":
             gen_mode, dock_mode = "pocket2mol", "production"
+        elif mode == "cascade":
+            gen_mode, dock_mode = "cascade", "production"
         else:
             gen_mode, dock_mode = "rdkit", "production"
 
@@ -522,10 +665,17 @@ def main():
         campaign_dir = DATA_DIR / campaign_id
         gen_dir = str(campaign_dir / "candidates")
         screen_dir = str(campaign_dir / "screened")
+        gate_dir = str(campaign_dir / "gated")
         dock_dir = str(campaign_dir / "results")
         rank_dir = str(campaign_dir / "ranked")
 
-        print(f"[Orchestrator] Running FULL PIPELINE — gen={gen_mode}, dock={dock_mode}")
+        # The gate runs by default whenever an AiZynth config is available
+        # (cascade/rdkit/targetdiff). --no-gate forces it off.
+        gate_on = (not getattr(args, "no_gate", False)) and bool(args.aizynth_config) \
+            and dock_mode == "production"
+
+        print(f"[Orchestrator] Running FULL PIPELINE — gen={gen_mode}, "
+              f"dock={dock_mode}, gate={'on' if gate_on else 'off'}")
         print(f"[Orchestrator] Campaign directory: {campaign_dir}")
 
         manifest_path = DATA_DIR / "processed" / f"{pdb_path.stem}_manifest.json"
@@ -537,7 +687,27 @@ def main():
                            clean_pdb=args.clean, pocket_backend=args.backend)
         if ok:
             ok = check_stage_output(manifest_path, "ingestion manifest")
-        if ok:
+        if ok and gen_mode == "cascade":
+            # Multi-backend: RDKit (makeable breadth, CPU) + TargetDiff (novel
+            # binding modes, GPU). Each writes to its own subdir; merge into the
+            # canonical generated_molecules.sdf the rest of the flow consumes.
+            rdkit_dir = str(campaign_dir / "candidates_rdkit")
+            td_dir = str(campaign_dir / "candidates_targetdiff")
+            ok = run_generation(manifest_path, db_path, campaign_id, "rdkit",
+                                output_dir=rdkit_dir, num_samples=args.num_samples,
+                                device="cpu")
+            td_ok = run_generation(manifest_path, db_path, campaign_id, "targetdiff",
+                                   output_dir=td_dir, num_samples=args.num_samples,
+                                   device=args.device)
+            # TargetDiff failure is non-fatal in cascade — RDKit alone still
+            # yields makeable matter; log and continue with whatever we have.
+            if not td_ok:
+                print("[Orchestrator] (cascade) TargetDiff stage failed; "
+                      "continuing with RDKit output only.")
+            n = _merge_sdfs([("rdkit", Path(rdkit_dir) / "generated_molecules.sdf"),
+                             ("td", Path(td_dir) / "generated_molecules.sdf")], sdf_path)
+            ok = ok and n > 0
+        elif ok:
             ok = run_generation(manifest_path, db_path, campaign_id, gen_mode,
                                 output_dir=gen_dir, num_samples=args.num_samples,
                                 device=args.device)
@@ -548,17 +718,50 @@ def main():
                                output_dir=screen_dir)
         if ok:
             ok = check_stage_output(screened_sdf, "screened molecules SDF")
+        # Stage 2.5 — synthesizability gate. Two placements by mode:
+        #  • cascade: dock BOTH backends (no pre-gate) so TargetDiff's poses
+        #    survive; the gate runs as an ANNOTATION (makeability label, not a
+        #    delete), and the pharmacophore bridge (Stage 5.5) then re-ranks
+        #    makeable candidates by fidelity to TargetDiff's binding modes.
+        #  • single-backend modes: gate BEFORE docking (filter) — cheaper, and
+        #    there are no TargetDiff poses worth harvesting in an rdkit-only run.
+        cascade_mode = (gen_mode == "cascade")
+        dock_candidates_dir = screen_dir
+        if ok and gate_on and not cascade_mode:
+            gated = run_gate(screened_sdf, gate_dir, args.aizynth_config,
+                             proxy=getattr(args, "gate_proxy", "rascore"),
+                             no_confirm=getattr(args, "gate_no_confirm", False))
+            gated_sdf = Path(gate_dir) / "screened_molecules.sdf"
+            if gated and check_stage_output(gated_sdf, "gated (makeable) SDF",
+                                            min_bytes=64):
+                dock_candidates_dir = gate_dir
+            else:
+                print("[Orchestrator] Gate kept nothing (or was skipped); "
+                      "docking the ungated screened set.")
         if ok:
             ok = run_docking(manifest_path, db_path, campaign_id, dock_mode,
-                             candidates_dir=screen_dir, output_dir=dock_dir)
+                             candidates_dir=dock_candidates_dir, output_dir=dock_dir)
         if ok:
             ok = check_stage_output(docking_csv, "docking results CSV", min_bytes=64)
+        # cascade: gate-as-annotation (best-effort; records makeability for the
+        # report/dashboard without removing anything from the docked set).
+        if ok and gate_on and cascade_mode:
+            run_gate(screened_sdf, gate_dir, args.aizynth_config,
+                     proxy=getattr(args, "gate_proxy", "rascore"),
+                     no_confirm=getattr(args, "gate_no_confirm", False))
         if ok:
             screening_json = Path(screen_dir) / "screening_report.json"
             ok = run_ranking(docking_csv,
                              screening_json if screening_json.exists() else None,
                              db_path, campaign_id, output_dir=rank_dir,
                              aizynth_config=args.aizynth_config)
+        # Stage 5.5 — pharmacophore bridge (cascade only): re-rank by fidelity to
+        # TargetDiff's binding modes, so TargetDiff's poses shape the winners.
+        if ok and cascade_mode:
+            ranked_json = Path(rank_dir) / "ranked_candidates.json"
+            if ranked_json.exists():
+                run_bridge(ranked_json, ranked_json,
+                           Path(dock_dir) / "docked_poses.sdf", sdf_path)
 
         print_campaign_summary(db_path, campaign_id)
     else:

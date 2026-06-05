@@ -113,6 +113,17 @@ WORKDIR /app
 RUN bash scripts/apply_targetdiff_patches.sh \
     && conda run -n targetdiff_env python scripts/verify_targetdiff_weights.py
 
+# Build-time import smoke for the FULL TargetDiff runtime import chain in its
+# env. verify_targetdiff_weights.py only torch.loads the checkpoint, so it never
+# imports rdkit/torch_geometric/lmdb — which is how the libc10_cuda.so, lmdb-cffi
+# and GLIBCXX_3.4.31 breaks all reached production pods green-built. This runs the
+# exact imports sample_for_pocket.py does, so any ABI/runtime-lib regression in
+# targetdiff_env fails the BUILD, not an hour-deep GPU pod.
+RUN cd /app/autonomous_drug_discovery/modules/02_generation/targetdiff \
+    && conda run -n targetdiff_env python -c \
+        "import torch, torch_geometric, lmdb; from rdkit import Chem; \
+         import utils.transforms; print('targetdiff_env import chain OK')"
+
 RUN install -m 0755 scripts/docker-entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Runs land here; the data/ volume is mounted at ./data relative to this dir.
