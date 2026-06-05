@@ -95,9 +95,9 @@ dashboard: ## Regenerate the static dashboard from local telemetry
 	$(DOCKER_RUN) -v $(DASH_DIR):/app/dashboard $(IMAGE) \
 		/app/scripts/regenerate_dashboard.py --data-dir data --out /app/dashboard
 
-dashboard-local: ## No-Docker dashboard regen via conda (reads telemetry → dashboard/)
+dashboard-local: ## No-Docker dashboard regen via conda — ALL targets (reads telemetry → dashboard/)
 	$(CONDA_BASE) $(REPO_ROOT)/scripts/regenerate_dashboard.py \
-		--data-dir $(DATA_DIR) --out $(DASH_DIR)
+		--all-targets --data-dir $(DATA_DIR) --out $(DASH_DIR)
 
 deploy: dashboard ## Regenerate the dashboard, then hand off to CI for Pages
 	@echo "Dashboard regenerated. Commit dashboard/ and push — CI deploys to GitHub Pages."
