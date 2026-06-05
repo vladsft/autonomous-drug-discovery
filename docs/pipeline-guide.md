@@ -26,7 +26,7 @@ make run TARGET=1M17 MODE=production
 make run TARGET=1M17 MODE=simulation
 ```
 
-`TARGET` is the PDB stem; the file must exist at `data/processed/<TARGET>.pdb`. `MODE` is one of `simulation`, `production` (alias for `rdkit`), `rdkit`, `targetdiff`, or `pocket2mol`. Output lands in `data/campaign_<id>/`.
+`TARGET` is the PDB stem; the file must exist at `data/processed/<TARGET>.pdb`. `MODE` is one of `cascade` (**recommended** — RDKit + TargetDiff merged), `rdkit` / `production` (alias), `targetdiff`, `simulation`, or `pocket2mol` (*dropped — Blackwell-incompatible; kept only for legacy*). When an AiZynth config is available, `run` also applies the **synthesizability gate** between screening and docking (disable with `--no-gate`). Output lands in `data/campaign_<id>/`.
 
 ### Full pipeline, cloud GPU
 
@@ -76,7 +76,7 @@ Optional variables (Settings → Variables): `IMAGE` to override the GHCR tag, `
 | Field | Default | What to put |
 |---|---|---|
 | **targets** | (required) | Whitespace- or comma-separated PDB codes — e.g. `1M17 2HYY 6P3D 8P1L`. 4–8 alphanumeric characters each. `scripts/fetch_pdb.py` downloads any code not already cached. |
-| **mode** | `targetdiff` | Which generator: `targetdiff` (diffusion, GPU-bound, ~30 min/target, best 3D fidelity), `rdkit` (fragment-based, CPU, ~2 min/target, broad chemical diversity), `pocket2mol` (pocket-aware GNN, GPU, ~7 s/mol — checkpoint not yet rehosted, so currently fails fast), `simulation` (stub, instant, plumbing-test only). |
+| **mode** | `cascade` | Which generator(s): `cascade` (**recommended** — RDKit + TargetDiff merged, then synthesizability-gated), `targetdiff` (diffusion, GPU, ~25-30 min/target, best 3D fidelity but ~0% makeable alone — a binding-mode proposer), `rdkit` (fragment-based, CPU, ~2 min/target, the makeable workhorse — ~30% routable), `simulation` (stub, instant, plumbing-test only), `pocket2mol` (*dropped — Blackwell-incompatible, CPU-only; legacy*). On the cloud GPU pod the gate auto-disables (no AiZynth in the image) so the GPU is never held for CPU retrosynthesis. |
 | **num_samples** | `30` | Molecules generated per target. 30 is the validated default. Going to 100+ multiplies wallclock and cost roughly linearly. |
 | **parallelism** | `5` | Concurrent RunPod pods. 5 is the sweet spot for the free tier. Bump to 10 if you have ample credit; >10 risks RunPod balance starvation mid-batch. |
 | **force** | `false` | If `true`, ignores the 24-hour idempotency skip-list and re-runs every target. Use this when you change pipeline params; otherwise leave at `false` to avoid paying for work you already have. |
@@ -291,13 +291,29 @@ docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discove
 docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discovery \
   orchestrator.py screen data/candidates/generated_molecules.sdf
 
-# Stage 4 — docking
+# Stage 2.5 — synthesizability gate (keep only molecules with a real route)
+docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discovery \
+  orchestrator.py gate data/screened/screened_molecules.sdf \
+    --aizynth_config ~/aizynthfinder_data/config.yml --output_dir data/gated
+# (the `run` pipeline inserts this automatically between screen and dock when
+#  --aizynth_config / $AIZYNTH_CONFIG is set; --no-gate disables it)
+
+# Stage 4 — docking  (point candidates_dir at data/gated when gating)
 docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discovery \
   orchestrator.py dock data/processed/1M17_manifest.json --mode production
 
 # Stage 5 — ranking
 docker run --rm -v $(pwd)/data:/app/data ghcr.io/vladsft/autonomous-drug-discovery \
   orchestrator.py rank data/results/docking_results.csv --screening_json data/screened/screening_report.json
+
+# Stage 5.5 — pharmacophore bridge (cascade only): re-rank makeable candidates
+# by how well their docked pose reproduces TargetDiff's binding-mode pharmacophore.
+# (the `run --mode cascade` pipeline invokes this automatically after ranking)
+python scripts/pharmacophore_bridge.py \
+  --ranked data/<campaign>/ranked/ranked_candidates.json \
+  --docked-poses data/<campaign>/results/docked_poses.sdf \
+  --candidates-sdf data/<campaign>/candidates/generated_molecules.sdf \
+  --output data/<campaign>/ranked/ranked_candidates.json
 ```
 
 These work the same way inside `make cloud-run` — the entrypoint is identical.

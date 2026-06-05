@@ -1,10 +1,10 @@
 # Adaptive Discovery Orchestrator — Architectural Plan
 
-This is the canonical plan. The [README](../README.md) and other docs under [`docs/`](../docs/) reference this file; if they disagree, this file wins. Last major revision: 2026-05-21 (Phase 1.5 — fire-and-forget batch driver — added).
+This is the canonical plan. The [README](../README.md) and other docs under [`docs/`](../docs/) reference this file; if they disagree, this file wins. Last major revision: 2026-05-30 (Pipeline v2 — synthesizability gate + cascade generation — added; see ["Pipeline v2"](#pipeline-v2--synthesizability-gate--cascade-2026-05-30)).
 
 ## Where we are
 
-**M1 (Working Pipeline) and M2 (Validation) are complete.** The 5-stage deterministic pipeline (P2Rank → generation → screening + ADMET → Vina docking → multi-criteria ranking) runs end-to-end on real proteins, with full SQLite telemetry. It is validated against three cancer targets with crystallographic ground truth:
+**M1 (Working Pipeline) and M2 (Validation) are complete.** The deterministic pipeline (P2Rank → generation → screening + ADMET → **synthesizability gate** → Vina docking → multi-criteria ranking) runs end-to-end on real proteins, with full SQLite telemetry. As of 2026-05-30 it is a **6-stage** pipeline: a synthesizability gate (Stage 2.5) was added after the discovery that the 3D generators produce mostly unmakeable molecules (see [Pipeline v2](#pipeline-v2--synthesizability-gate--cascade-2026-05-30)). It is validated against three cancer targets with crystallographic ground truth (and the docking protocol itself is now retrospectively validated — imatinib redocks into 1IEP at 0.93 Å RMSD):
 
 | Target | Disease | Best Dock Score | Pocket Distance | Residue Overlap |
 |---|---|---|---|---|
@@ -20,6 +20,38 @@ This is the canonical plan. The [README](../README.md) and other docs under [`do
 - A 2026-05-11 attempt to run TargetDiff on 2HYY also surfaced a `PYTHONPATH` bug in the wrapper that meant TargetDiff had never worked end-to-end through the orchestrator from a fresh shell (now fixed in `run_generation.py`).
 
 **Demo forcing function.** The professor presentation is the next milestone. The deliverable is **20 quality candidate molecules** rendered through the dashboard, end-to-end through the pipeline, on five targets. Everything in Phase 1 below is scoped to that deliverable; nothing extra.
+
+## Pipeline v2 — synthesizability gate + cascade (2026-05-30)
+
+**The finding that forced this.** Running TargetDiff across 10 kinase targets and then attempting lead-optimization surfaced a hard truth, measured with a real AiZynthFinder retrosynthetic search (full USPTO templates + 17M-compound ZINC stock):
+
+- **0 / 28** top kinase candidates had a complete synthetic route. The 3D generators optimise pocket-fit with **no synthesizability prior**, producing novel fused/bridged ring systems that score beautifully in docking but cannot be made from purchasable building blocks. This is the documented central failure of generative SBDD (GenBench3D; "What Ails Generative SBDD"), confirmed here at the extreme.
+- The pipeline's strongest binders were also its worst molecules — flat fused-aromatic intercalators (cryptolepine-like) carrying intrinsic AMES/hERG flags. Validated docking made the *score* trustworthy while the *molecule* was a reject.
+- **Makeability by backend** (8c4v, 45 screened survivors, AiZynth): **RDKit 30 % (1–3 step routes), Pocket2Mol 18 % (4-step), TargetDiff 0 %.** RDKit builds from drug-like fragments and lands near catalog space; TargetDiff does not.
+
+**Consequence #1 — synthesizability becomes a first-class GATE, not a post-hoc score.** A new **Stage 2.5 synthesizability gate** (`scripts/synthesizability_gate.py`, orchestrator `gate` subcommand, inserted in `run` between screening and docking) runs retrosynthesis and keeps only molecules with a real route, so docking + the chemist's attention are spent on makeable matter. A **fast proxy tier** (`scripts/synth_proxy.py`, RAScore — predicts AiZynth-solvability in ms/molecule) pre-filters before the expensive AiZynth confirm; it degrades gracefully to full AiZynth when RAScore isn't installed. The gate replaces the old 0.5 placeholder that had been polluting every composite score.
+
+**Consequence #2 — `cascade` mode; Pocket2Mol dropped.** The recommended generation mode is now **`cascade` = RDKit (CPU, makeable breadth) + TargetDiff (GPU, novel binding modes)**, merged into one pool. TargetDiff is reframed as a *binding-mode proposer*, not a candidate producer. **Pocket2Mol is excluded**: it can't target Blackwell (cu11.3 → CPU-only, 38 min vs TargetDiff's 25 min on GPU) and added almost no makeable matter the other two don't.
+
+**Consequence #2b — the pharmacophore bridge: harness TargetDiff, don't discard it (Stage 5.5).** A naive gate-before-dock would filter TargetDiff out entirely (0% makeable) — wasting its GPU work and throwing away the binding-mode information it discovered. Instead, in cascade the gate runs *after* docking as an **annotation** (makeable/not label, not a delete), so **both backends are docked and TargetDiff's poses are retained**. A new **pharmacophore bridge** (`scripts/pharmacophore_bridge.py`, orchestrator Stage 5.5) then: (1) takes TargetDiff's top-docked poses as binding-mode hypotheses, (2) extracts their 3D pharmacophore (Donor/Acceptor/Aromatic/Hydrophobe features), and (3) scores every makeable candidate by how well its docked pose *reproduces* that pharmacophore — in the shared pocket frame, so no alignment is needed (2D pharmacophore-fingerprint fallback when a pose is missing). That match term is folded into the final ranking (`0.35·dock + 0.20·ADMET + 0.15·synth + 0.30·pharmacophore_match`), so **makeable molecules that recreate TargetDiff's binding mode rise to the top**. TargetDiff's expensive output now shapes the selection instead of being binned. (If no makeable molecule matches well, that itself is an honest signal that the mode isn't reachable with synthesizable chemistry on that target.) Docking now also emits `docked_poses.sdf` (best-effort Meeko round-trip) to feed the bridge.
+
+**Consequence #3 — cost-optimal cloud puts the gate OFF the GPU pod.** A RunPod GPU pod is a full machine (CPU + GPU), so cascade runs fine on one pod — but the GPU sits idle during the CPU stages (RDKit, screen, gate, Vina dock). The expensive offender is AiZynth (~30 min). So **on cloud the gate auto-disables on the pod** (no `AIZYNTH_CONFIG` in the image → `gate_on` is False): the pod does generation + screen + dock + rank only, and the synthesizability gate runs **off-pod** (locally or on the free dispatcher) where no GPU is rented. Locally, the gate runs before docking (saves docking CPU, no rental cost). **Planned next optimization (not yet built):** split the cloud pipeline so the GPU pod does *generation only* (~25 min), releases the GPU, and the dispatcher runs screen + gate + dock + rank on free CPU — deferred until the cloud TargetDiff path is green and the all-on-one-pod version is proven.
+
+**Pipeline shape now:**
+```
+single-backend (rdkit / targetdiff):
+  Ingest → Generate → Screen(+ADMET) → ★Gate(2.5, filter)★ → Dock → Rank
+           (gate removes unmakeable before the expensive dock)
+
+cascade (recommended):
+  Ingest → [RDKit(CPU) + TargetDiff(GPU)] → Screen → Dock BOTH → Gate(2.5, annotate) →
+           Rank → ★Pharmacophore bridge (5.5)★ → final pharmacophore-weighted ranking → [Lead-opt]
+           (TargetDiff poses retained → become binding-mode hypotheses → makeable
+            candidates ranked by fidelity to them)
+
+cloud: the gate auto-disables on the GPU pod (no AiZynth in image) so the GPU is
+       never held for CPU retrosynthesis; gate + bridge run off-pod.
+```
 
 ## Architecture (target state)
 

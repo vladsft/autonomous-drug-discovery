@@ -7,13 +7,14 @@ An end-to-end computational drug discovery system that takes a protein structure
 Given a protein target, the pipeline:
 
 1. **Detects binding pockets** with P2Rank (ML-based, default) or fpocket (geometry fallback).
-2. **Generates candidate molecules** with one of:
-   - **RDKit** fragment-based combinatorial generation (default, fast, CPU)
-   - **TargetDiff** E(3)-equivariant diffusion (pocket-conditioned, highest-fidelity 3D; needs GPU in practice)
-   - **Pocket2Mol** autoregressive generator (pocket-conditioned, faster than TargetDiff; *currently deferred — pretrained checkpoint not recovered*)
+2. **Generates candidate molecules**. The recommended mode is **`cascade`** — RDKit + TargetDiff merged:
+   - **RDKit** fragment-based combinatorial generation (CPU, fast; the *makeable* workhorse — ~30% of its hits have a real synthetic route)
+   - **TargetDiff** E(3)-equivariant diffusion (pocket-conditioned, highest-fidelity 3D; needs a GPU). Reframed as a *binding-mode proposer* — its raw output is potent but rarely synthesizable on its own.
+   - **Pocket2Mol** autoregressive generator — *dropped*: can't target NVIDIA Blackwell (CPU-only there) and adds little makeable matter the other two don't.
 3. **Screens candidates** against drug-likeness filters (Lipinski, QED, SA, PAINS) and ADMET-AI (104 properties).
-4. **Docks survivors** into the pocket with AutoDock Vina.
-5. **Ranks** via a composite score (docking + ADMET + optional AiZynthFinder synthesis feasibility) and writes a final scorecard.
+4. **Synthesizability gate (Stage 2.5)** — runs AiZynthFinder retrosynthesis (with an optional fast RAScore pre-filter). In single-backend modes it *filters* unmakeable molecules before docking; in `cascade` it runs as an *annotation* (so TargetDiff's poses are retained for step 6). Added after measuring that the 3D generators produce mostly unmakeable molecules (0/28 top kinase candidates had a route) — synthesizability is now a first-class signal, not a footnote.
+5. **Docks survivors** (both backends, in `cascade`) into the pocket with AutoDock Vina; emits docked 3D poses.
+6. **Ranks** via a composite score, and in `cascade` runs a **pharmacophore bridge (Stage 5.5)**: TargetDiff's top-docked poses become binding-mode hypotheses, and each makeable candidate is scored by how well its pose *reproduces* that pharmacophore — so makeable molecules that recreate TargetDiff's binding mode rise to the top. This is how TargetDiff's output is *harnessed* rather than discarded. Writes a final scorecard.
 
 Validated against three cancer targets with crystallographic ground truth:
 

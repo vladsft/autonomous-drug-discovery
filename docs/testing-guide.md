@@ -16,7 +16,7 @@ It does all of this computationally — no lab, no chemicals, no test tubes. The
 
 ---
 
-## The Five Stages, Explained
+## The Stages, Explained
 
 ### Stage 1: Pocket Detection (P2Rank or fpocket)
 
@@ -33,14 +33,15 @@ It does all of this computationally — no lab, no chemicals, no test tubes. The
 - **Pocket distance to known drug site**: For validated targets, P2Rank places the pocket within 2.7-3.1 Angstroms of the crystallographic drug position.
 - The pipeline picks the top-ranked pocket automatically.
 
-### Stage 2: Molecule Generation (RDKit)
+### Stage 2: Molecule Generation (cascade: RDKit + TargetDiff)
 
-**What it does:** Creates ~100 random drug-like molecules from chemical building blocks (rings, chains, functional groups), combining them like LEGO bricks.
+**What it does:** Creates candidate molecules for the pocket. The recommended `cascade` mode runs two generators and merges them: **RDKit** combines chemical building blocks (rings, chains, functional groups) like LEGO bricks — fast, CPU, and crucially the *makeable* one; **TargetDiff** is a diffusion model that grows a 3D molecule directly inside the pocket — novel and high-fidelity, but its molecules are usually hard to synthesise. (Pocket2Mol, a third backend, was dropped — it can't run on the newest NVIDIA GPUs.)
 
-**Real-world analogy:** Like a chef combining ingredients (salt, sugar, spices, different proteins) into dishes. Most random combinations taste bad, but a trained chef knows which building blocks work well together. Our "chef" uses rules from medicinal chemistry.
+**Real-world analogy:** RDKit is a chef combining familiar ingredients into plausible dishes; TargetDiff is an avant-garde chef inventing wholly new dishes that look stunning but may use ingredients no shop sells. You want both at the table — then a hard rule (the synthesizability gate, next) that throws out anything you can't actually cook.
 
 **What to look for:**
-- How many molecules were generated (typically 100)
+- How many molecules each backend generated (typically ~50 each in cascade)
+- TargetDiff output is potent-looking but often unmakeable — that's expected, and the gate handles it
 - The generation uses the pocket size to decide how big the molecules should be
 
 ### Stage 3: Screening (MolScore + ADMET-AI)
@@ -69,7 +70,19 @@ It does all of this computationally — no lab, no chemicals, no test tubes. The
 - **LD50**: Lethal dose estimate (higher = safer)
 
 **What to look for:**
-- **Survival rate**: What percentage passes all filters. 40-60% is healthy. If it's very low, the generator is making junk. If it's very high, the filters may be too loose. (Current thresholds yield 73-98% survival — needs tightening with expert input.)
+- **Survival rate**: What percentage passes all filters. 40-60% is healthy. If it's very low, the generator is making junk; if very high, the filters are too loose. After the thresholds were tightened (lead-like window: MW 250-450, QED ≥ 0.5, SA ≤ 4.5), real runs land in a sensible band — e.g. RDKit ~46%, TargetDiff ~23% on 8c4v — replacing the earlier too-loose 73-98%.
+
+### Stage 2.5: Synthesizability Gate (AiZynthFinder)
+
+**What it does:** Before spending docking effort, the gate asks a blunt question of each molecule: *can a chemist actually make this, from chemicals you can buy?* It runs a retrosynthetic tree search (AiZynthFinder, optionally pre-filtered by the fast RAScore model) and keeps only molecules with a complete route to purchasable building blocks.
+
+**Real-world analogy:** A recipe that calls for "one unicorn egg" scores great on paper and is useless in the kitchen. The gate is the line cook who refuses to plate anything that can't be sourced.
+
+**Why it exists:** When measured honestly, the 3D generators fail here badly — **0 of 28** top kinase candidates had any synthetic route, and TargetDiff scored **0% makeable** vs RDKit's **30%**. Without this gate the pipeline happily ranks beautiful, potent, *uncreatable* molecules. With it, synthesizability is enforced, not hoped for.
+
+**What to look for:**
+- **Makeable fraction**: how many survivors have a route. If a backend contributes ~0% (TargetDiff often does), that's the signal to lean on RDKit and treat the diffusion output as binding-mode inspiration only.
+- **Route length**: 1-3 steps is genuinely tractable; 5-6 steps is a real project.
 
 ### Stage 4: Docking (AutoDock Vina)
 
@@ -84,6 +97,16 @@ It does all of this computationally — no lab, no chemicals, no test tubes. The
   - **-5 to -7**: Moderate — might work but not a top candidate
   - **Worse than -5**: Weak — probably won't bind effectively
 - Real approved drugs typically score between -7 and -11 kcal/mol
+
+### Stage 5 + 5.5: Ranking and the Pharmacophore Bridge
+
+**What it does:** Stage 5 combines docking, ADMET, and synthesizability into one composite score. In `cascade` mode a **pharmacophore bridge** (Stage 5.5) then does something clever with TargetDiff's output: instead of throwing away its (usually unmakeable) molecules, it treats their docked poses as a *map of how to bind the pocket* — which groups should point where — and re-ranks the **makeable** candidates by how well they reproduce that map.
+
+**Real-world analogy:** TargetDiff is an architect who sketches a beautiful building out of materials that don't exist. Rather than bin the sketch, we keep the *floor plan* (where the load-bearing walls go) and ask: which buildable design best matches it? That match is rewarded in the final ranking.
+
+**What to look for:**
+- **`pharmacophore_match`** (0-1) on each ranked candidate: how faithfully a makeable molecule reproduces TargetDiff's binding mode. High match + makeable + good dock = the molecules you actually want.
+- If *no* makeable molecule scores a high match, that's an honest finding: TargetDiff's binding mode isn't reachable with synthesizable chemistry on this target.
 
 ---
 
@@ -188,6 +211,25 @@ This section documents every validation experiment that has been completed, with
 - Ligand efficiency (0.38-0.39) is excellent — compact molecules with good binding per atom.
 - 50% reconstruction failure rate (1 of 2 molecules failed in a 2-molecule batch) is expected for diffusion models.
 - Visualizations available in `reports/` (mol1_vs_ponatinib.png, mol2_vs_ponatinib.png, targetdiff_all_vs_ponatinib.png).
+
+### Test 5: Docking Protocol Validation — imatinib redock into 1IEP (2026-05-30)
+
+**What:** Retrospective ("self-docking") validation of the docking protocol. Took the ABL kinase crystal structure 1IEP, removed its co-crystallised imatinib (Gleevec), and asked Vina to dock it back from scratch. Compares the docked pose against the true crystal pose by RMSD.
+
+**Result:** Pose **RMSD 0.93 Å** (threshold for "correct" is < 2.0 Å) — PASS, and tighter than typical. Affinity −12.17 kcal/mol.
+
+**Why it matters:** This calibrates the instrument. It means docking scores *on this target* are trustworthy — the 1IEP generated candidates' numbers sit on a validated protocol, unlike targets with no co-crystal ligand (e.g. 8c4v, where docking is unvalidatable and every score carries an asterisk). Surfaced and fixed two real bugs in the validation path: a multi-copy-ligand extraction error (1IEP has imatinib in two chains) and a bad RDKit import.
+
+### Test 6: Synthesizability Audit — the finding that reshaped the pipeline (2026-05-30)
+
+**What:** Ran a real AiZynthFinder retrosynthetic search (full USPTO templates + 17M-compound ZINC stock) over the top candidates from 10 kinase targets, and over all screened survivors of the three 8c4v generators.
+
+**Result:**
+- **0 of 28** top kinase candidates had a complete synthetic route — the 3D generators produce molecules that score well but can't be made.
+- Makeability by backend (8c4v): **RDKit 30%** (1–3 step routes), **Pocket2Mol 18%** (4-step), **TargetDiff 0%**.
+- The strongest binders were also the least makeable (flat fused-aromatic intercalators with high mutagenicity flags).
+
+**Why it matters:** This is *the* finding behind Pipeline v2. It promoted synthesizability from an after-the-fact score to an enforced **Stage 2.5 gate**, motivated the **cascade** generator mix (RDKit for makeable matter, TargetDiff for binding-mode novelty), and justified **dropping Pocket2Mol**. Honest negative results like this — measured, not assumed — are exactly what the project's "every claim verifiable" principle is for.
 
 ### Summary of All Campaigns in Telemetry
 

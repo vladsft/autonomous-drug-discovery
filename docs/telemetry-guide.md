@@ -20,7 +20,9 @@ One row per module execution. Tracks what ran, when, whether it succeeded, and w
 |---|---|---|
 | `run_id` | TEXT (PK) | UUID, unique per execution |
 | `campaign_id` | TEXT | Groups all stages of a single pipeline run (e.g. `campaign_fd4fad48`) |
-| `module_name` | TEXT | Which stage ran: `01_ingestion`, `02_generation`, `03_screening`, `04_docking`, `agent_planner` |
+| `module_name` | TEXT | Which stage ran: `01_ingestion`, `02_generation`, `03_screening`, `04_docking`, `05_ranking`, `agent_planner` |
+
+> **Note — the synthesizability gate (Stage 2.5) is not a telemetry-DB stage.** It runs between screening and docking as a file-level filter: it reads `data/<campaign>/screened/screened_molecules.sdf`, and writes the makeable survivors to `data/<campaign>/gated/screened_molecules.sdf` plus a `data/<campaign>/gated/gate_report.json` (pass rate, per-molecule routes/scores). Docking then consumes the gated SDF. So the gate's record lives in that JSON report, not in the `runs` table; the docking row that follows simply reflects the post-gate molecule count.
 | `started_at` | TEXT | ISO 8601 UTC timestamp |
 | `completed_at` | TEXT | ISO 8601 UTC timestamp, NULL if still running |
 | `status` | TEXT | `running`, `success`, or `failed` |

@@ -35,7 +35,7 @@ A critical financial reality: the **50:1 ratio** between announced "biobucks" an
 
 ## What We Build
 
-A modular, orchestrated pipeline with five stages:
+A modular, orchestrated pipeline with six stages (a synthesizability gate was added at Stage 2.5 in 2026-05; see the caveat below):
 
 ### Stage 1 — Pocket Detection
 
@@ -43,9 +43,15 @@ Input: a PDB structure file for a protein of interest. The system identifies can
 
 ### Stage 2 — Molecule Generation
 
-Given a prioritised binding pocket, the system generates candidate molecules. Three backends: RDKit fragment-based (current default, fast, no GPU), Pocket2Mol autoregressive (pocket-conditioned GNN, ~11× faster than TargetDiff, ~7 s/molecule on GPU), and TargetDiff diffusion (E(3)-equivariant, highest-fidelity 3D generation conditioned on pocket shape, requires hours on CPU / minutes on GPU).
+Given a prioritised binding pocket, the system generates candidate molecules. The recommended mode is **cascade** — RDKit fragment-based (CPU, the *makeable* workhorse) + TargetDiff diffusion (E(3)-equivariant, highest-fidelity 3D, GPU) merged into one pool. **Pocket2Mol was dropped** (Blackwell-incompatible, CPU-only there, little unique makeable matter). TargetDiff is now understood as a *binding-mode proposer*, not a finished-candidate producer.
 
-Critical caveat from the literature: an ICLR 2025 paper demonstrated that SBDD models routinely generate molecules with better Vina docking scores than known ligands — but this improvement is largely an artifact of generating larger molecules, not better binders. We must always evaluate molecular weight alongside docking score.
+Two critical caveats from the literature, both confirmed empirically here:
+1. **Docking-score inflation** (ICLR 2025): SBDD models routinely beat known ligands on Vina largely by generating *larger* molecules, not better binders — so we evaluate molecular weight / ligand efficiency alongside docking score, and our composite ranker down-weights size.
+2. **Synthesizability collapse** (GenBench3D; measured here 2026-05): 3D generators produce mostly *unmakeable* molecules — **0 of 28** top kinase candidates had a retrosynthetic route; TargetDiff scored 0% makeable vs RDKit's 30%. This is exactly the "silent attrition" pain point above, and it is why synthesizability is now an enforced **gate** (Stage 2.5), not a hope.
+
+### Stage 2.5 — Synthesizability Gate
+
+Before docking, candidates pass through an AiZynthFinder retrosynthetic search (with an optional fast RAScore pre-filter); only molecules with a real route to purchasable building blocks proceed. This turns "we should check synthesizability eventually" into "the pipeline refuses to advance molecules that can't be made" — directly closing the silent-attrition gap that kills computational candidates downstream.
 
 ### Stage 3 — Scoring and Filtering
 
@@ -65,7 +71,7 @@ This is the deliverable. Not a cure, not a clinical candidate, not a paper. A pr
 
 The deterministic five-stage pipeline above is the foundation. On top of it sits a four-part adaptive layer that turns the system from a one-shot pipeline into one that learns from its own campaigns:
 
-- **Cascade generation** — Pocket2Mol for breadth, TargetDiff for refinement around top-ranked seeds, AiZynthFinder for synthesis feasibility on the survivors. Combines speed and fidelity without sacrificing either.
+- **Cascade generation (shipped, 2026-05)** — the original "Pocket2Mol for breadth, TargetDiff for refinement" idea evolved, on contact with data, into something sharper: **RDKit for makeable breadth + TargetDiff for novel binding modes**, unified by a **pharmacophore bridge** that uses TargetDiff's docked poses as binding-mode hypotheses and ranks *makeable* candidates by how faithfully they reproduce them, with AiZynthFinder enforcing synthesizability throughout. This is the realized "best of both" — TargetDiff's pocket insight, expressed in chemistry you can actually make. (Pocket2Mol was dropped; see [plan.md](../autonomous_drug_discovery/plan.md) "Pipeline v2".)
 - **Bayesian strategy selection** — Thompson sampling over (backend, parameters) given pocket descriptors. The system maintains a posterior over which configuration works for which pocket family, exploring less as the posterior tightens. Multi-criteria reward (composite score) blunts the known Vina-bigger-is-better reward-hacking trap.
 - **Sonnet-in-the-loop** — A Claude Sonnet agent retrieves over local telemetry + open-source corpora (CrossDocked2020, BindingDB, ChEMBL), surfaces structured recommendations with cited evidence, watches mid-campaign attrition for pathological runs, and writes the chemist-facing campaign report. Recommendations are never auto-applied; the chemist accepts or overrides each one, and every decision is logged.
 - **Obsidian knowledge graph** — Each campaign emits a folder of cross-linked Markdown notes that becomes a queryable record of what worked, what failed, and what the expert thought. The graph compounds with each campaign — this is what makes the data advantage durable.
